@@ -21,9 +21,10 @@ stub/test-tone source until SD lands) audible on the Pod.
 
 ## 2. SDRAM buffer placement
 **Type:** Toil / Guards and Quality
-Place the source buffer and the six voice buffers (`accum_[4096]` + `ring_[4096]`
-per voice, ~196 KB total) in SDRAM (`DSY_SDRAM_BSS`). Confirm against the linker
-map that internal SRAM is not overrun.
+Place the source buffer and the eight voice buffers (`accum_[4096]` +
+`ring_[4096]` per voice, ~256 KB total; `SS_MAX_VOICES = SS_STEPS = 8`) in SDRAM
+(`DSY_SDRAM_BSS`). Confirm against the linker map that internal SRAM is not
+overrun.
 **Acceptance:** `build/dreamosc.map` shows voices + source in SDRAM; SRAM within
 budget; no hard fault at boot.
 
@@ -41,7 +42,8 @@ on hand — easy to remedy).
 **Type:** Feature
 Map the Pod's 2 knobs + encoder + 2 buttons onto the four globals: encoder turn
 -> stretch (wide exponential range, ~5–500), knob1 -> duration (0.5–8 s),
-knob2 -> spread (0–3). Drift on a second page (encoder click to switch), or fixed
+knob2 -> spread (0–1: 0 all heads together, 1 end-to-end). Drift on a second page
+(encoder click to switch), or fixed
 for a first cut. Smooth pot reads (one-pole) as the .ino did.
 **Acceptance:** each control audibly does what the spec describes; no zipper
 noise; stretch is usable across the encoder's travel.

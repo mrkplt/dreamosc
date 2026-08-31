@@ -158,9 +158,11 @@ class Sequencer:
 
     @property
     def interval(self):
-        """Seconds between step onsets. spread=0 butts steps end to end;
-        spread=1 puts two steps in the air at once; spread=2, three."""
-        return self.duration / (1.0 + self.spread)
+        """Seconds between head starts, as a fraction of duration. spread is
+        0..1: 0 fires all heads together (interval 0), 1 spaces them end-to-end
+        (a head starts as the previous one ends)."""
+        s = min(max(self.spread, 0.0), 1.0)
+        return self.duration * s
 
     def _envelope(self, n):
         """Equal-power (sine) fade in and out over the whole step."""

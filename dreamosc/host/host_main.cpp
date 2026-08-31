@@ -160,9 +160,8 @@ int main(int argc, char** argv) {
   for (int i = 0; i < SS_STEPS; i++) { seq.position[i] = pos[i]; seq.drift[i] = 0.0f; }
 
   // Total length: passes * 8 steps on the even lattice.
-  uint32_t interval = seq.intervalSamples();
-  uint32_t step_n   = (uint32_t)(duration * in.sr);
-  uint32_t total    = interval * (SS_STEPS * passes - 1) + step_n;
+  // One pass of all SS_STEPS heads is patternSamples(); render `passes` of them.
+  uint32_t total = seq.patternSamples() * passes;
 
   std::vector<float> out;
   out.reserve(total);

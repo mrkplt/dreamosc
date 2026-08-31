@@ -25,8 +25,11 @@
 #endif
 #define SS_H (SS_W / 2)      // output hop, always half the window
 #define SS_RING SS_W         // per-voice lookahead FIFO, power of two
-#define SS_MAX_VOICES 6      // ceiling on simultaneously sounding steps
 #define SS_STEPS 8
+// Ceiling on simultaneously sounding heads. Heads start (duration * spread)
+// apart and each lives `duration`, so the number in flight is 1/spread. At
+// spread -> 0 all SS_STEPS heads sound at once, so the ceiling must be SS_STEPS.
+#define SS_MAX_VOICES SS_STEPS
 
 // ---------------------------------------------------------------------------
 // Shared scratch. Only one voice renders at a time, from the main loop, so a
@@ -215,7 +218,7 @@ class Sequencer {
   float drift[SS_STEPS] = {0};
   float stretch = 50.0f;      // stretch factor
   float duration = 4.0f;      // step duration, seconds
-  float spread = 1.0f;        // 0 butt-joined, 1 two sounding, 2 three
+  float spread = 1.0f;        // 0..1: 0 = all heads together, 1 = end-to-end
 
   void init(const Source* src, float sampleRate, uint32_t seed = 0x12345678u) {
     src_ = src;
@@ -225,17 +228,36 @@ class Sequencer {
     for (int i = 0; i < SS_MAX_VOICES; i++) voice_[i].reset();
     counter_ = 0;
     step_ = 0;
+    fired_ = 0;
   }
 
+  // Samples between successive head starts. spread is 0..1 as a fraction of the
+  // step duration: 0 fires all heads together, 1 spaces them end-to-end. The
+  // whole 8-head pattern repeats every patternSamples().
   uint32_t intervalSamples() const {
-    uint32_t n = (uint32_t)(duration * sr_ / (1.0f + spread));
-    return n < 1 ? 1 : n;
+    float s = spread < 0.0f ? 0.0f : (spread > 1.0f ? 1.0f : spread);
+    return (uint32_t)(duration * sr_ * s);
+  }
+
+  // How long one full pass of all SS_STEPS heads takes: the last head starts at
+  // (SS_STEPS-1)*interval and lasts one duration. At spread 0 that is just one
+  // duration (all heads fire at t=0); at spread 1 it is SS_STEPS durations.
+  uint32_t patternSamples() const {
+    uint32_t dur = (uint32_t)(duration * sr_);
+    return (SS_STEPS - 1) * intervalSamples() + dur;
   }
 
   // Audio callback. One sample of the whole sequence.
   inline float next() {
-    if (counter_ == 0) trigger();
-    if (++counter_ >= intervalSamples()) counter_ = 0;
+    // Fire each head at counter_ == headStart_. With interval 0 (spread ~0) all
+    // SS_STEPS heads share start 0 and fire on the same sample; otherwise they
+    // fire one interval apart. The pattern restarts after patternSamples().
+    uint32_t interval = intervalSamples();
+    while (fired_ < SS_STEPS && counter_ >= (uint32_t)fired_ * interval) {
+      trigger();
+      fired_++;
+    }
+    if (++counter_ >= patternSamples()) { counter_ = 0; fired_ = 0; }
 
     float sum = 0.0f, power = 0.0f;
     for (int i = 0; i < SS_MAX_VOICES; i++) {
@@ -285,7 +307,7 @@ class Sequencer {
   Voice voice_[SS_MAX_VOICES];
   float sr_ = 48000.0f;
   uint32_t counter_ = 0, seed_ = 0, rng_ = 1;
-  int step_ = 0;
+  int step_ = 0, fired_ = 0;   // fired_: heads started in the current pattern
 };
 
 #endif  // STRETCH_CORE_H

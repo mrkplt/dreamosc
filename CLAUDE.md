@@ -18,9 +18,13 @@ sweeps overlap.** Not one scanning cursor, not 8 fixed taps, and NOT polyphony.
 - While a step sounds (its **duration**), its head **travels** — the distance set
   by the **stretch factor**. Low stretch: the head travels far, scanning through
   material. High stretch: it barely moves, a frozen/held sound.
-- **Spread** controls how much the heads overlap in time — how much one head is
-  still traveling while the next has already started. Low spread: heads run one
-  after another. High spread: several heads in flight at once, their fades layered.
+- **Spread** (0..1) sets the time between head starts as a fraction of duration:
+  `interval = duration * spread`. **0% = all 8 heads fire together** (maximum
+  overlap, pattern lasts one duration); **100% = end-to-end**, each head starts as
+  the previous ends (pattern lasts 8 durations). 50% at a 4 s duration = heads 2 s
+  apart. So spread runs from fully-stacked (0) to fully-sequential (1) — note this
+  is the INVERSE of the original spec/`.ino` comment ("0 butt-joined"), which was
+  wrong; the code now implements the correct direction.
 - `SS_MAX_VOICES` (6) is NOT musical polyphony — it is the ceiling on how many
   overlapping traveling heads / fade tails can render simultaneously. The spec's
   "polyphonic voice allocator" phrasing describes that rendering machinery, not
@@ -100,8 +104,10 @@ c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
   duration, knob2 -> spread, drift on a second page / encoder-click. Four globals
   do not fit two knobs directly.
 - **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
-  `SS_MAX_VOICES = 6` -> ~196 KB. These + the source buffer almost certainly must
-  live in SDRAM, not internal SRAM. Watch the linker map.
+  `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
+  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). These +
+  the source buffer almost certainly must live in SDRAM, not internal SRAM. Watch
+  the linker map.
 - **libDaisy + GCC 15.3 wrinkle:** `WavPlayer.h` throws a `[-Wtemplate-body]`
   error (`FileReader` vs `IReader`) when transitively included. It is upstream, not
   ours. Avoid pulling that header, or pin/patch it when building `dreamosc.cpp`.

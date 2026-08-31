@@ -1,0 +1,291 @@
+// stretch_core.h - portable DSP core for the stretch sequencer.
+// No Arduino or Daisy dependencies, so it can be compiled and verified on a
+// host machine. StretchSeq.ino wraps this with audio I/O and pot reading.
+
+#ifndef STRETCH_CORE_H
+#define STRETCH_CORE_H
+
+#include <math.h>
+#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
+
+// Emilie Gillet's real FFT, MIT licensed, as shipped with the Nimbus example in
+// DaisyExamples and used by its phase vocoder. Real rather than complex-on-real
+// input, so about half the arithmetic of a naive transform, and already tuned
+// for this chip.
+#include "shy_fft.h"
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+#ifndef SS_W
+#define SS_W 4096            // analysis window, must be a power of two
+#endif
+#define SS_H (SS_W / 2)      // output hop, always half the window
+#define SS_RING SS_W         // per-voice lookahead FIFO, power of two
+#define SS_MAX_VOICES 6      // ceiling on simultaneously sounding steps
+#define SS_STEPS 8
+
+// ---------------------------------------------------------------------------
+// Shared scratch. Only one voice renders at a time, from the main loop, so a
+// single set of work buffers serves all of them.
+// ---------------------------------------------------------------------------
+
+typedef ShyFFT<float, SS_W, RotationPhasor> SSFFT;
+
+struct StretchTables {
+  SSFFT fft;
+  float window[SS_W];        // (1 - x^2)^1.25, Nasca's original curve
+  float sinLut[1024];
+  float olaGain;             // corrects the twice-windowed overlap-add sum
+
+  void init() {
+    fft.Init();
+    for (int i = 0; i < SS_W; i++) {
+      float x = -1.0f + 2.0f * i / (SS_W - 1);
+      window[i] = powf(1.0f - x * x, 1.25f);
+    }
+    for (int i = 0; i < 1024; i++)
+      sinLut[i] = sinf(2.0f * (float)M_PI * i / 1024.0f);
+    // Mean of the summed squared window across one hop, times ShyFFT's inverse
+    // scaling. Measured on a host: Direct followed by Inverse multiplies by
+    // SS_W, so the 1/N belongs here rather than inside the transform.
+    float s = 0.0f;
+    for (int i = 0; i < SS_H; i++)
+      s += window[i] * window[i] + window[i + SS_H] * window[i + SS_H];
+    olaGain = (1.0f / (s / SS_H)) / (float)SS_W;
+  }
+
+  inline float sinAt(uint32_t idx) const { return sinLut[idx & 1023]; }
+  inline float cosAt(uint32_t idx) const { return sinLut[(idx + 256) & 1023]; }
+};
+
+extern StretchTables gTab;
+extern float gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
+extern float gSpec[SS_W];   // split spectrum: real in [0,W/2), imag in [W/2,W)
+
+// ---------------------------------------------------------------------------
+// The source. A plain buffer plus its length; reads wrap, so every position is
+// legal and no bounds check is ever needed at the call site.
+// ---------------------------------------------------------------------------
+
+struct Source {
+  float* data = nullptr;
+  uint32_t len = 0;
+  inline float at(int32_t i) const {
+    i %= (int32_t)len;
+    if (i < 0) i += len;
+    return data[i];
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Voice - one sounding step.
+// ---------------------------------------------------------------------------
+
+class Voice {
+ public:
+  void reset() { active_ = false; wr_ = rr_ = 0; }
+  bool active() const { return active_; }
+
+  // position: 0..1 through the stretch. stretch: factor. lenSamples: duration.
+  void start(const Source* src, float position, float stretch,
+             uint32_t lenSamples, uint32_t seed) {
+    src_ = src;
+    if (position < 0.0f) position = 0.0f;
+    if (position >= 1.0f) position = 0.999999f;
+    srcPos_ = (double)position * (double)src->len;
+    srcHop_ = (double)SS_H / (double)stretch;
+    len_ = lenSamples;
+    out_ = 0;
+    produced_ = 0;
+    wr_ = rr_ = 0;
+    // Phase seed comes from the position, not from a counter, so the same
+    // position always yields the same audio. That is what makes zero drift a
+    // literal repeat.
+    rng_ = seed ^ (uint32_t)(position * 4294967295.0);
+    if (rng_ == 0) rng_ = 0x9E3779B9u;
+    memset(accum_, 0, sizeof(accum_));
+    frame_ = -1;
+    // Pre-roll. Overlap-add means every output sample is the sum of two
+    // frames; starting cold leaves the first half-window ~3.5 dB down and
+    // spectrally thin. The dependency is exactly one frame deep, so render one
+    // frame ahead of the start point and discard its output.
+    renderFrame();
+    discardHop();
+    active_ = true;
+  }
+
+  // Called from the main loop. Returns true if it did work.
+  bool topUp() {
+    if (!active_) return false;
+    if (fill() >= SS_H) return false;
+    if (produced_ >= len_ + SS_H) return false;
+    renderFrame();
+    emitHop();
+    return true;
+  }
+
+  // Called from the audio callback. Writes the enveloped sample and its
+  // squared envelope, for the loudness compensation.
+  inline void next(float* sample, float* envSq) {
+    if (!active_) { *sample = 0.0f; *envSq = 0.0f; return; }
+    float raw = 0.0f;
+    if (rr_ != wr_) { raw = ring_[rr_ & (SS_RING - 1)]; rr_++; }
+    // Equal-power (sine) fade across the whole step.
+    float e = gTab.sinAt((uint32_t)(1024.0f * 0.5f * out_ / (float)len_));
+    *sample = raw * e;
+    *envSq = e * e;
+    if (++out_ >= len_) active_ = false;
+  }
+
+ private:
+  inline uint32_t fill() const { return wr_ - rr_; }
+
+  inline uint32_t rand32() {
+    rng_ ^= rng_ << 13; rng_ ^= rng_ >> 17; rng_ ^= rng_ << 5;
+    return rng_;
+  }
+
+  void renderFrame() {
+    int32_t base = (int32_t)srcPos_;
+    for (int i = 0; i < SS_W; i++)
+      gWork[i] = src_->at(base + i) * gTab.window[i];
+
+    gTab.fft.Direct(gWork, gSpec);
+
+    // Split layout: real part in gSpec[0..W/2), imaginary in gSpec[W/2..W).
+    // gSpec[0] is DC and gSpec[W/2] is Nyquist, both of which get zeroed, the
+    // same convention Nimbus uses.
+    float* re = &gSpec[0];
+    float* im = &gSpec[SS_W / 2];
+    for (int k = 1; k < SS_W / 2; k++) {
+      float mag = sqrtf(re[k] * re[k] + im[k] * im[k]);
+      uint32_t a = rand32() >> 22;              // 0..1023
+      re[k] = mag * gTab.cosAt(a);              // keep magnitude, redraw phase
+      im[k] = mag * gTab.sinAt(a);
+    }
+    gSpec[0] = 0.0f;                            // DC
+    gSpec[SS_W / 2] = 0.0f;                     // Nyquist
+
+    gTab.fft.Inverse(gSpec, gWork);
+    for (int i = 0; i < SS_W; i++)
+      accum_[i] += gWork[i] * gTab.window[i];
+
+    srcPos_ += srcHop_;
+    frame_++;
+  }
+
+  void slideAccum() {
+    memmove(accum_, accum_ + SS_H, SS_H * sizeof(float));
+    memset(accum_ + SS_H, 0, SS_H * sizeof(float));
+  }
+
+  void discardHop() { slideAccum(); }
+
+  void emitHop() {
+    for (int i = 0; i < SS_H; i++)
+      ring_[(wr_ + i) & (SS_RING - 1)] = accum_[i] * gTab.olaGain;
+    wr_ += SS_H;
+    produced_ += SS_H;
+    slideAccum();
+  }
+
+  const Source* src_ = nullptr;
+  double srcPos_ = 0.0, srcHop_ = 0.0;   // double: position precision matters
+  uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
+  int32_t frame_ = -1;
+  bool active_ = false;
+  float accum_[SS_W];
+  float ring_[SS_RING];
+  volatile uint32_t wr_ = 0, rr_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Sequencer - eight steps on an even lattice.
+// Per step: position, drift.  Global: stretch, duration, spread.
+// ---------------------------------------------------------------------------
+
+class Sequencer {
+ public:
+  float position[SS_STEPS] = {0.10f, 0.13f, 0.16f, 0.19f,
+                              0.22f, 0.25f, 0.28f, 0.31f};
+  float drift[SS_STEPS] = {0};
+  float stretch = 50.0f;      // stretch factor
+  float duration = 4.0f;      // step duration, seconds
+  float spread = 1.0f;        // 0 butt-joined, 1 two sounding, 2 three
+
+  void init(const Source* src, float sampleRate, uint32_t seed = 0x12345678u) {
+    src_ = src;
+    sr_ = sampleRate;
+    seed_ = seed;
+    rng_ = seed;
+    for (int i = 0; i < SS_MAX_VOICES; i++) voice_[i].reset();
+    counter_ = 0;
+    step_ = 0;
+  }
+
+  uint32_t intervalSamples() const {
+    uint32_t n = (uint32_t)(duration * sr_ / (1.0f + spread));
+    return n < 1 ? 1 : n;
+  }
+
+  // Audio callback. One sample of the whole sequence.
+  inline float next() {
+    if (counter_ == 0) trigger();
+    if (++counter_ >= intervalSamples()) counter_ = 0;
+
+    float sum = 0.0f, power = 0.0f;
+    for (int i = 0; i < SS_MAX_VOICES; i++) {
+      float s, e2;
+      voice_[i].next(&s, &e2);
+      sum += s;
+      power += e2;
+    }
+    // Uncorrelated sources sum in power, so dividing by the square root of the
+    // summed squared envelopes holds level flat however many steps are
+    // stacked. Spread stays a character control and never a loudness one.
+    return power > 1e-6f ? sum / sqrtf(power) : 0.0f;
+  }
+
+  // Main loop. Keeps every voice's FIFO ahead of the audio callback.
+  void service() {
+    for (int i = 0; i < SS_MAX_VOICES; i++)
+      if (voice_[i].topUp()) return;   // one FFT per pass, to bound latency
+  }
+
+ private:
+  inline uint32_t rand32() {
+    rng_ ^= rng_ << 13; rng_ ^= rng_ >> 17; rng_ ^= rng_ << 5;
+    return rng_;
+  }
+
+  void trigger() {
+    int slot = -1;
+    for (int i = 0; i < SS_MAX_VOICES; i++)
+      if (!voice_[i].active()) { slot = i; break; }
+    if (slot < 0) return;              // all busy: drop rather than steal
+
+    float d = drift[step_];
+    float p = position[step_];
+    if (d > 0.0f) {
+      float u = (float)(rand32() >> 8) / 16777216.0f;   // 0..1
+      p += (u * 2.0f - 1.0f) * d;
+      if (p < 0.0f) p = 0.0f;
+      if (p > 1.0f) p = 1.0f;
+    }
+    voice_[slot].start(src_, p, stretch,
+                       (uint32_t)(duration * sr_), seed_);
+    step_ = (step_ + 1) % SS_STEPS;
+  }
+
+  const Source* src_ = nullptr;
+  Voice voice_[SS_MAX_VOICES];
+  float sr_ = 48000.0f;
+  uint32_t counter_ = 0, seed_ = 0, rng_ = 1;
+  int step_ = 0;
+};
+
+#endif  // STRETCH_CORE_H

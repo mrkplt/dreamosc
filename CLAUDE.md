@@ -1,0 +1,100 @@
+# dreamosc — Stretch Sequencer for Daisy Pod
+
+A PaulStretch-based texture instrument for the **Electrosmith Daisy Pod** (Seed3,
+STM32H750). A step sequencer whose 8 steps address positions inside a *virtual*
+PaulStretch that is never fully rendered — each step pulls a fixed duration of
+phase-randomized sound from a named point in the stretch and fades into the next.
+
+Read `archive/stretchsequencerspec.md` for the full design. It is the source of
+truth for behavior.
+
+## Toolchain (already installed on this machine)
+
+- `arm-none-eabi-gcc` 15.3.1 — ARM cross-compiler (`brew install --cask gcc-arm-embedded`)
+- `dfu-util` 0.11 — flashes the H750 over USB DFU (`brew install dfu-util`)
+- `arduino-cli` 1.5.1 — present but NOT used here (we chose the native libDaisy path)
+- Host verification uses a Python venv at `dreamosc/host/.venv` (numpy)
+
+**Path chosen: native libDaisy + Makefile, NOT DaisyDuino/Arduino.** The uploaded
+`StretchSeq.ino` was a DaisyDuino wrapper; we are porting its wiring to libDaisy.
+The DSP core (`stretch_core.h`, `shy_fft.h`) has no platform dependencies and is
+shared verbatim between host and device.
+
+## Dependencies (cloned, gitignored — re-fetch if missing)
+
+```
+cd ~/src/dreamosc
+git clone --recursive https://github.com/electro-smith/libDaisy.git
+git clone --recursive https://github.com/electro-smith/DaisySP.git
+make -C libDaisy && make -C DaisySP        # build the static libs once
+```
+
+## Layout
+
+```
+dreamosc/
+  stretch_core.h      DSP core: Source, Voice, Sequencer (portable, verified)
+  shy_fft.h           Emilie Gillet's embedded real FFT (MIT)
+  sd_source.h         Load a WAV off microSD -> SDRAM -> Source. THE source seam.
+  dreamosc.cpp        (WIP) Pod firmware — currently a placeholder oscillator
+  Makefile            libDaisy build; targets ../libDaisy and ../DaisySP
+  host/
+    host_main.cpp     Host harness: WAV -> Sequencer -> WAV (defines the globals)
+    stretchseq.py     Python reference (ground truth for the DSP)
+archive/              The original reference files, as delivered (see below)
+```
+
+## Build & flash
+
+```
+# Device firmware
+cd dreamosc && make                 # -> build/dreamosc.bin
+make program-dfu                    # BOOT+RESET the Seed into DFU first
+
+# Host verification (proves the C++ core matches the Python)
+cd dreamosc/host
+c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
+./stretchcore in.wav out.wav --stretch 50 --duration 4 --spread 1
+.venv/bin/python stretchseq.py in.wav ref.wav --stretch 50 --duration 4 --spread 1
+```
+
+## State of play (what's done, what's next)
+
+- **DSP core: host-verified.** C++ vs Python — identical length, RMS within
+  +0.12 dB, spectral shape correlated 0.92 (phase differs by design: different
+  RNGs). The port is faithful to `stretchseq.py`.
+- **SD reader: written and compile-checked** against the real libDaisy API
+  (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
+  stereo->mono fold). Not yet run on hardware (no card yet).
+- **Pod firmware (`dreamosc.cpp`): NOT DONE.** Still the throwaway oscillator.
+  Needs: voices/source buffers in SDRAM (`DSY_SDRAM_BSS`), `Sequencer::next()` in
+  the audio callback, `service()` in the main loop, Pod controls mapped.
+
+## Key facts a future agent needs
+
+- **Source is source-agnostic by design.** `Source { float* data; uint32_t len; }`
+  with wrapping reads. `sd_source.h::load_source()` is the ONE seam that decides
+  where audio comes from. Today: SD card at boot (card not present yet — stub with
+  a test tone until one is). This SD path is reused in later projects, so it was
+  built for real, not faked.
+- **Controls = Daisy Pod, not a bare Seed.** 2 knobs + encoder (turn+click) +
+  2 buttons. Plan: encoder turn -> stretch (wide exponential range), knob1 ->
+  duration, knob2 -> spread, drift on a second page / encoder-click. Four globals
+  do not fit two knobs directly.
+- **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
+  `SS_MAX_VOICES = 6` -> ~196 KB. These + the source buffer almost certainly must
+  live in SDRAM, not internal SRAM. Watch the linker map.
+- **libDaisy + GCC 15.3 wrinkle:** `WavPlayer.h` throws a `[-Wtemplate-body]`
+  error (`FileReader` vs `IReader`) when transitively included. It is upstream, not
+  ours. Avoid pulling that header, or pin/patch it when building `dreamosc.cpp`.
+- **Two Pythons, one truth:** `paulstretch.py` is the older origin convention;
+  `stretchseq.py` + `stretch_core.h` are the current, matching pair. Verify against
+  `stretchseq.py`.
+
+## archive/
+
+Original reference files as delivered, kept verbatim for provenance:
+`paulstretch.py`, `stretchseq.py`, `stretchsequencerspec.md`, `stretch_core.h`,
+`shy_fft.h`, `StretchSeq.ino`. The working copies of `stretch_core.h` / `shy_fft.h`
+under `dreamosc/` are the ones the build uses; the archive copies are the untouched
+originals.

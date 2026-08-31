@@ -1,0 +1,21 @@
+# Cloned dependencies (not ours; re-clone with --recursive)
+/libDaisy/
+/DaisySP/
+
+# Build artifacts
+build/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.lst
+*.map
+
+# Host verification tooling
+dreamosc/host/.venv/
+dreamosc/host/stretchcore
+dreamosc/host/*.wav
+
+# macOS
+.DS_Store

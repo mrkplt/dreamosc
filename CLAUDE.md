@@ -8,6 +8,24 @@ phase-randomized sound from a named point in the stretch and fades into the next
 Read `archive/stretchsequencerspec.md` for the full design. It is the source of
 truth for behavior.
 
+## Mental model (read this before reasoning about voices)
+
+**8 read heads sweeping through the stretch, with spread setting how much their
+sweeps overlap.** Not one scanning cursor, not 8 fixed taps, and NOT polyphony.
+
+- Each of the 8 steps is a **read head** starting at its Position in the virtual
+  stretch.
+- While a step sounds (its **duration**), its head **travels** — the distance set
+  by the **stretch factor**. Low stretch: the head travels far, scanning through
+  material. High stretch: it barely moves, a frozen/held sound.
+- **Spread** controls how much the heads overlap in time — how much one head is
+  still traveling while the next has already started. Low spread: heads run one
+  after another. High spread: several heads in flight at once, their fades layered.
+- `SS_MAX_VOICES` (6) is NOT musical polyphony — it is the ceiling on how many
+  overlapping traveling heads / fade tails can render simultaneously. The spec's
+  "polyphonic voice allocator" phrasing describes that rendering machinery, not
+  chords. There is one source, one timeline, one sequence.
+
 ## Toolchain (already installed on this machine)
 
 - `arm-none-eabi-gcc` 15.3.1 — ARM cross-compiler (`brew install --cask gcc-arm-embedded`)

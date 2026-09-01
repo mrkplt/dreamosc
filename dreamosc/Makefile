@@ -38,3 +38,29 @@ $(VENDOR_STAMP):
 	$(VENDOR_DIR)/fetch.sh
 
 build/$(TARGET).o: $(VENDOR_STAMP)
+
+# --- Sample upload to QSPI ---------------------------------------------------
+# TEMPORARY scaffolding for #132 control testing: real broadband material has to
+# live somewhere, and internal flash (128 KB) is far too small. QSPI is 8 MB and
+# memory-mapped at 0x90000000, so the firmware reads it in place. Reverts to the
+# SD-card path (#131) once controls are sorted.
+#
+#   make sample SRC=/path/to.wav   convert a WAV to the blob
+#   make program-sample            upload the blob to QSPI over DFU
+#
+# NOTE: QSPI DFU requires Electrosmith's Daisy bootloader (the STM32 ROM
+# bootloader exposes only Internal Flash + Option Bytes). Install it once with
+# `make program-boot`, which libDaisy's core Makefile provides.
+SAMPLE_BIN ?= ../sample/amen.bin
+SAMPLE_SRC ?=
+
+.PHONY: sample program-sample
+sample:
+	@test -n "$(SAMPLE_SRC)" || { echo "usage: make sample SAMPLE_SRC=/path/to.wav"; exit 2; }
+	../tools/wav2raw.py "$(SAMPLE_SRC)" "$(SAMPLE_BIN)"
+
+# 0x90100000 = 1 MB into QSPI, clear of the 256 KB the Daisy bootloader reserves
+# for firmware images at 0x90040000. Must match QSPI_BASE in dreamosc.cpp.
+program-sample:
+	@test -f "$(SAMPLE_BIN)" || { echo "no $(SAMPLE_BIN) -- run: make sample SAMPLE_SRC=..."; exit 2; }
+	dfu-util -a 0 -s 0x90100000:leave -D "$(SAMPLE_BIN)" -d ,0483:df11

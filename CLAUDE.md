@@ -138,6 +138,40 @@ showing `[0483:df11] ... @Internal Flash /0x08000000` before flashing.
 STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
 `File downloaded successfully` line above it means the flash landed.
 
+### Sample audio: QSPI (temporary scaffolding)
+
+**Why:** internal flash is 128 KB and the firmware already uses ~89 KB, so real
+sample material (hundreds of KB) cannot be embedded. QSPI is 8 MB and
+memory-mapped, so the firmware reads samples in place with no copy.
+
+**This is temporary.** It exists so the #132 controls can be judged on broadband
+material — a sine has no spectral variation across the buffer, so moving a read
+head sounds identical everywhere and the controls appear to do nothing. The
+intended long-term source is the SD card path (#131, `sd_source.h`, already
+written). Revert this once controls are settled.
+
+```
+make sample SAMPLE_SRC=/path/to.wav   # WAV -> tools/wav2raw.py blob
+make program-boot                     # ONE TIME: install the Daisy bootloader
+make program-sample                   # upload the blob to QSPI
+```
+
+**The Daisy bootloader is required** because the STM32 ROM bootloader exposes
+only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
+
+- **Use `APP_TYPE = BOOT_SRAM`**, never `BOOT_QSPI`. SRAM execution is
+  "comparable speed to internal flash" with a 480 KB limit (we use ~89 KB);
+  QSPI execution is "more cache-dependent" i.e. slower, which is a real risk
+  for a real-time audio callback.
+- The bootloader **reserves the first 256 KB of QSPI** (firmware images load at
+  `0x90040000`). Sample data therefore lives at **`0x90100000`** (1 MB in) —
+  `QSPI_BASE` in `dreamosc.cpp` and the address in `make program-sample` must
+  agree.
+- With the bootloader installed, programs **cannot use internal flash**.
+- The blob is self-describing (magic `DRMO`, count, rate) so the firmware
+  validates it and falls back to a synthesized source if QSPI is empty or
+  erased — it never plays garbage.
+
 ## State of play (what's done, what's next)
 
 - **Synthesis: canonical PaulXStretch, settled by listening on hardware.** Each

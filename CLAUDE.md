@@ -102,7 +102,11 @@ c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
 - **Controls = Daisy Pod, not a bare Seed.** 2 knobs + encoder (turn+click) +
   2 buttons. Plan: encoder turn -> stretch (wide exponential range), knob1 ->
   duration, knob2 -> spread, drift on a second page / encoder-click. Four globals
-  do not fit two knobs directly.
+  do not fit two knobs directly. **This mapping is a first-cut constraint of the
+  Pod's panel, NOT the intended final control surface** — the design wants a knob
+  per parameter (and per-step, that is the spec's 16 numbers), so the
+  encoder-juggling is provisional. Add knobs / dedicated controls as the hardware
+  allows; don't treat two-knobs-plus-encoder as the design.
 - **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
   `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
   all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). These +

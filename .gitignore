@@ -25,3 +25,6 @@ dreamosc/test/unit_tests
 dreamosc/test/*.dSYM/
 dreamosc/test/*.profraw
 dreamosc/test/*.profdata
+
+# Sample blobs built by tools/wav2raw.py -- large, and third-party audio
+sample/

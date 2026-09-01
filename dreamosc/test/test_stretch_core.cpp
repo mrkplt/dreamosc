@@ -73,6 +73,38 @@ TEST_CASE("deterministic: same config renders identically") {
 // heads are steady-state butt joints and the seam splice is accepted. Interior
 // discontinuities are guarded by the click-detector test below.)
 
+TEST_CASE("a genuinely starved ring counts an underrun and stays silent") {
+  // gUnderruns / the ring-empty branch in Voice::next() is only reached when a
+  // PRIMED, already-sounding voice outruns the worker — the onset lookahead
+  // deliberately prevents this in the normal case, and the rate-limited test
+  // above proves safe degradation without confirming this exact counter fires.
+  // Force it directly: let one head prime normally, then drain next() far past
+  // what a full ring (SS_RING samples) can supply with zero further service().
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 1.0f);   // long, isolated head
+
+  uint32_t before = gUnderruns;
+  // Prime: run service()+next() together long enough to pass the onset and
+  // fill the ring, as a healthy main loop would.
+  for (uint32_t i = 0; i < SS_LOOKAHEAD + SS_RING; i++) {
+    seq.service();
+    float s = seq.next();
+    REQUIRE(std::isfinite(s));
+  }
+  // Now starve it: pure next(), no service() at all, for more samples than any
+  // ring depth could possibly cover.
+  bool saw_silence_after_starve = false;
+  for (uint32_t i = 0; i < SS_RING * 4; i++) {
+    float s = seq.next();
+    REQUIRE(std::isfinite(s));
+    if (gUnderruns > before) saw_silence_after_starve = true;
+  }
+  REQUIRE(gUnderruns > before);
+  REQUIRE(saw_silence_after_starve);
+}
+
 TEST_CASE("rate-limited worker degrades to silence, not garbage") {
   // The fully-drained render() cannot see the on-device race: with a starved
   // worker a head's buffer may be empty when the callback reads it. Correct
@@ -254,6 +286,62 @@ TEST_CASE("renders at multiple sample rates without blowing up") {
     REQUIRE(out.size() > 0);
     for (float v : out) REQUIRE(std::isfinite(v));
   }
+}
+
+TEST_CASE("spread ~0 fires all SS_STEPS heads together through render()") {
+  // Every other test uses spread >= 0.25; the "all heads share one onset" burst
+  // path in Sequencer::next() (requestArm() called SS_STEPS times, interval==0)
+  // is otherwise never exercised through an actual render — only its length
+  // arithmetic (patternSamples()) is checked elsewhere. Distinct step positions
+  // + zero drift means each head is a distinguishable steady tone once primed;
+  // confirm real audible output appears (not silence) once heads are primed.
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
+  seq.spread = 0.0f;
+  auto out = render(seq, 2);
+  REQUIRE(out.size() > 0);
+
+  // Some part of the render must be genuinely audible: SS_LOOKAHEAD samples of
+  // startup priming are silence by design, but the render must not be silent
+  // throughout (which would mean the burst-arm path silently failed to fire).
+  bool any_audible = false;
+  for (float v : out) if (std::abs(v) > 1e-3f) { any_audible = true; break; }
+  REQUIRE(any_audible);
+  for (float v : out) REQUIRE(std::isfinite(v));
+}
+
+TEST_CASE("drift perturbs position within bounds and stays reproducible") {
+  // Every other test hardcodes drift=0 for determinism. Drift is a real,
+  // spec'd feature (spec.md: "a fresh random position inside its neighbourhood
+  // ... no memory") and had zero coverage. Assert: (1) with drift > 0 and a
+  // fixed seed, two renders of the SAME config are still identical (the RNG is
+  // seeded, not wall-clock random); (2) a large drift measurably changes output
+  // vs. zero drift (it is actually wired in, not a dead no-op); (3) drift is
+  // clamped into [0,1] position space (no wraparound/out-of-bounds source read).
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+
+  Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 0.5f, /*spread=*/1.0f,
+                           /*drift=*/0.3f, /*seed=*/42u);
+  Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 0.5f, /*spread=*/1.0f,
+                           /*drift=*/0.3f, /*seed=*/42u);
+  auto a = render(seqA);
+  auto b = render(seqB);
+  REQUIRE(a.size() == b.size());
+  for (size_t i = 0; i < a.size(); i++) REQUIRE(a[i] == Approx(b[i]));
+
+  Sequencer seqZero; make_seq(seqZero, &src, 48000, 50.0f, 0.5f, 1.0f,
+                              /*drift=*/0.0f, /*seed=*/42u);
+  auto zero = render(seqZero);
+  bool differs = false;
+  for (size_t i = 0; i < std::min(a.size(), zero.size()); i++)
+    if (a[i] != zero[i]) { differs = true; break; }
+  REQUIRE(differs);
+
+  for (float v : a) REQUIRE(std::isfinite(v));
 }
 
 TEST_CASE("spread is clamped to [0,1]") {

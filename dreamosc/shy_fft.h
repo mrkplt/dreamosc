@@ -144,8 +144,13 @@ struct Math<double>
 {
     inline double pi() const { return 3.141592653589793; }
     inline float  sqrt_2_div_2() const { return 0.7071067811865476; }
-    inline double cos(double x) { return cos(x); }
-    inline double sin(double x) { return sin(x); }
+    // Fixed upstream bug: these called themselves (member cos/sin shadowing
+    // ::cos/::sin), causing infinite recursion (a hang / stack overflow) any
+    // time ShyFFT<double, ...> was instantiated. ::-qualify to reach the libm
+    // functions. The archive copy is left as-delivered; this is the working
+    // copy the build actually uses.
+    inline double cos(double x) { return ::cos(x); }
+    inline double sin(double x) { return ::sin(x); }
 };
 
 

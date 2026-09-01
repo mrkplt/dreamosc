@@ -22,3 +22,6 @@ dreamosc/test/unit_tests
 
 # macOS
 .DS_Store
+dreamosc/test/*.dSYM/
+dreamosc/test/*.profraw
+dreamosc/test/*.profdata

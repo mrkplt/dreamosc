@@ -83,13 +83,15 @@ struct StretchTables {
 
   void init() {
     fft.Init();
-    // Rectangular analysis window (constant 0.707), the canonical PaulXStretch
-    // default. A shaped window smears a tone across bins, and per-frame phase
-    // randomization of those bins beats at the bin spacing — measured 10.7 dB
-    // windowed-RMS wobble on a pure sine vs 6.7 dB with rect. (Residual wobble
-    // comes from leakage of non-bin-centered tones; the lever for that is a
-    // larger SS_W, which shrinks the bin spacing.)
-    for (int i = 0; i < SS_W; i++) window[i] = 0.707f;
+    // Nasca's original PaulStretch analysis window. A rectangular window (the
+    // PaulXStretch *default*, which is selectable there for a reason) measured
+    // lower amplitude wobble but leaked 0.6% of output energy out of band vs
+    // 0.0% here — broadband junk, audible as scratchiness. Spectral purity wins;
+    // the lever for wobble is frame size (see #136), not the window.
+    for (int i = 0; i < SS_W; i++) {
+      float x = -1.0f + 2.0f * i / (SS_W - 1);
+      window[i] = powf(1.0f - x * x, 1.25f);
+    }
     for (int i = 0; i < 1024; i++)
       sinLut[i] = sinf(2.0f * (float)M_PI * i / 1024.0f);
     // ShyFFT Direct+Inverse multiplies by SS_W (measured on host), so 1/SS_W

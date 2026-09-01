@@ -24,12 +24,25 @@
 #define SS_W 4096            // analysis window, must be a power of two
 #endif
 #define SS_H (SS_W / 2)      // output hop, always half the window
-#define SS_RING SS_W         // per-voice lookahead FIFO, power of two
+// Per-voice lookahead FIFO, power of two. Must be several hops deep so the main
+// loop can stay well ahead of the audio callback; at exactly SS_W (2 hops) the
+// ring could drain to empty between refills and momentarily starve the callback.
+// 2*SS_W = 4 hops gives a comfortable cushion.
+#define SS_RING (2 * SS_W)
 #define SS_STEPS 8
 // Ceiling on simultaneously sounding heads. Heads start (duration * spread)
 // apart and each lives `duration`, so the number in flight is 1/spread. At
 // spread -> 0 all SS_STEPS heads sound at once, so the ceiling must be SS_STEPS.
 #define SS_MAX_VOICES SS_STEPS
+// Arm each head this many samples before its audible onset, giving the main loop
+// time to pre-roll + fill the FIFO off the audio callback. ~85 ms at 48 kHz —
+// far more than the handful of FFTs a head needs, with margin for the spread-0
+// case where all SS_STEPS heads arm at once. Heads armed but unfilled wait
+// silently (Voice::next), so this never shifts when a head actually sounds.
+#define SS_LOOKAHEAD SS_W
+// Short raw-edge fade (samples) applied at each head's start and end to mask the
+// splice transient between successive uncorrelated heads. ~5 ms at 48 kHz.
+#define SS_EDGE 240
 
 // ---------------------------------------------------------------------------
 // Shared scratch. Only one voice renders at a time, from the main loop, so a
@@ -132,7 +145,12 @@ class Voice {
       preRolled_ = true;
       return true;
     }
-    if (fill() >= SS_H) return false;
+    // Keep the ring as full as it can go (leaving room for one more hop) rather
+    // than topping up only when it drains below one hop. The old SS_H cap let the
+    // ring run all the way to empty between refills, so the audio callback could
+    // catch the producer and momentarily starve — audible as a gated/stuttering
+    // signal. Filling to SS_RING - SS_H keeps a multi-hop cushion.
+    if (fill() > SS_RING - SS_H) return false;
     if (produced_ >= len_ + SS_H) return false;
     renderFrame();
     emitHop();
@@ -143,8 +161,35 @@ class Voice {
   // squared envelope, for the loudness compensation.
   inline void next(float* sample, float* envSq) {
     if (!active_) { *sample = 0.0f; *envSq = 0.0f; return; }
-    float raw = 0.0f;
-    if (rr_ != wr_) { raw = ring_[rr_ & (SS_RING - 1)]; rr_++; }
+    // Ring empty = main loop has not filled this head yet (its FFTs are still in
+    // flight). Output silence and DO NOT advance the envelope: the head waits at
+    // its onset rather than burning its lifetime playing an empty buffer. This
+    // turns a would-be underrun into an inaudible brief wait that self-corrects
+    // as soon as service() catches up. Arming heads LOOKAHEAD samples early (see
+    // Sequencer) makes that wait zero in the normal case.
+    if (rr_ == wr_) {
+      extern volatile uint32_t gUnderruns;  // diagnostic: ring starved mid/at-onset
+      gUnderruns++;
+      *sample = 0.0f; *envSq = 0.0f; return;
+    }
+    float raw = ring_[rr_ & (SS_RING - 1)];
+    rr_++;
+
+    // Short raw-edge fade to mask the splice transient. The whole-step sine fade
+    // (`e` below) is divided back out by the sequencer's power normalization when
+    // only one head sounds, so it cannot hide the boundary discontinuity — a head
+    // otherwise ends/begins at full amplitude and the handoff clicks. Fading the
+    // RAW sample (before the power math sees it) forces the signal to zero across
+    // the first/last SS_EDGE samples regardless of normalization, so successive
+    // uncorrelated heads splice silently.
+    uint32_t edge = SS_EDGE < len_ / 2 ? SS_EDGE : len_ / 2;
+    if (edge > 0) {
+      if (out_ < edge)
+        raw *= (float)out_ / (float)edge;
+      else if (out_ >= len_ - edge)
+        raw *= (float)(len_ - 1 - out_) / (float)edge;
+    }
+
     // Equal-power (sine) fade across the whole step.
     float e = gTab.sinAt((uint32_t)(1024.0f * 0.5f * out_ / (float)len_));
     *sample = raw * e;
@@ -235,9 +280,8 @@ class Sequencer {
     seed_ = seed;
     rng_ = seed;
     for (int i = 0; i < SS_MAX_VOICES; i++) voice_[i].reset();
-    counter_ = 0;
     step_ = 0;
-    fired_ = 0;
+    armClock_ = 0;   // arm the first head on the very first next()
   }
 
   // Samples between successive head starts. spread is 0..1 as a fraction of the
@@ -258,15 +302,25 @@ class Sequencer {
 
   // Audio callback. One sample of the whole sequence.
   inline float next() {
-    // Fire each head at counter_ == headStart_. With interval 0 (spread ~0) all
-    // SS_STEPS heads share start 0 and fire on the same sample; otherwise they
-    // fire one interval apart. The pattern restarts after patternSamples().
+    // Arm each head LOOKAHEAD samples before its audible onset, so the main loop
+    // has time to pre-roll + fill its FIFO before next() reads it (heads that are
+    // armed but not yet filled wait silently — see Voice::next — so arming early
+    // is safe and does not shift when a head actually sounds). With interval 0
+    // (spread ~0) all SS_STEPS heads share onset 0; otherwise one interval apart.
+    // Arming runs on a free-running countdown (armClock_), NOT a per-pattern
+    // counter that resets, so the next pattern's first head arms while this
+    // pattern's last head is still sounding its tail — the seam is continuous and
+    // never drains dry. armClock_ counts samples until the next head is ARMED;
+    // arming is intrinsically LOOKAHEAD-ahead of onset because a just-armed head
+    // waits silently (Voice::next) until service() fills its FIFO.
     uint32_t interval = intervalSamples();
-    while (fired_ < SS_STEPS && counter_ >= (uint32_t)fired_ * interval) {
+    while (armClock_ == 0) {
       trigger();
-      fired_++;
+      // spread ~0 (interval 0): all heads share one onset — arm them in a burst
+      // this sample, then wait one full pattern before the next burst.
+      armClock_ = interval > 0 ? interval : patternSamples();
     }
-    if (++counter_ >= patternSamples()) { counter_ = 0; fired_ = 0; }
+    armClock_--;
 
     float sum = 0.0f, power = 0.0f;
     for (int i = 0; i < SS_MAX_VOICES; i++) {
@@ -318,8 +372,8 @@ class Sequencer {
   const Source* src_ = nullptr;
   Voice voice_[SS_MAX_VOICES];
   float sr_ = 48000.0f;
-  uint32_t counter_ = 0, seed_ = 0, rng_ = 1;
-  int step_ = 0, fired_ = 0;   // fired_: heads started in the current pattern
+  uint32_t armClock_ = 0, seed_ = 0, rng_ = 1;  // armClock_: samples to next arm
+  int step_ = 0;
 };
 
 #endif  // STRETCH_CORE_H

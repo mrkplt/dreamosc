@@ -13,6 +13,7 @@
 
 using testutil::make_source;
 using testutil::render;
+using testutil::render_rate_limited;
 using testutil::rms;
 
 namespace {
@@ -67,6 +68,68 @@ TEST_CASE("deterministic: same config renders identically") {
   auto b = render(seqB);
   REQUIRE(a.size() == b.size());
   for (size_t i = 0; i < a.size(); i++) REQUIRE(a[i] == Approx(b[i]));
+}
+
+TEST_CASE("no click at head boundaries (transient-free by construction)") {
+  // The instrument is phase-randomized and transient-free, so the output must
+  // not jump at a step boundary. The failure this guards: the power
+  // normalization (sum/sqrt(power)) divides the per-voice fade out when only one
+  // voice sounds, so a head ends at full amplitude and snaps to zero at the
+  // handoff — a click every step. We assert the max sample-to-sample delta over
+  // the whole render is not wildly larger than the in-body steady-state delta.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  const float sr = 48000, dur = 1.0f;
+  auto seq = make_seq(&src, sr, 50.0f, dur, 1.0f);   // spread 1: one voice at a time
+  auto out = render(seq, 2);
+
+  // Steady-state reference: largest adjacent delta in the middle of the FIRST
+  // head, away from any boundary.
+  uint32_t step = (uint32_t)(dur * sr);
+  float body_max = 0.0f;
+  for (uint32_t i = step / 4 + 1; i < step * 3 / 4; i++)
+    body_max = std::max(body_max, std::abs(out[i] - out[i - 1]));
+
+  // Largest adjacent delta anywhere (will land on a boundary if one clicks).
+  float overall_max = 0.0f;
+  uint32_t at = 0;
+  for (uint32_t i = 1; i < out.size(); i++) {
+    float d = std::abs(out[i] - out[i - 1]);
+    if (d > overall_max) { overall_max = d; at = i; }
+  }
+  INFO("overall max delta " << overall_max << " at sample " << at
+       << " vs body max " << body_max);
+  REQUIRE(overall_max <= body_max * 4.0f + 1e-4f);
+}
+
+TEST_CASE("no onset click under a rate-limited worker (on-device race)") {
+  // The fully-drained render() cannot see the hardware bug: at a head's onset the
+  // worker has not filled its buffer, so the callback reads it cold and clicks.
+  // Reproduce it by rate-limiting service() to a small FFT budget per block, then
+  // require the seam to stay continuous — a correct ready-gate keeps an unready
+  // voice silent rather than reading a cold buffer.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  const float sr = 48000, dur = 1.0f;
+  auto seq = make_seq(&src, sr, 50.0f, dur, 1.0f);
+  // 1 FFT per 48-sample block ~= 1000 FFT/s, far above the ~23/s one voice needs
+  // in steady state but NOT enough to fill a cold buffer instantly at onset.
+  auto out = render_rate_limited(seq, 2, /*block=*/48, /*fftsPerBlock=*/1);
+
+  uint32_t step = (uint32_t)(dur * sr);
+  float body_max = 0.0f;
+  for (uint32_t i = step / 4 + 1; i < step * 3 / 4; i++)
+    body_max = std::max(body_max, std::abs(out[i] - out[i - 1]));
+  float overall_max = 0.0f; uint32_t at = 0;
+  for (uint32_t i = 1; i < out.size(); i++) {
+    float d = std::abs(out[i] - out[i - 1]);
+    if (d > overall_max) { overall_max = d; at = i; }
+  }
+  INFO("rate-limited max delta " << overall_max << " at " << at
+       << " vs body " << body_max);
+  REQUIRE(overall_max <= body_max * 4.0f + 1e-4f);
 }
 
 TEST_CASE("pattern length follows (SS_STEPS-1)*dur*spread + dur") {

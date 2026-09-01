@@ -18,6 +18,11 @@ StretchTables gTab;
 float         gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
 float         gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
 
+// #129 diagnostic: incremented in Voice::next() when a head's ring is empty
+// (starved). led1 latches red if this ever moves — tells us on-device whether
+// the boundary artifact is a buffer underrun vs. a DSP/splice issue.
+volatile uint32_t gUnderruns = 0;
+
 // --- storage ---------------------------------------------------------------
 #define SOURCE_SECONDS 10
 #define SAMPLE_RATE    48000
@@ -74,14 +79,21 @@ int main(void) {
   seq.init(&src, pod.AudioSampleRate());
   // Defaults from the spec; controls (#132) will drive these live later.
   seq.stretch  = 50.0f;
-  seq.duration = 4.0f;
-  seq.spread   = 0.5f;
+  seq.duration = 1.0f;   // #129 debug: 1s steps -> 8s pattern, faster to hear
+  seq.spread   = 1.0f;   // #129 debug: no head overlap, one voice at a time
 
   pod.StartAdc();
   pod.StartAudio(AudioCallback);
 
-  // Keep every voice's FIFO ahead of the audio callback.
+  // Keep every voice's FIFO ahead of the audio callback. Latch led1 red if a
+  // ring ever starves (gUnderruns moves) — diagnostic for the boundary click.
+  uint32_t last_underruns = gUnderruns;
   while (1) {
     seq.service();
+    if (gUnderruns != last_underruns) {
+      last_underruns = gUnderruns;
+      pod.led1.Set(1.0f, 0.0f, 0.0f);   // red = underrun happened
+      pod.UpdateLeds();
+    }
   }
 }

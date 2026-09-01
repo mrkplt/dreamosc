@@ -9,6 +9,8 @@
 #define CATCH_CONFIG_MAIN
 #include "catch_amalgamated.hpp"
 
+#include <vector>
+
 #include "test_support.h"
 
 using testutil::make_source;
@@ -23,7 +25,9 @@ namespace {
 void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
               float duration, float spread, float drift = 0.0f,
               uint32_t seed = 0x12345678u) {
-  seq.init(src, sr, seed);
+  // Host-side voice pool; on device this lives in SDRAM (see dreamosc.cpp).
+  static std::vector<float> pool(SS_POOL_FLOATS);
+  seq.init(src, sr, pool.data(), seed);
   seq.stretch  = stretch;
   seq.duration = duration;
   seq.spread   = spread;

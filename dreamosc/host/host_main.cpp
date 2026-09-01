@@ -151,7 +151,8 @@ int main(int argc, char** argv) {
   src.len  = (uint32_t)mono.size();
 
   Sequencer seq;
-  seq.init(&src, (float)in.sr, seed);
+  static std::vector<float> voice_pool(SS_POOL_FLOATS);
+  seq.init(&src, (float)in.sr, voice_pool.data(), seed);
   seq.stretch  = stretch;
   seq.duration = duration;
   seq.spread   = spread;

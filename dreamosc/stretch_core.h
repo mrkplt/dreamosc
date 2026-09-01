@@ -40,6 +40,11 @@ using stmlib::RotationPhasor;
 // apart and each lives `duration`, so the number in flight is 1/spread. At
 // spread -> 0 all SS_STEPS heads sound at once, so the ceiling must be SS_STEPS.
 #define SS_MAX_VOICES SS_STEPS
+// Per-voice scratch: old_ (SS_W) + ring_ (SS_RING). The caller allocates
+// SS_POOL_FLOATS floats and passes them to Sequencer::init(); at SS_W 4096 that
+// is 8 voices * 48 KB = 384 KB, which must live in SDRAM, not internal SRAM.
+#define SS_VOICE_FLOATS (SS_W + SS_RING)
+#define SS_POOL_FLOATS  (SS_MAX_VOICES * SS_VOICE_FLOATS)
 // Arm each head this many samples before its audible onset, giving the main loop
 // time to pre-roll + fill the FIFO off the audio callback. ~85 ms at 48 kHz —
 // far more than the handful of FFTs a head needs, with margin for the spread-0
@@ -140,6 +145,17 @@ struct Source {
 
 class Voice {
  public:
+  // Attach this voice's working buffers. They are supplied by the caller rather
+  // than held inline so the big arrays (old_ SS_W + ring_ SS_RING = 48 KB per
+  // voice at SS_W 4096) can live in SDRAM while the Voice OBJECT stays in normal
+  // memory. Objects placed in .sdram_bss get neither their constructor run nor
+  // their storage zeroed (NOLOAD section, SDRAM unpowered at static init), so
+  // only plain data may live there — see CLAUDE.md.
+  void setBuffers(float* old_buf, float* ring_buf) {
+    old_  = old_buf;
+    ring_ = ring_buf;
+  }
+
   void reset() {
     active_.store(false, std::memory_order_relaxed);
     wr_.store(0, std::memory_order_relaxed);
@@ -173,7 +189,7 @@ class Voice {
     if (rng_ == 0) rng_ = 0x9E3779B9u;
     // old_ starts silent: the first emitted block therefore ramps in through the
     // raised cosine, which IS the head's natural rise (no pre-roll).
-    memset(old_, 0, sizeof(old_));
+    memset(old_, 0, SS_W * sizeof(float));
     // Release-store LAST: every plain field above must be visible to the ISR
     // before it can observe active_ == true. Without the barrier the ISR could
     // see a half-initialized voice (ARM reorders plain stores).
@@ -302,15 +318,18 @@ class Voice {
     // visible to the ISR before it can observe the advanced wr_.
     wr_.store(w + SS_H, std::memory_order_release);
     produced_ += SS_H;
-    memcpy(old_, gWork, sizeof(old_));   // current frame becomes "old"
+    memcpy(old_, gWork, SS_W * sizeof(float));   // current frame becomes "old"
   }
 
   const Source* src_ = nullptr;
   double srcPos_ = 0.0, srcHop_ = 0.0;   // double: position precision matters
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
   uint32_t onsetDelay_ = 0;   // samples silent-and-filling before audible
-  float old_[SS_W];   // previous frame's full IFFT waveform (PXS handoff)
-  float ring_[SS_RING];
+  // Buffers live in SDRAM, supplied via setBuffers(); see the note there.
+  // NOTE: pointers, not arrays -- sizeof() on these is a pointer size, so always
+  // spell out the element count when memset/memcpy-ing them.
+  float* old_  = nullptr;   // previous frame's full IFFT waveform (PXS handoff)
+  float* ring_ = nullptr;   // SS_RING-sample output FIFO
   // Cross-thread state (main-loop producer / audio-ISR consumer). active_ is the
   // publication gate for a freshly start()ed voice; wr_/rr_ are the SPSC ring
   // indices. Release/acquire pairs make the data they guard visible in order.
@@ -332,12 +351,20 @@ class Sequencer {
   float duration = 4.0f;      // step duration, seconds
   float spread = 1.0f;        // 0..1: 0 = all heads together, 1 = end-to-end
 
-  void init(const Source* src, float sampleRate, uint32_t seed = 0x12345678u) {
+  // pool: SS_MAX_VOICES * SS_VOICE_FLOATS floats of scratch for the voices'
+  // old_/ring_ buffers, carved up here. Supplied by the caller so it can live in
+  // SDRAM (plain data only — see Voice::setBuffers).
+  void init(const Source* src, float sampleRate, float* pool,
+            uint32_t seed = 0x12345678u) {
     src_ = src;
     sr_ = sampleRate;
     seed_ = seed;
     rng_ = seed;
-    for (int i = 0; i < SS_MAX_VOICES; i++) voice_[i].reset();
+    for (int i = 0; i < SS_MAX_VOICES; i++) {
+      float* base = pool + (size_t)i * SS_VOICE_FLOATS;
+      voice_[i].setBuffers(/*old_=*/base, /*ring_=*/base + SS_W);
+      voice_[i].reset();
+    }
     step_ = 0;
     armHead_ = armTail_ = 0;
     // Start at SS_LOOKAHEAD so the first head arms on sample 0 and becomes

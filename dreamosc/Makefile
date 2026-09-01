@@ -8,6 +8,13 @@ CPP_SOURCES = dreamosc.cpp
 LIBDAISY_DIR = ../libDaisy
 DAISYSP_DIR  = ../DaisySP
 
+# Built for the Daisy bootloader, which we need because the STM32 ROM bootloader
+# exposes no QSPI DFU target and sample audio has to live in QSPI (see CLAUDE.md).
+# BOOT_SRAM runs from internal SRAM: comparable speed to internal flash, 480 KB
+# limit (we use ~90 KB). Do NOT use BOOT_QSPI -- executing from QSPI is
+# "more cache-dependent" i.e. slower, a real risk for the audio callback.
+APP_TYPE = BOOT_SRAM
+
 # --- Vendored third-party sources -------------------------------------------
 # Pinned to exact upstream commits in ../vendor/manifest.txt and fetched by
 # ../vendor/fetch.sh. Vendored files are NEVER edited in place: `make
@@ -59,8 +66,9 @@ sample:
 	@test -n "$(SAMPLE_SRC)" || { echo "usage: make sample SAMPLE_SRC=/path/to.wav"; exit 2; }
 	../tools/wav2raw.py "$(SAMPLE_SRC)" "$(SAMPLE_BIN)"
 
-# 0x90100000 = 1 MB into QSPI, clear of the 256 KB the Daisy bootloader reserves
-# for firmware images at 0x90040000. Must match QSPI_BASE in dreamosc.cpp.
+# 0x90400000 is the third QSPI region per the bootloader's DFU descriptor
+# (0x90000000 reserved, 0x90040000 firmware images, 0x90400000 free).
+# Must match QSPI_BASE in dreamosc.cpp.
 program-sample:
 	@test -f "$(SAMPLE_BIN)" || { echo "no $(SAMPLE_BIN) -- run: make sample SAMPLE_SRC=..."; exit 2; }
-	dfu-util -a 0 -s 0x90100000:leave -D "$(SAMPLE_BIN)" -d ,0483:df11
+	dfu-util -a 0 -s 0x90400000:leave -D "$(SAMPLE_BIN)" -d ,0483:df11

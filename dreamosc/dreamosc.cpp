@@ -60,10 +60,13 @@ static Source   src;
 // Blob layout, little-endian (see tools/wav2raw.py):
 //   uint32 magic 'DRMO' | uint32 count | uint32 rate | uint32 reserved
 //   int16  samples[count]
-// The Daisy bootloader reserves the first 256 KB of QSPI for firmware images
-// (it loads apps from 0x90040000). Park sample data ABOVE that so the two can
-// never collide, even if we later switch to APP_TYPE=BOOT_QSPI.
-#define QSPI_BASE        0x90100000u   // 1 MB in: clear of the bootloader region
+// QSPI layout, read from the Daisy bootloader's own DFU descriptor:
+//   0x90000000  64 x 4KB   (256 KB) bootloader-reserved
+//   0x90040000  60 x 64KB  (3.75 MB) firmware images live here
+//   0x90400000  60 x 64KB  (3.75 MB) free
+// Sample data goes in the THIRD region so it can never collide with a firmware
+// image, even under APP_TYPE=BOOT_QSPI.
+#define QSPI_BASE        0x90400000u
 #define SAMPLE_MAGIC     0x4F4D5244u   // 'DRMO'
 
 struct SampleHeader {

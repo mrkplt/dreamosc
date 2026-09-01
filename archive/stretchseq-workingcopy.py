@@ -90,15 +90,19 @@ class StretchField:
         idx = (np.arange(length) + int(start)) % self.n_src
         return self.source[:, idx]
 
-    def pull(self, position, stretch, duration):
-        """Return `duration` seconds of stretch, starting at `position`.
+    def pull(self, position, stretch, n_frames):
+        """Return one head: n_frames*H samples, steady-state from sample 0.
 
         position : fraction in [0, 1) through the stretch
         stretch  : stretch factor (source seconds per output second = 1/stretch)
-        duration : output length in seconds
+        n_frames : body length in hops (durations quantize to the hop grid)
+
+        Frame -1 is a pre-roll: the frame one source-hop before the playhead,
+        rendered and its hop discarded. Its tail is the overlap partner for the
+        playhead frame's rise, consuming the first-hop rise, so the pull is at
+        full level from its very first sample. Heads butt-joint at full level;
+        the splice of uncorrelated steady material is design-accepted.
         """
-        n_out = int(round(duration * self.sr))
-        n_frames = n_out // self.H + 2
         position = position % 1.0
         src_start = position * self.n_src
         src_hop = self.H / float(stretch)          # how far the read head moves
@@ -109,12 +113,6 @@ class StretchField:
         # cacheable.
         rng = np.random.default_rng([self.seed, int(position * (1 << 44))])
 
-        # Overlap-add means every output sample is the sum of two frames, so a
-        # pull that simply starts at frame 0 is missing the contribution of the
-        # frame that would have preceded it: its first half-window comes out
-        # ~3.4 dB down and spectrally thin. The dependency is exactly one frame
-        # deep, so rendering one frame of pre-roll and discarding it puts the
-        # pull in steady state from its first sample. Random access stays O(1).
         out = np.zeros((self.n_ch, (n_frames + 2) * self.H + self.W))
         for k in range(-1, n_frames):
             frame = self._read(src_start + k * src_hop, self.W) * self.window
@@ -130,7 +128,7 @@ class StretchField:
             off = (k + 1) * self.H
             out[:, off:off + self.W] += frame
 
-        return out[:, self.H:self.H + n_out]
+        return out[:, self.H:self.H + n_frames * self.H]
 
 
 # ----------------------------------------------------------------------------
@@ -156,28 +154,29 @@ class Sequencer:
         self.spread = float(spread)
         self.rng = np.random.default_rng(seed)
 
+    def step_frames(self):
+        """Step duration in hops (durations quantize to the hop grid so a
+        head's natural tail lands exactly under the next head's rise)."""
+        return max(1, int(round(self.duration * self.field.sr / self.field.H)))
+
     @property
     def interval(self):
-        """Seconds between head starts, as a fraction of duration. spread is
-        0..1: 0 fires all heads together (interval 0), 1 spaces them end-to-end
-        (a head starts as the previous one ends)."""
+        """Seconds between head starts, as a fraction of the (hop-quantized)
+        duration. spread is 0..1: 0 fires all heads together (interval 0),
+        1 spaces them end-to-end (a head starts as the previous one ends)."""
         s = min(max(self.spread, 0.0), 1.0)
-        return self.duration * s
-
-    def _envelope(self, n):
-        """Equal-power (sine) fade in and out over the whole step."""
-        return np.sin(np.pi * (np.arange(n) + 0.5) / n)
+        return self.step_frames() * self.field.H * s / self.field.sr
 
     def render(self, passes=1):
         sr = self.field.sr
         n_steps = len(self.positions)
-        step_n = int(round(self.duration * sr))
+        H = self.field.H
+        n_frames = self.step_frames()
+        step_n = n_frames * H            # steady-state body, no tail
         hop_n = int(round(self.interval * sr))
         total = hop_n * (n_steps * passes - 1) + step_n
 
         out = np.zeros((self.field.n_ch, total))
-        power = np.zeros(total)                    # sum of squared envelopes
-        env = self._envelope(step_n)
 
         for i in range(n_steps * passes):
             s = i % n_steps
@@ -185,15 +184,22 @@ class Sequencer:
             pos = self.positions[s] + (self.rng.uniform(-d, d) if d > 0 else 0.0)
             pos = float(np.clip(pos, 0.0, 1.0))
 
-            audio = self.field.pull(pos, self.stretch, self.duration)
+            # No envelope: pre-rolled heads are steady-state from sample 0 and
+            # butt-joint at full level (design-accepted splice).
+            audio = self.field.pull(pos, self.stretch, n_frames)
             start = i * hop_n
-            out[:, start:start + step_n] += audio * env
-            power[start:start + step_n] += env ** 2
+            out[:, start:start + step_n] += audio
 
-        # Constant loudness: uncorrelated sources sum in power, so dividing by
-        # the square root of the summed squared envelopes holds level flat
-        # however many steps are stacked.
-        out *= 1.0 / np.sqrt(np.maximum(power, 1e-9))
+        # Constant loudness = a CONSTANT gain per spread setting, never an
+        # instantaneous divide. ~1/spread heads sound at once and uncorrelated
+        # sources sum in power, so sqrt(spread) (floored at 1/n_steps heads)
+        # holds overall RMS flat while each head's fade survives intact — heads
+        # meet at silence, so the lattice is transient-free by construction.
+        # (Dividing by sqrt(instantaneous summed env^2) cancels a lone head's
+        # fade and splices full-amplitude uncorrelated heads: a click of random
+        # size at every boundary.)
+        s = min(max(self.spread, 1.0 / n_steps), 1.0)
+        out *= np.sqrt(s)
         return out
 
 

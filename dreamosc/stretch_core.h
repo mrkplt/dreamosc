@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <atomic>
 
 // Emilie Gillet's real FFT, MIT licensed, as shipped with the Nimbus example in
 // DaisyExamples and used by its phase vocoder. Real rather than complex-on-real
@@ -40,9 +41,27 @@
 // case where all SS_STEPS heads arm at once. Heads armed but unfilled wait
 // silently (Voice::next), so this never shifts when a head actually sounds.
 #define SS_LOOKAHEAD SS_W
-// Short raw-edge fade (samples) applied at each head's start and end to mask the
-// splice transient between successive uncorrelated heads. ~5 ms at 48 kHz.
-#define SS_EDGE 240
+// Arm-request queue depth (power of two, >= SS_STEPS since spread 0 bursts all
+// SS_STEPS at once). The ISR pushes arm requests; the main loop starts voices.
+#define SS_ARMQ 16
+// Output headroom. The phase-randomized signal's peaks exceed its RMS (~1.07
+// measured); scale below 1.0 so the codec never clips (an over-range sample =
+// an audible tick on hardware). ~2 dB.
+#define SS_HEADROOM 0.8f
+// There is NO outer envelope or crossfade in either variant. Two seam
+// constructions, compile-time selectable for A/B listening:
+//
+// Default (butt-joint): each head pre-rolls frame -1 and discards its hop,
+// consuming the natural first-hop rise, so every head is steady-state from its
+// first audible sample and stops after its body: heads butt-joint at full
+// level (the uncorrelated splice at the joint is the audible variable).
+//
+// -DSS_SEAM_OLA (window-mediated): no pre-roll; the first hop rises naturally
+// and the last frame's tail rings out one hop, with adjacent heads overlapping
+// by that hop — the seam is the same overlap-add construction as the stretch
+// interior.
+//
+// Durations quantize to the hop grid (SS_H samples, ~43 ms) in both.
 
 // ---------------------------------------------------------------------------
 // Shared scratch. Only one voice renders at a time, from the main loop, so a
@@ -53,29 +72,41 @@ typedef ShyFFT<float, SS_W, RotationPhasor> SSFFT;
 
 struct StretchTables {
   SSFFT fft;
-  float window[SS_W];        // (1 - x^2)^1.25, Nasca's original curve
+  float window[SS_W];        // (1 - x^2)^1.25, Nasca's original curve (analysis)
   float sinLut[1024];
-  float olaGain;             // corrects the twice-windowed overlap-add sum
+  float synthGain;           // PaulXStretch synthesis output gain
 
   void init() {
     fft.Init();
-    for (int i = 0; i < SS_W; i++) {
-      float x = -1.0f + 2.0f * i / (SS_W - 1);
-      window[i] = powf(1.0f - x * x, 1.25f);
-    }
+    // Rectangular analysis window (constant 0.707), the canonical PaulXStretch
+    // default. A shaped window smears a tone across bins, and per-frame phase
+    // randomization of those bins beats at the bin spacing — measured 10.7 dB
+    // windowed-RMS wobble on a pure sine vs 6.7 dB with rect. (Residual wobble
+    // comes from leakage of non-bin-centered tones; the lever for that is a
+    // larger SS_W, which shrinks the bin spacing.)
+    for (int i = 0; i < SS_W; i++) window[i] = 0.707f;
     for (int i = 0; i < 1024; i++)
       sinLut[i] = sinf(2.0f * (float)M_PI * i / 1024.0f);
-    // Mean of the summed squared window across one hop, times ShyFFT's inverse
-    // scaling. Measured on a host: Direct followed by Inverse multiplies by
-    // SS_W, so the 1/N belongs here rather than inside the transform.
-    float s = 0.0f;
-    for (int i = 0; i < SS_H; i++)
-      s += window[i] * window[i] + window[i + SS_H] * window[i + SS_H];
-    olaGain = (1.0f / (s / SS_H)) / (float)SS_W;
+    // ShyFFT Direct+Inverse multiplies by SS_W (measured on host), so 1/SS_W
+    // undoes the transform scaling. The analysis window attenuates the input by
+    // its mean, so dividing by mean(window) restores unity-ish gain through the
+    // whole pipeline (verified by the unit-gain test).
+    float wsum = 0.0f;
+    for (int i = 0; i < SS_W; i++) wsum += window[i];
+    synthGain = 1.0f / ((wsum / SS_W) * (float)SS_W);
   }
 
   inline float sinAt(uint32_t idx) const { return sinLut[idx & 1023]; }
   inline float cosAt(uint32_t idx) const { return sinLut[(idx + 256) & 1023]; }
+  // Linearly interpolated LUT reads for smooth per-sample curves (a 1024-entry
+  // LUT read with truncation would staircase the crossfade coefficients).
+  inline float sinAtF(float idx) const {
+    uint32_t i0 = (uint32_t)idx;
+    float f = idx - (float)i0;
+    float s0 = sinLut[i0 & 1023], s1 = sinLut[(i0 + 1) & 1023];
+    return s0 + (s1 - s0) * f;
+  }
+  inline float cosAtF(float idx) const { return sinAtF(idx + 256.0f); }
 };
 
 extern StretchTables gTab;
@@ -103,12 +134,21 @@ struct Source {
 
 class Voice {
  public:
-  void reset() { active_ = false; wr_ = rr_ = 0; }
-  bool active() const { return active_; }
+  void reset() {
+    active_.store(false, std::memory_order_relaxed);
+    wr_.store(0, std::memory_order_relaxed);
+    rr_.store(0, std::memory_order_relaxed);
+  }
+  bool active() const { return active_.load(std::memory_order_acquire); }
 
-  // position: 0..1 through the stretch. stretch: factor. lenSamples: duration.
+  // position: 0..1 through the stretch. stretch: factor. lenSamples: duration in
+  // samples, already quantized to a multiple of SS_H by the sequencer.
+  // onsetDelay: samples to stay silent (filling) before becoming audible.
+  // The audible span is lenSamples + SS_H: the first frame rises naturally (no
+  // pre-roll) and the last frame's tail rings out for one hop — those natural
+  // window edges ARE the head's fades, identical to the stretch interior.
   void start(const Source* src, float position, float stretch,
-             uint32_t lenSamples, uint32_t seed) {
+             uint32_t lenSamples, uint32_t seed, uint32_t onsetDelay = 0) {
     src_ = src;
     if (position < 0.0f) position = 0.0f;
     if (position >= 1.0f) position = 0.999999f;
@@ -117,88 +157,107 @@ class Voice {
     len_ = lenSamples;
     out_ = 0;
     produced_ = 0;
-    wr_ = rr_ = 0;
+    onsetDelay_ = onsetDelay;
+    wr_.store(0, std::memory_order_relaxed);
+    rr_.store(0, std::memory_order_relaxed);
     // Phase seed comes from the position, not from a counter, so the same
     // position always yields the same audio. That is what makes zero drift a
     // literal repeat.
     rng_ = seed ^ (uint32_t)(position * 4294967295.0);
     if (rng_ == 0) rng_ = 0x9E3779B9u;
-    memset(accum_, 0, sizeof(accum_));
-    frame_ = -1;
-    preRolled_ = false;   // pre-roll happens in topUp() (main loop), NOT here
-    active_ = true;
+    memset(old_, 0, sizeof(old_));
+#ifdef SS_SEAM_OLA
+    preRolled_ = true;    // no pre-roll: the natural first-hop rise is the seam
+#else
+    preRolled_ = false;   // frame -1 renders in topUp() (main loop), not here
+#endif
+    // Release-store LAST: every plain field above must be visible to the ISR
+    // before it can observe active_ == true. Without the barrier the ISR could
+    // see a half-initialized voice (ARM reorders plain stores).
+    active_.store(true, std::memory_order_release);
   }
 
-  // Called from the main loop. Returns true if it did work. The FFT-heavy work
-  // (pre-roll + frame rendering) lives here, off the audio callback, so
-  // triggering a voice never blocks next(). start() only arms the voice; the
-  // first topUp() does the one-frame pre-roll before emitting.
+  // Called from the main loop. Returns true if it did work. The FFT-heavy
+  // frame rendering lives here, off the audio callback, so triggering a voice
+  // never blocks next(). In the butt-joint variant the first topUp() renders
+  // frame -1 (pre-roll) straight into old_: the first emitted block then starts
+  // 100% inside frame -1's waveform, so the head is at full level from its very
+  // first audible sample. In the seam variant old_ starts silent and the first
+  // block ramps in through the raised cosine.
   bool topUp() {
-    if (!active_) return false;
+    if (!active_.load(std::memory_order_acquire)) return false;
     if (!preRolled_) {
-      // Pre-roll. Overlap-add means every output sample is the sum of two
-      // frames; starting cold leaves the first half-window ~3.5 dB down and
-      // spectrally thin. The dependency is exactly one frame deep, so render one
-      // frame ahead of the start point and discard its output.
       renderFrame();
-      discardHop();
+      memcpy(old_, gWork, sizeof(old_));   // frame -1 becomes "old"
       preRolled_ = true;
       return true;
     }
-    // Keep the ring as full as it can go (leaving room for one more hop) rather
-    // than topping up only when it drains below one hop. The old SS_H cap let the
-    // ring run all the way to empty between refills, so the audio callback could
-    // catch the producer and momentarily starve — audible as a gated/stuttering
-    // signal. Filling to SS_RING - SS_H keeps a multi-hop cushion.
+    // Keep the ring as full as it can go (leaving room for one more hop);
+    // letting it drain to empty between refills lets the callback catch the
+    // producer and starve.
     if (fill() > SS_RING - SS_H) return false;
-    if (produced_ >= len_ + SS_H) return false;
+#ifdef SS_SEAM_OLA
+    if (produced_ < len_) {              // body: render a frame, emit a hop
+      renderFrame();
+      emitHop();
+      return true;
+    }
+    if (produced_ < len_ + SS_H) {       // natural tail: the last frame fades
+      memset(gWork, 0, sizeof(float) * SS_W);   // out against silence
+      emitHop();
+      return true;
+    }
+    return false;
+#else
+    if (produced_ >= len_) return false;
     renderFrame();
     emitHop();
     return true;
+#endif
   }
 
-  // Called from the audio callback. Writes the enveloped sample and its
-  // squared envelope, for the loudness compensation.
-  inline void next(float* sample, float* envSq) {
-    if (!active_) { *sample = 0.0f; *envSq = 0.0f; return; }
-    // Ring empty = main loop has not filled this head yet (its FFTs are still in
-    // flight). Output silence and DO NOT advance the envelope: the head waits at
-    // its onset rather than burning its lifetime playing an empty buffer. This
-    // turns a would-be underrun into an inaudible brief wait that self-corrects
-    // as soon as service() catches up. Arming heads LOOKAHEAD samples early (see
-    // Sequencer) makes that wait zero in the normal case.
-    if (rr_ == wr_) {
-      extern volatile uint32_t gUnderruns;  // diagnostic: ring starved mid/at-onset
+  // Called from the audio callback. Returns the enveloped sample. The sine fade
+  // is applied here and SURVIVES to the output — the sequencer compensates
+  // loudness with a constant per-spread gain, never an instantaneous divide (an
+  // instantaneous sum/sqrt(power) cancels a lone head's fade entirely, splicing
+  // full-amplitude uncorrelated heads at every boundary: the click).
+  inline float next() {
+    if (!active_.load(std::memory_order_acquire)) return 0.0f;
+    // Onset delay: the head is armed but not yet audible. It sits silent while
+    // the main loop pre-rolls and fills its buffer (the lookahead window), then
+    // becomes audible primed — this is what prevents an onset underrun.
+    if (onsetDelay_ > 0) { onsetDelay_--; return 0.0f; }
+    // Acquire-load wr_: pairs with emitHop's release-store, guaranteeing every
+    // ring_ sample the index covers is visible before we read it.
+    uint32_t w = wr_.load(std::memory_order_acquire);
+    uint32_t r = rr_.load(std::memory_order_relaxed);
+    // Ring empty despite the onset delay = the worker fell behind even with the
+    // lookahead (should not happen in normal load). Count it and output clean
+    // silence without advancing the envelope, so it self-corrects.
+    if (r == w) {
+      extern volatile uint32_t gUnderruns;
       gUnderruns++;
-      *sample = 0.0f; *envSq = 0.0f; return;
+      return 0.0f;
     }
-    float raw = ring_[rr_ & (SS_RING - 1)];
-    rr_++;
+    float raw = ring_[r & (SS_RING - 1)];
+    rr_.store(r + 1, std::memory_order_release);
 
-    // Short raw-edge fade to mask the splice transient. The whole-step sine fade
-    // (`e` below) is divided back out by the sequencer's power normalization when
-    // only one head sounds, so it cannot hide the boundary discontinuity — a head
-    // otherwise ends/begins at full amplitude and the handoff clicks. Fading the
-    // RAW sample (before the power math sees it) forces the signal to zero across
-    // the first/last SS_EDGE samples regardless of normalization, so successive
-    // uncorrelated heads splice silently.
-    uint32_t edge = SS_EDGE < len_ / 2 ? SS_EDGE : len_ / 2;
-    if (edge > 0) {
-      if (out_ < edge)
-        raw *= (float)out_ / (float)edge;
-      else if (out_ >= len_ - edge)
-        raw *= (float)(len_ - 1 - out_) / (float)edge;
-    }
-
-    // Equal-power (sine) fade across the whole step.
-    float e = gTab.sinAt((uint32_t)(1024.0f * 0.5f * out_ / (float)len_));
-    *sample = raw * e;
-    *envSq = e * e;
-    if (++out_ >= len_) active_ = false;
+    // No envelope in either variant; only the audible span differs.
+#ifdef SS_SEAM_OLA
+    if (++out_ >= len_ + SS_H) active_.store(false, std::memory_order_release);
+#else
+    if (++out_ >= len_) active_.store(false, std::memory_order_release);
+#endif
+    return raw;
   }
 
  private:
-  inline uint32_t fill() const { return wr_ - rr_; }
+  // Producer-side occupancy. A stale rr_ only underestimates how much has been
+  // consumed, making the producer conservative — safe.
+  inline uint32_t fill() const {
+    return wr_.load(std::memory_order_relaxed)
+         - rr_.load(std::memory_order_relaxed);
+  }
 
   inline uint32_t rand32() {
     rng_ ^= rng_ << 13; rng_ ^= rng_ >> 17; rng_ ^= rng_ << 5;
@@ -226,38 +285,54 @@ class Voice {
     gSpec[0] = 0.0f;                            // DC
     gSpec[SS_W / 2] = 0.0f;                     // Nyquist
 
+    // Full periodic IFFT waveform — NO synthesis window, no overlap-add. The
+    // canonical PaulXStretch synthesis (essej/paulxstretch Stretch.cpp) plays
+    // whole frames back-to-back via emitHop()'s raised-cosine handoff instead.
     gTab.fft.Inverse(gSpec, gWork);
-    for (int i = 0; i < SS_W; i++)
-      accum_[i] += gWork[i] * gTab.window[i];
 
     srcPos_ += srcHop_;
-    frame_++;
   }
 
-  void slideAccum() {
-    memmove(accum_, accum_ + SS_H, SS_H * sizeof(float));
-    memset(accum_ + SS_H, 0, SS_H * sizeof(float));
-  }
-
-  void discardHop() { slideAccum(); }
-
+  // Canonical PaulXStretch output block (one hop). The block blends the current
+  // frame's SECOND half against the previous frame's FIRST half with a raised
+  // cosine (a: 1 -> 0). At every block boundary the output is 100% a single
+  // frame at its circular wrap point — an IFFT is periodic, so sample 0 follows
+  // sample SS_W-1 with perfect phase continuity: block joints are seamless by
+  // construction, and uncorrelated-frame mixing is confined to mid-block. The
+  // 0.853553... = (1+1/sqrt2)/2 curve corrects the expected amplitude dip of
+  // that mid-block mix. This is what kills the hop-rate amplitude wobble the
+  // double-window OLA synthesis had on tonal material.
   void emitHop() {
-    for (int i = 0; i < SS_H; i++)
-      ring_[(wr_ + i) & (SS_RING - 1)] = accum_[i] * gTab.olaGain;
-    wr_ += SS_H;
+    const float h = 0.853553390593f;
+    uint32_t w = wr_.load(std::memory_order_relaxed);
+    for (int i = 0; i < SS_H; i++) {
+      // a = 0.5 + 0.5*cos(pi*i/SS_H): fraction of 2*pi is i/(2*SS_H).
+      float a = 0.5f + 0.5f * gTab.cosAtF(1024.0f * i / (2.0f * SS_H));
+      float mixed = gWork[SS_H + i] * (1.0f - a) + old_[i] * a;
+      // corr = h - (1-h)*cos(2*pi*i/SS_H): 1/sqrt2 at the (single-frame) edges,
+      // 1.0 at the (mixed) middle.
+      float corr = h - (1.0f - h) * gTab.cosAtF(1024.0f * i / (float)SS_H);
+      ring_[(w + i) & (SS_RING - 1)] = mixed * corr * gTab.synthGain;
+    }
+    // Release-store publishes the hop: all ring_ writes above are guaranteed
+    // visible to the ISR before it can observe the advanced wr_.
+    wr_.store(w + SS_H, std::memory_order_release);
     produced_ += SS_H;
-    slideAccum();
+    memcpy(old_, gWork, sizeof(old_));   // current frame becomes "old"
   }
 
   const Source* src_ = nullptr;
   double srcPos_ = 0.0, srcHop_ = 0.0;   // double: position precision matters
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
-  int32_t frame_ = -1;
-  bool active_ = false;
-  bool preRolled_ = false;
-  float accum_[SS_W];
+  uint32_t onsetDelay_ = 0;   // samples silent-and-filling before audible
+  bool preRolled_ = false;    // frame -1 rendered (consumes the first-hop rise)
+  float old_[SS_W];   // previous frame's full IFFT waveform (PXS handoff)
   float ring_[SS_RING];
-  volatile uint32_t wr_ = 0, rr_ = 0;
+  // Cross-thread state (main-loop producer / audio-ISR consumer). active_ is the
+  // publication gate for a freshly start()ed voice; wr_/rr_ are the SPSC ring
+  // indices. Release/acquire pairs make the data they guard visible in order.
+  std::atomic<bool>     active_{false};
+  std::atomic<uint32_t> wr_{0}, rr_{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -281,23 +356,37 @@ class Sequencer {
     rng_ = seed;
     for (int i = 0; i < SS_MAX_VOICES; i++) voice_[i].reset();
     step_ = 0;
-    armClock_ = 0;   // arm the first head on the very first next()
+    armHead_ = armTail_ = 0;
+    // Start at SS_LOOKAHEAD so the first head arms on sample 0 and becomes
+    // audible SS_LOOKAHEAD samples later (~85 ms) — primed, so no startup click.
+    armClock_ = SS_LOOKAHEAD;
+  }
+
+  // Step duration in samples, quantized to the hop grid (multiples of SS_H).
+  // The quantization is what keeps a head's natural tail exactly overlapping
+  // the next head's natural rise at spread 1 — the seam only reconstructs the
+  // interior OLA sum when the two land on the same grid.
+  uint32_t lenSamples() const {
+    uint32_t hops = (uint32_t)(duration * sr_ / SS_H + 0.5f);
+    return (hops < 1 ? 1 : hops) * SS_H;
   }
 
   // Samples between successive head starts. spread is 0..1 as a fraction of the
-  // step duration: 0 fires all heads together, 1 spaces them end-to-end. The
-  // whole 8-head pattern repeats every patternSamples().
+  // (quantized) step duration: 0 fires all heads together, 1 end-to-end.
   uint32_t intervalSamples() const {
     float s = spread < 0.0f ? 0.0f : (spread > 1.0f ? 1.0f : spread);
-    return (uint32_t)(duration * sr_ * s);
+    return (uint32_t)(lenSamples() * s);
   }
 
   // How long one full pass of all SS_STEPS heads takes: the last head starts at
-  // (SS_STEPS-1)*interval and lasts one duration. At spread 0 that is just one
-  // duration (all heads fire at t=0); at spread 1 it is SS_STEPS durations.
+  // (SS_STEPS-1)*interval; its audible span is its body (butt-joint) or body
+  // plus one-hop tail (seam-OLA variant).
   uint32_t patternSamples() const {
-    uint32_t dur = (uint32_t)(duration * sr_);
-    return (SS_STEPS - 1) * intervalSamples() + dur;
+#ifdef SS_SEAM_OLA
+    return (SS_STEPS - 1) * intervalSamples() + lenSamples() + SS_H;
+#else
+    return (SS_STEPS - 1) * intervalSamples() + lenSamples();
+#endif
   }
 
   // Audio callback. One sample of the whole sequence.
@@ -313,32 +402,58 @@ class Sequencer {
     // never drains dry. armClock_ counts samples until the next head is ARMED;
     // arming is intrinsically LOOKAHEAD-ahead of onset because a just-armed head
     // waits silently (Voice::next) until service() fills its FIFO.
+    // armClock_ counts down to the next head's ONSET. We arm a head SS_LOOKAHEAD
+    // samples early and hand trigger() that same lookahead as the head's
+    // onsetDelay, so the worker has SS_LOOKAHEAD samples to pre-roll + fill the
+    // buffer while the voice sits silent; the head becomes audible exactly at its
+    // scheduled onset — primed, no underrun.
     uint32_t interval = intervalSamples();
-    while (armClock_ == 0) {
-      trigger();
-      // spread ~0 (interval 0): all heads share one onset — arm them in a burst
-      // this sample, then wait one full pattern before the next burst.
-      armClock_ = interval > 0 ? interval : patternSamples();
+    if (armClock_ == SS_LOOKAHEAD) {
+      if (interval == 0) {
+        // spread ~0: all SS_STEPS heads share this onset — request them together.
+        for (int k = 0; k < SS_STEPS; k++) requestArm(SS_LOOKAHEAD);
+        armClock_ = patternSamples() + SS_LOOKAHEAD;
+      } else {
+        requestArm(SS_LOOKAHEAD);
+        armClock_ = interval + SS_LOOKAHEAD;   // next onset one interval later
+      }
     }
     armClock_--;
 
-    float sum = 0.0f, power = 0.0f;
-    for (int i = 0; i < SS_MAX_VOICES; i++) {
-      float s, e2;
-      voice_[i].next(&s, &e2);
-      sum += s;
-      power += e2;
-    }
-    // Uncorrelated sources sum in power, so dividing by the square root of the
-    // summed squared envelopes holds level flat however many steps are
-    // stacked. Spread stays a character control and never a loudness one.
-    return power > 1e-6f ? sum / sqrtf(power) : 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < SS_MAX_VOICES; i++) sum += voice_[i].next();
+    // Constant loudness = a CONSTANT gain per spread setting, never an
+    // instantaneous divide. ~1/spread heads sound at once and uncorrelated
+    // sources sum in power, so scaling by sqrt(spread) (floored at 1/SS_STEPS
+    // heads) holds overall RMS flat across the spread range while leaving each
+    // head's fade intact — heads meet at silence, so the lattice is transient-
+    // free by construction. (The old sum/sqrt(instantaneous power) flattened a
+    // lone head to full-amplitude raw and spliced uncorrelated heads at the
+    // boundary: an audible click of random size at every step.)
+    float s = spread < 1.0f / SS_STEPS ? 1.0f / SS_STEPS
+                                       : (spread > 1.0f ? 1.0f : spread);
+    float out = sum * sqrtf(s) * SS_HEADROOM;
+    // Hard clamp: the codec must never see an over-range sample (a clip is an
+    // audible tick on hardware even though the float host plays it silently).
+    if (out > 1.0f) out = 1.0f;
+    else if (out < -1.0f) out = -1.0f;
+    return out;
   }
 
-  // Main loop. Keeps every voice's FIFO ahead of the audio callback. Does at
-  // most one FFT per call (to bound latency) and returns true if it did work, so
-  // a caller can spin it until there is nothing left to do.
+  // Main loop. Two jobs, both OFF the audio ISR: (1) drain pending arm requests
+  // by actually starting voices here — all Voice-state mutation happens in this
+  // one thread, so it never races the ISR's next() (the bug that clicked every
+  // head onset was start()'s memset/reset running in the ISR while topUp() wrote
+  // the same voice from the main loop); (2) keep FIFOs full. One unit of work per
+  // call, returns true if it did work, so a caller can spin until idle.
   bool service() {
+    uint32_t h = armHead_.load(std::memory_order_acquire);
+    uint32_t t = armTail_.load(std::memory_order_relaxed);
+    if (h != t) {                         // a pending arm request from the ISR
+      startVoice(armReq_[t & (SS_ARMQ - 1)]);
+      armTail_.store(t + 1, std::memory_order_release);
+      return true;
+    }
     for (int i = 0; i < SS_MAX_VOICES; i++)
       if (voice_[i].topUp()) return true;
     return false;
@@ -350,7 +465,20 @@ class Sequencer {
     return rng_;
   }
 
-  void trigger() {
+  // ISR side: enqueue an arm request only. No Voice state is touched here — the
+  // heavy start() runs in the main loop (startVoice) to avoid racing topUp().
+  inline void requestArm(uint32_t onsetDelay) {
+    uint32_t h = armHead_.load(std::memory_order_relaxed);
+    uint32_t t = armTail_.load(std::memory_order_acquire);
+    if (h - t >= SS_ARMQ) return;                 // queue full: drop
+    armReq_[h & (SS_ARMQ - 1)] = onsetDelay;
+    // Release publishes the request payload before the index moves.
+    armHead_.store(h + 1, std::memory_order_release);
+  }
+
+  // Main-loop side: actually start a voice for the next step. All Voice-state
+  // mutation and the step/rng/drift advance happen here, single-threaded.
+  void startVoice(uint32_t onsetDelay) {
     int slot = -1;
     for (int i = 0; i < SS_MAX_VOICES; i++)
       if (!voice_[i].active()) { slot = i; break; }
@@ -365,7 +493,7 @@ class Sequencer {
       if (p > 1.0f) p = 1.0f;
     }
     voice_[slot].start(src_, p, stretch,
-                       (uint32_t)(duration * sr_), seed_);
+                       lenSamples(), seed_, onsetDelay);
     step_ = (step_ + 1) % SS_STEPS;
   }
 
@@ -374,6 +502,10 @@ class Sequencer {
   float sr_ = 48000.0f;
   uint32_t armClock_ = 0, seed_ = 0, rng_ = 1;  // armClock_: samples to next arm
   int step_ = 0;
+  // SPSC arm queue: ISR (next) pushes at armHead_, main loop (service) pops at
+  // armTail_. SS_ARMQ must be a power of two and >= SS_STEPS (spread 0 bursts 8).
+  uint32_t armReq_[SS_ARMQ];
+  std::atomic<uint32_t> armHead_{0}, armTail_{0};
 };
 
 #endif  // STRETCH_CORE_H

@@ -56,15 +56,29 @@ static void fill_stub_source() {
 }
 
 // --- audio -----------------------------------------------------------------
+// #129 bisection: define DEBUG_PURE_TONE to bypass the sequencer entirely and
+// emit a continuous 220 Hz sine. If THAT still clicks every second, the click is
+// in the firmware/codec path, not the sequencer/DSP.
 static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                           AudioHandle::InterleavingOutputBuffer out,
                           size_t                                size) {
   pod.ProcessAllControls();
+#ifdef DEBUG_PURE_TONE
+  static float phase = 0.0f;
+  const float  inc = 2.0f * (float)M_PI * 220.0f / SAMPLE_RATE;
+  for (size_t i = 0; i < size; i += 2) {
+    float s = 0.3f * sinf(phase);
+    phase += inc;
+    if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+    out[i] = s; out[i + 1] = s;
+  }
+#else
   for (size_t i = 0; i < size; i += 2) {
     float s     = seq.next();
     out[i]      = s;   // left
     out[i + 1]  = s;   // right
   }
+#endif
 }
 
 int main(void) {

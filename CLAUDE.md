@@ -88,6 +88,33 @@ run `dreamosc/test/run.sh` and keep it green. A change to `stretch_core.h` /
 tolerances from measurement with a written reason, never loosen one to hide a
 regression.** Details in `dreamosc/test/README.md`.
 
+### Vendored code (shy_fft.h, and anything else pulled in from elsewhere)
+
+**Do not edit vendored/third-party files in place, and do not write tests against
+them without checking upstream first.** This bit us once: a self-recursive
+`cos`/`sin` bug was found in `shy_fft.h` by writing a new test against it, then
+patched in place — without checking (a) whether stmlib's own `test/` already had
+FFT coverage we should have used instead, or (b) whether the bug was already
+known/fixed upstream (it was — pichenettes/stmlib PR #7, 2021). An in-place edit
+to a vendored file is invisible to anything that manages the dependency: a
+re-vendor, an upstream update, or another agent pulling a fresh copy silently
+wipes it out with no signal that a fix disappeared, and the file looks
+untouched-vendored right up until it isn't.
+
+Before touching anything under a vendored path:
+1. **Check upstream first** — for existing tests before writing new ones, and for
+   an existing fix before writing a local one. A five-minute search beats a silent
+   fork.
+2. **Prefer working around vendored code from our own code** over editing the
+   vendored file. If a fix genuinely must land in the vendored file, it needs to
+   be a *visible, deliberate* change — not indistinguishable from the delivered
+   original — and ideally tracked as an explicit patch or an upstream-version
+   bump, not a quiet in-place diff.
+3. **Ask before patching a dependency.** This is a case where the cost of
+   pausing to confirm is real: the same 20 minutes spent finding and fixing the
+   bug could instead have been spent flagging it and asking how the owner wants
+   it handled.
+
 ### Flashing the Pod (DFU)
 
 `make program-dfu` uploads over USB DFU. The board must be in the bootloader first:

@@ -17,5 +17,8 @@ dreamosc/host/.venv/
 dreamosc/host/stretchcore
 dreamosc/host/*.wav
 
+# Test artifacts
+dreamosc/test/unit_tests
+
 # macOS
 .DS_Store

@@ -73,18 +73,30 @@ archive/              The original reference files, as delivered (see below)
 cd dreamosc && make                 # -> build/dreamosc.bin
 make program-dfu                    # BOOT+RESET the Seed into DFU first
 
-# Host verification (proves the C++ core matches the Python)
+# Host tests (run before committing a DSP change)
+cd dreamosc/test && ./run.sh    # Catch2 unit tests + golden C++-vs-Python regression
+
+# Ad-hoc render (manual listening / debugging)
 cd dreamosc/host
 c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
 ./stretchcore in.wav out.wav --stretch 50 --duration 4 --spread 1
-.venv/bin/python stretchseq.py in.wav ref.wav --stretch 50 --duration 4 --spread 1
 ```
+
+**Testing culture: the DSP core is platform-free so it can be tested on the host —
+run `dreamosc/test/run.sh` and keep it green. A change to `stretch_core.h` /
+`shy_fft.h` is not done until the suite passes. Add a test with new behavior; set
+tolerances from measurement with a written reason, never loosen one to hide a
+regression.** Details in `dreamosc/test/README.md`.
 
 ## State of play (what's done, what's next)
 
-- **DSP core: host-verified.** C++ vs Python — identical length, RMS within
-  +0.12 dB, spectral shape correlated 0.92 (phase differs by design: different
-  RNGs). The port is faithful to `stretchseq.py`.
+- **DSP core: host-tested.** Run `dreamosc/test/run.sh` — Catch2 unit tests over
+  `stretch_core.h` (determinism, NaN/bounds, the spread model, constant-loudness,
+  multi-samplerate) plus a golden regression that diffs the C++ core against the
+  Python reference (length / RMS / spectral shape, tolerances documented). Both
+  gate on exit code. See `dreamosc/test/README.md`. The port is faithful to
+  `stretchseq.py` (phase differs by design — different RNGs — so tests assert
+  invariants, not bit-equality).
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
   stereo->mono fold). Not yet run on hardware (no card yet).

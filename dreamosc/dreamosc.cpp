@@ -40,6 +40,14 @@ static float DSY_SDRAM_BSS sourceBuf[SOURCE_LEN];
 // SRAM. #130 revisits placement/budget deliberately; #129 needs it to run.
 static Sequencer seq;
 
+// Voice working buffers (old_ + ring_ per voice, ~384 KB at SS_W 4096) live in
+// SDRAM: far too big for the 512 KB internal SRAM once anything else is present.
+// This is a plain array, NOT an object -- .sdram_bss is NOLOAD and SDRAM is
+// unpowered at static-init time, so constructors never run and storage is not
+// zeroed there. Sequencer::init() carves this up and hands each Voice a slice;
+// the Voice objects themselves stay in SRAM where C++ works normally.
+static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
+
 static DaisyPod pod;
 static Source   src;
 
@@ -90,7 +98,7 @@ int main(void) {
   src.data = sourceBuf;
   src.len  = SOURCE_LEN;
 
-  seq.init(&src, pod.AudioSampleRate());
+  seq.init(&src, pod.AudioSampleRate(), voicePool);
   // Defaults from the spec; controls (#132) will drive these live later.
   seq.stretch  = 50.0f;
   seq.duration = 1.0f;   // #129 debug: 1s steps -> 8s pattern, faster to hear

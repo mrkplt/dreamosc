@@ -88,32 +88,43 @@ run `dreamosc/test/run.sh` and keep it green. A change to `stretch_core.h` /
 tolerances from measurement with a written reason, never loosen one to hide a
 regression.** Details in `dreamosc/test/README.md`.
 
-### Vendored code (shy_fft.h, and anything else pulled in from elsewhere)
+### Vendored dependencies
 
-**Do not edit vendored/third-party files in place, and do not write tests against
-them without checking upstream first.** This bit us once: a self-recursive
-`cos`/`sin` bug was found in `shy_fft.h` by writing a new test against it, then
-patched in place — without checking (a) whether stmlib's own `test/` already had
-FFT coverage we should have used instead, or (b) whether the bug was already
-known/fixed upstream (it was — pichenettes/stmlib PR #7, 2021). An in-place edit
-to a vendored file is invisible to anything that manages the dependency: a
-re-vendor, an upstream update, or another agent pulling a fresh copy silently
-wipes it out with no signal that a fix disappeared, and the file looks
-untouched-vendored right up until it isn't.
+Third-party sources are **pinned to an exact upstream commit** in
+`vendor/manifest.txt` (`<repo> <sha> <src-path> <dest-path>`) and fetched by
+`vendor/fetch.sh`, wired into the build:
 
-Before touching anything under a vendored path:
-1. **Check upstream first** — for existing tests before writing new ones, and for
-   an existing fix before writing a local one. A five-minute search beats a silent
-   fork.
-2. **Prefer working around vendored code from our own code** over editing the
-   vendored file. If a fix genuinely must land in the vendored file, it needs to
-   be a *visible, deliberate* change — not indistinguishable from the delivered
-   original — and ideally tracked as an explicit patch or an upstream-version
-   bump, not a quiet in-place diff.
-3. **Ask before patching a dependency.** This is a case where the cost of
-   pausing to confirm is real: the same 20 minutes spent finding and fixing the
-   bug could instead have been spent flagging it and asking how the owner wants
-   it handled.
+```
+make vendor          # fetch/refresh vendored sources at their pinned SHAs
+make vendor-check    # verify on-disk files still match upstream (build gate)
+```
+
+`vendor-check` also runs at the top of `dreamosc/test/run.sh`. A fresh clone
+fetches automatically on first build. Vendored files land under
+`dreamosc/vendor_stmlib/` and are **byte-identical to upstream** — no local
+edits, ever.
+
+**Rules:**
+1. **Never edit a vendored file in place.** `vendor-check` re-fetches from the
+   pinned SHA and fails on any difference, so an edit is caught rather than
+   silently carried. If upstream is broken, either bump the SHA to a fixed
+   upstream commit or work around it from *our* code.
+2. **Check upstream before writing tests or fixes.** Look for existing upstream
+   tests before writing your own, and an existing upstream fix before writing a
+   local one.
+3. **Pin the source of truth, not the most convenient copy.** Choose the
+   longest-lived / best-supported repo that is actually authoritative for the
+   file. `shy_fft.h` comes from `pichenettes/stmlib` (its canonical home) rather
+   than Electro-Smith's DaisyExamples copy, which pins stmlib at a June-2021
+   commit predating the `Math<double>` cos/sin infinite-recursion fix — pinning
+   there would have baked in a known-buggy snapshot.
+
+**Why this exists:** a self-recursive `cos`/`sin` bug in `shy_fft.h` was found by
+writing a test against it, then patched *in place* — without first checking
+whether upstream already had tests (it has none) or had already fixed the bug (it
+had, in PR #7, 2021). A hand-copied file with a silent local edit has no
+provenance, no pinning, and no rollback path, and the next re-vendor wipes the fix
+with no signal. Pinning at a SHA plus a drift check gives all three.
 
 ### Flashing the Pod (DFU)
 

@@ -1,0 +1,20 @@
+# Vendored third-party sources. Fetched by `make vendor` (see dreamosc/Makefile).
+#
+# Format: <repo-url> <sha> <path-in-repo> <dest-path-relative-to-repo-root>
+#
+# Rules:
+#   - Pin an exact SHA, never a branch. Reproducible + auditable.
+#   - Never edit vendored files in place. If upstream is broken, bump the SHA to
+#     a fixed upstream commit, or work around it from our own code.
+#   - Upstream chosen as the SOURCE OF TRUTH, not the most convenient copy:
+#     pichenettes/stmlib is the canonical home of shy_fft.h (Mutable
+#     Instruments, 2012-2023). Electro-Smith's DaisyExamples carries a copy but
+#     pins stmlib at 5dc8b89 (June 2021), which predates the Math<double>
+#     cos/sin infinite-recursion fix (PR #7, merged 2021-11-13) -- pinning there
+#     would institutionalize a known-buggy snapshot.
+#
+# d18def8 is current stmlib master (2023-09-03). For fft/shy_fft.h it is
+# byte-identical to the fix commit 83550a9, verified by diff.
+
+https://github.com/pichenettes/stmlib d18def816c51d1da0c108236928b2bbd25c17481 fft/shy_fft.h dreamosc/vendor_stmlib/shy_fft.h
+https://github.com/pichenettes/stmlib d18def816c51d1da0c108236928b2bbd25c17481 stmlib.h dreamosc/vendor_stmlib/stmlib/stmlib.h

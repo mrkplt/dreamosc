@@ -15,7 +15,12 @@
 // DaisyExamples and used by its phase vocoder. Real rather than complex-on-real
 // input, so about half the arithmetic of a naive transform, and already tuned
 // for this chip.
-#include "shy_fft.h"
+// Vendored upstream, unmodified, pinned in vendor/manifest.txt
+// (pichenettes/stmlib@d18def8). Do NOT edit it; `make vendor-check` fails if it
+// drifts. Upstream wraps everything in namespace stmlib.
+#include "vendor_stmlib/shy_fft.h"
+using stmlib::ShyFFT;
+using stmlib::RotationPhasor;
 
 // ---------------------------------------------------------------------------
 // Configuration

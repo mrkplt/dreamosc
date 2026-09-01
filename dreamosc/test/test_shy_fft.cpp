@@ -11,7 +11,9 @@
 #include <cmath>
 #include <vector>
 
-#include "shy_fft.h"
+#include "vendor_stmlib/shy_fft.h"
+using stmlib::ShyFFT;
+using stmlib::RotationPhasor;
 
 TEST_CASE("ShyFFT<float,64> round-trips (small size, bit_rev_ LUT path)") {
   // size=64 -> num_passes=6 <= 8, so Init() builds and Direct/Inverse use the

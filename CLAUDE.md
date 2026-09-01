@@ -88,15 +88,72 @@ run `dreamosc/test/run.sh` and keep it green. A change to `stretch_core.h` /
 tolerances from measurement with a written reason, never loosen one to hide a
 regression.** Details in `dreamosc/test/README.md`.
 
+### Vendored dependencies
+
+Third-party sources are **pinned to an exact upstream commit** in
+`vendor/manifest.txt` (`<repo> <sha> <src-path> <dest-path>`) and fetched by
+`vendor/fetch.sh`, wired into the build:
+
+```
+make vendor          # fetch/refresh vendored sources at their pinned SHAs
+make vendor-check    # verify on-disk files still match upstream (build gate)
+```
+
+`vendor-check` also runs at the top of `dreamosc/test/run.sh`. A fresh clone
+fetches automatically on first build. Vendored files land under
+`dreamosc/vendor_stmlib/` and are **byte-identical to upstream** — no local
+edits, ever.
+
+**Rules:**
+1. **Never edit a vendored file in place.** `vendor-check` re-fetches from the
+   pinned SHA and fails on any difference, so an edit is caught rather than
+   silently carried. If upstream is broken, either bump the SHA to a fixed
+   upstream commit or work around it from *our* code.
+2. **Check upstream before writing tests or fixes.** Look for existing upstream
+   tests before writing your own, and an existing upstream fix before writing a
+   local one.
+3. **Pin the source of truth, not the most convenient copy.** Choose the
+   longest-lived / best-supported repo that is actually authoritative for the
+   file. `shy_fft.h` comes from `pichenettes/stmlib` (its canonical home) rather
+   than Electro-Smith's DaisyExamples copy, which pins stmlib at a June-2021
+   commit predating the `Math<double>` cos/sin infinite-recursion fix — pinning
+   there would have baked in a known-buggy snapshot.
+
+**Why this exists:** a self-recursive `cos`/`sin` bug in `shy_fft.h` was found by
+writing a test against it, then patched *in place* — without first checking
+whether upstream already had tests (it has none) or had already fixed the bug (it
+had, in PR #7, 2021). A hand-copied file with a silent local edit has no
+provenance, no pinning, and no rollback path, and the next re-vendor wipes the fix
+with no signal. Pinning at a SHA plus a drift check gives all three.
+
+### Flashing the Pod (DFU)
+
+`make program-dfu` uploads over USB DFU. The board must be in the bootloader first:
+on the Seed there are two unlabeled tactile buttons — **hold one, tap the other,
+release the first** (empirically on this board: hold the button [POSITION TBD —
+fill in relative to the USB connector], tap the other). Confirm with `dfu-util -l`
+showing `[0483:df11] ... @Internal Flash /0x08000000` before flashing.
+`make program-dfu` ends with `dfu-util: Error during download get_status` /
+`Error 74` on the "Submitting leave request" step — this is **harmless** on the
+STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
+`File downloaded successfully` line above it means the flash landed.
+
 ## State of play (what's done, what's next)
 
-- **DSP core: host-tested.** Run `dreamosc/test/run.sh` — Catch2 unit tests over
-  `stretch_core.h` (determinism, NaN/bounds, the spread model, constant-loudness,
-  multi-samplerate) plus a golden regression that diffs the C++ core against the
-  Python reference (length / RMS / spectral shape, tolerances documented). Both
-  gate on exit code. See `dreamosc/test/README.md`. The port is faithful to
-  `stretchseq.py` (phase differs by design — different RNGs — so tests assert
-  invariants, not bit-equality).
+- **Synthesis: canonical PaulXStretch, settled by listening on hardware.** Each
+  frame's IFFT is a full periodic waveform; each output block raised-cosine-blends
+  the current frame's second half against the previous frame's first half, times
+  the `0.853553…` = `(1+1/√2)/2` AM-correction curve (ported against the real
+  `essej/paulxstretch` `Stretch.cpp`, not a summary of it). Seams between heads
+  are **window-mediated overlap** — no envelope, no crossfade, no pre-roll — which
+  beat the butt-joint alternative in an A/B on hardware. Analysis window is
+  Nasca's `(1-x²)^1.25`; a rectangular window leaked 0.6% out-of-band energy and
+  was audibly scratchy.
+- **DSP core: host-tested.** Run `dreamosc/test/run.sh` — vendored-source drift
+  check plus Catch2 unit tests over `stretch_core.h` (determinism, NaN/bounds, the
+  spread model, constant-loudness, drift, multi-samplerate, click detection) and
+  `shy_fft.h` (round-trips across sizes/types). 20 cases; gates on exit code. See
+  `dreamosc/test/README.md`.
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
   stereo->mono fold). Not yet run on hardware (no card yet).
@@ -121,9 +178,17 @@ regression.** Details in `dreamosc/test/README.md`.
   allows; don't treat two-knobs-plus-encoder as the design.
 - **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
   `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
-  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). These +
-  the source buffer almost certainly must live in SDRAM, not internal SRAM. Watch
-  the linker map.
+  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). As built
+  in #129: the **source buffer (~1.9 MB) is in SDRAM** (it must be — too big for
+  SRAM), and the **`Sequencer` (with its 8 voice buffers, ~256 KB) is in internal
+  SRAM** (SRAM lands ~70% full). #130 is the deliberate budget/placement pass.
+- **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
+  is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
+  NEITHER their constructor run NOR their storage zeroed — they boot with garbage
+  state. This cost us a silent-firmware bug in #129 (a `Sequencer` in SDRAM never
+  activated its voices → no sound). SDRAM is fine for **plain arrays you memset
+  yourself** (like the source buffer); keep constructed objects in SRAM, or if a
+  voice pool must go to SDRAM later, placement-new it after `Init()`.
 - **libDaisy + GCC 15.3 wrinkle:** `WavPlayer.h` throws a `[-Wtemplate-body]`
   error (`FileReader` vs `IReader`) when transitively included. It is upstream, not
   ours. Avoid pulling that header, or pin/patch it when building `dreamosc.cpp`.

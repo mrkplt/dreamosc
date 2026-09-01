@@ -14,6 +14,7 @@
 inline StretchTables gTab;
 inline float         gWork[SS_W];
 inline float         gSpec[SS_W];
+inline volatile uint32_t gUnderruns = 0;   // diagnostic counter (see Voice::next)
 
 namespace testutil {
 
@@ -36,7 +37,30 @@ inline std::vector<float> render(Sequencer& seq, int passes = 1) {
   std::vector<float> out;
   out.reserve(total);
   for (uint32_t n = 0; n < total; n++) {
-    for (int g = 0; g < SS_MAX_VOICES + 1; g++) seq.service();
+    // Drain service() fully each sample: on-device the main loop spins service()
+    // continuously between callback samples. A bounded cap guards against a
+    // runaway while staying well above the worst case (8 heads * a few frames).
+    for (int g = 0; g < 64 && seq.service(); g++) {}
+    out.push_back(seq.next());
+  }
+  return out;
+}
+
+// Render mimicking the on-device producer/consumer race: service() (the worker)
+// gets only `fftsPerBlock` FFT calls per `block` samples of playback, instead of
+// being fully drained every sample. This reproduces a cold buffer at a head's
+// onset — the failure the fully-drained render() cannot see. With a correct
+// ready-gate, an unready voice stays silent (no click); without it, the callback
+// reads an empty/partial buffer and the seam jumps.
+inline std::vector<float> render_rate_limited(Sequencer& seq, int passes,
+                                              int block, int fftsPerBlock) {
+  uint32_t total = seq.patternSamples() * passes;
+  std::vector<float> out;
+  out.reserve(total);
+  int budget = 0;
+  for (uint32_t n = 0; n < total; n++) {
+    if ((int)(n % block) == 0) budget = fftsPerBlock;   // refill worker budget
+    while (budget > 0 && seq.service()) budget--;
     out.push_back(seq.next());
   }
   return out;

@@ -52,8 +52,10 @@ build/$(TARGET).o: $(VENDOR_STAMP)
 # memory-mapped at 0x90000000, so the firmware reads it in place. Reverts to the
 # SD-card path (#131) once controls are sorted.
 #
-#   make sample SRC=/path/to.wav   convert a WAV to the blob
-#   make program-sample            upload the blob to QSPI over DFU
+#   make sample SAMPLE_SRC=/path/to.wav   convert a WAV to the blob
+#   make program-all                      upload sample + firmware in one go
+#   make program-sample                   upload just the blob to QSPI
+#   make program-dfu                      upload just the firmware
 #
 # NOTE: QSPI DFU requires Electrosmith's Daisy bootloader (the STM32 ROM
 # bootloader exposes only Internal Flash + Option Bytes). Install it once with
@@ -61,14 +63,32 @@ build/$(TARGET).o: $(VENDOR_STAMP)
 SAMPLE_BIN ?= ../sample/amen.bin
 SAMPLE_SRC ?=
 
-.PHONY: sample program-sample
+# 0x90400000 is the third QSPI region per the bootloader's DFU descriptor
+# (0x90000000 reserved, 0x90040000 firmware images, 0x90400000 free).
+# Must match QSPI_BASE in dreamosc.cpp.
+SAMPLE_ADDR = 0x90400000
+
+.PHONY: sample program-sample program-all
 sample:
 	@test -n "$(SAMPLE_SRC)" || { echo "usage: make sample SAMPLE_SRC=/path/to.wav"; exit 2; }
 	../tools/wav2raw.py "$(SAMPLE_SRC)" "$(SAMPLE_BIN)"
 
-# 0x90400000 is the third QSPI region per the bootloader's DFU descriptor
-# (0x90000000 reserved, 0x90040000 firmware images, 0x90400000 free).
-# Must match QSPI_BASE in dreamosc.cpp.
 program-sample:
 	@test -f "$(SAMPLE_BIN)" || { echo "no $(SAMPLE_BIN) -- run: make sample SAMPLE_SRC=..."; exit 2; }
-	dfu-util -a 0 -s 0x90400000:leave -D "$(SAMPLE_BIN)" -d ,0483:df11
+	dfu-util -a 0 -s $(SAMPLE_ADDR):leave -D "$(SAMPLE_BIN)" -d ,0483:df11
+
+# Both images in one pass. The sample is written WITHOUT ':leave' so the board
+# stays in DFU for the firmware upload that follows -- ':leave' would boot it out
+# and the second dfu-util call would find no device. Only the firmware (last)
+# leaves DFU and runs.
+#
+# dfu-util exits non-zero on the harmless "Submitting leave request" error on the
+# STM32H750 (the chip resets and drops USB before dfu-util gets its ack), so the
+# firmware step tolerates that; the sample step must genuinely succeed.
+program-all: $(BUILD_DIR)/$(TARGET_BIN)
+	@test -f "$(SAMPLE_BIN)" || { echo "no $(SAMPLE_BIN) -- run: make sample SAMPLE_SRC=..."; exit 2; }
+	@echo "==> 1/2 sample -> QSPI $(SAMPLE_ADDR)"
+	dfu-util -a 0 -s $(SAMPLE_ADDR) -D "$(SAMPLE_BIN)" -d ,0483:df11
+	@echo "==> 2/2 firmware -> $(FLASH_ADDRESS)"
+	-dfu-util -a 0 -s $(FLASH_ADDRESS):leave -D $(BUILD_DIR)/$(TARGET_BIN) -d ,0483:df11
+	@echo "==> done (ignore any 'Error during download get_status' above)"

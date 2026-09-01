@@ -144,13 +144,14 @@ struct Math<double>
 {
     inline double pi() const { return 3.141592653589793; }
     inline float  sqrt_2_div_2() const { return 0.7071067811865476; }
-    // Fixed upstream bug: these called themselves (member cos/sin shadowing
-    // ::cos/::sin), causing infinite recursion (a hang / stack overflow) any
-    // time ShyFFT<double, ...> was instantiated. ::-qualify to reach the libm
-    // functions. The archive copy is left as-delivered; this is the working
-    // copy the build actually uses.
-    inline double cos(double x) { return ::cos(x); }
-    inline double sin(double x) { return ::sin(x); }
+    // Our vendored copy predates pichenettes/stmlib PR #7 (merged 2021-11-13),
+    // which fixed this exact self-referential recursion (member cos/sin
+    // shadowing the libm functions -> infinite recursion, a hang, any time
+    // ShyFFT<double, ...> is instantiated). Applying the same fix upstream
+    // used. Confirmed via web search that stmlib's test/ has no FFT test we
+    // failed to pull in. Archive copy left as-delivered.
+    inline double cos(double x) { return std::cos(x); }
+    inline double sin(double x) { return std::sin(x); }
 };
 
 

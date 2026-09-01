@@ -227,18 +227,18 @@ TEST_CASE("pattern length follows (SS_STEPS-1)*dur*spread + dur") {
   // Durations quantize to the hop grid, and each head's audible span carries a
   // one-hop natural tail beyond its body.
   const uint32_t len = ((uint32_t)(dur * sr / SS_H + 0.5f)) * SS_H;
-  SECTION("spread 0 = all heads together = one duration") {
+  SECTION("spread 0 = all heads together = one duration (+ tail hop)") {
     Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 0.0f);
-    REQUIRE(seq.patternSamples() == len);
+    REQUIRE(seq.patternSamples() == len + SS_H);
   }
   SECTION("spread 0.5 = heads half a duration apart") {
     Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 0.5f);
-    uint32_t expected = (SS_STEPS - 1) * (uint32_t)(len * 0.5f) + len;
+    uint32_t expected = (SS_STEPS - 1) * (uint32_t)(len * 0.5f) + len + SS_H;
     REQUIRE(seq.patternSamples() == expected);
   }
-  SECTION("spread 1 = end-to-end = SS_STEPS durations") {
+  SECTION("spread 1 = end-to-end = SS_STEPS durations (+ tail hop)") {
     Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 1.0f);
-    REQUIRE(seq.patternSamples() == SS_STEPS * len);
+    REQUIRE(seq.patternSamples() == SS_STEPS * len + SS_H);
   }
 }
 

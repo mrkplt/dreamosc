@@ -53,20 +53,19 @@ using stmlib::RotationPhasor;
 // measured); scale below 1.0 so the codec never clips (an over-range sample =
 // an audible tick on hardware). ~2 dB.
 #define SS_HEADROOM 0.8f
-// There is NO outer envelope or crossfade in either variant. Two seam
-// constructions, compile-time selectable for A/B listening:
+// SEAM CONSTRUCTION: window-mediated overlap, no envelope, no crossfade, no
+// pre-roll. A head's first hop rises naturally (its overlap partner is absent)
+// and its last frame's tail rings out for one hop; adjacent heads overlap by
+// exactly that hop, so a head-to-head seam is the SAME overlap-add construction
+// as every frame junction inside a continuous stretch — which is why it needs
+// no added fade to be click-free.
 //
-// Default (butt-joint): each head pre-rolls frame -1 and discards its hop,
-// consuming the natural first-hop rise, so every head is steady-state from its
-// first audible sample and stops after its body: heads butt-joint at full
-// level (the uncorrelated splice at the joint is the audible variable).
+// The alternative (pre-roll frame -1, discard its hop, butt-joint heads at full
+// steady-state level) was built and A/B'd on hardware; its uncorrelated splice
+// at the joint is audible, so it was dropped.
 //
-// -DSS_SEAM_OLA (window-mediated): no pre-roll; the first hop rises naturally
-// and the last frame's tail rings out one hop, with adjacent heads overlapping
-// by that hop — the seam is the same overlap-add construction as the stretch
-// interior.
-//
-// Durations quantize to the hop grid (SS_H samples, ~43 ms) in both.
+// Durations quantize to the hop grid (SS_H samples, ~43 ms) so the overlap
+// lands aligned.
 
 // ---------------------------------------------------------------------------
 // Shared scratch. Only one voice renders at a time, from the main loop, so a
@@ -172,38 +171,26 @@ class Voice {
     // literal repeat.
     rng_ = seed ^ (uint32_t)(position * 4294967295.0);
     if (rng_ == 0) rng_ = 0x9E3779B9u;
+    // old_ starts silent: the first emitted block therefore ramps in through the
+    // raised cosine, which IS the head's natural rise (no pre-roll).
     memset(old_, 0, sizeof(old_));
-#ifdef SS_SEAM_OLA
-    preRolled_ = true;    // no pre-roll: the natural first-hop rise is the seam
-#else
-    preRolled_ = false;   // frame -1 renders in topUp() (main loop), not here
-#endif
     // Release-store LAST: every plain field above must be visible to the ISR
     // before it can observe active_ == true. Without the barrier the ISR could
     // see a half-initialized voice (ARM reorders plain stores).
     active_.store(true, std::memory_order_release);
   }
 
-  // Called from the main loop. Returns true if it did work. The FFT-heavy
-  // frame rendering lives here, off the audio callback, so triggering a voice
-  // never blocks next(). In the butt-joint variant the first topUp() renders
-  // frame -1 (pre-roll) straight into old_: the first emitted block then starts
-  // 100% inside frame -1's waveform, so the head is at full level from its very
-  // first audible sample. In the seam variant old_ starts silent and the first
-  // block ramps in through the raised cosine.
+  // Called from the main loop. Returns true if it did work. The FFT-heavy frame
+  // rendering lives here, off the audio callback, so triggering a voice never
+  // blocks next(). No pre-roll: old_ starts silent, so the first block ramps in
+  // through the raised cosine (the head's natural rise), and after the body a
+  // final block blends the last frame out against silence (its natural tail).
   bool topUp() {
     if (!active_.load(std::memory_order_acquire)) return false;
-    if (!preRolled_) {
-      renderFrame();
-      memcpy(old_, gWork, sizeof(old_));   // frame -1 becomes "old"
-      preRolled_ = true;
-      return true;
-    }
     // Keep the ring as full as it can go (leaving room for one more hop);
     // letting it drain to empty between refills lets the callback catch the
     // producer and starve.
     if (fill() > SS_RING - SS_H) return false;
-#ifdef SS_SEAM_OLA
     if (produced_ < len_) {              // body: render a frame, emit a hop
       renderFrame();
       emitHop();
@@ -215,12 +202,6 @@ class Voice {
       return true;
     }
     return false;
-#else
-    if (produced_ >= len_) return false;
-    renderFrame();
-    emitHop();
-    return true;
-#endif
   }
 
   // Called from the audio callback. Returns the enveloped sample. The sine fade
@@ -249,12 +230,8 @@ class Voice {
     float raw = ring_[r & (SS_RING - 1)];
     rr_.store(r + 1, std::memory_order_release);
 
-    // No envelope in either variant; only the audible span differs.
-#ifdef SS_SEAM_OLA
+    // No envelope. Audible span is the body plus the one-hop natural tail.
     if (++out_ >= len_ + SS_H) active_.store(false, std::memory_order_release);
-#else
-    if (++out_ >= len_) active_.store(false, std::memory_order_release);
-#endif
     return raw;
   }
 
@@ -332,7 +309,6 @@ class Voice {
   double srcPos_ = 0.0, srcHop_ = 0.0;   // double: position precision matters
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
   uint32_t onsetDelay_ = 0;   // samples silent-and-filling before audible
-  bool preRolled_ = false;    // frame -1 rendered (consumes the first-hop rise)
   float old_[SS_W];   // previous frame's full IFFT waveform (PXS handoff)
   float ring_[SS_RING];
   // Cross-thread state (main-loop producer / audio-ISR consumer). active_ is the
@@ -386,14 +362,9 @@ class Sequencer {
   }
 
   // How long one full pass of all SS_STEPS heads takes: the last head starts at
-  // (SS_STEPS-1)*interval; its audible span is its body (butt-joint) or body
-  // plus one-hop tail (seam-OLA variant).
+  // (SS_STEPS-1)*interval; its audible span is its body plus a one-hop tail.
   uint32_t patternSamples() const {
-#ifdef SS_SEAM_OLA
     return (SS_STEPS - 1) * intervalSamples() + lenSamples() + SS_H;
-#else
-    return (SS_STEPS - 1) * intervalSamples() + lenSamples();
-#endif
   }
 
   // Audio callback. One sample of the whole sequence.

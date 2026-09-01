@@ -140,13 +140,20 @@ STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
 
 ## State of play (what's done, what's next)
 
-- **DSP core: host-tested.** Run `dreamosc/test/run.sh` — Catch2 unit tests over
-  `stretch_core.h` (determinism, NaN/bounds, the spread model, constant-loudness,
-  multi-samplerate) plus a golden regression that diffs the C++ core against the
-  Python reference (length / RMS / spectral shape, tolerances documented). Both
-  gate on exit code. See `dreamosc/test/README.md`. The port is faithful to
-  `stretchseq.py` (phase differs by design — different RNGs — so tests assert
-  invariants, not bit-equality).
+- **Synthesis: canonical PaulXStretch, settled by listening on hardware.** Each
+  frame's IFFT is a full periodic waveform; each output block raised-cosine-blends
+  the current frame's second half against the previous frame's first half, times
+  the `0.853553…` = `(1+1/√2)/2` AM-correction curve (ported against the real
+  `essej/paulxstretch` `Stretch.cpp`, not a summary of it). Seams between heads
+  are **window-mediated overlap** — no envelope, no crossfade, no pre-roll — which
+  beat the butt-joint alternative in an A/B on hardware. Analysis window is
+  Nasca's `(1-x²)^1.25`; a rectangular window leaked 0.6% out-of-band energy and
+  was audibly scratchy.
+- **DSP core: host-tested.** Run `dreamosc/test/run.sh` — vendored-source drift
+  check plus Catch2 unit tests over `stretch_core.h` (determinism, NaN/bounds, the
+  spread model, constant-loudness, drift, multi-samplerate, click detection) and
+  `shy_fft.h` (round-trips across sizes/types). 20 cases; gates on exit code. See
+  `dreamosc/test/README.md`.
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
   stereo->mono fold). Not yet run on hardware (no card yet).

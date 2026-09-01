@@ -23,6 +23,19 @@ float         gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
 // the boundary artifact is a buffer underrun vs. a DSP/splice issue.
 volatile uint32_t gUnderruns = 0;
 
+#ifdef PROFILE
+// #132 diagnostic build (`make PROFILE=1`): measure where the CPU actually goes
+// so the low-spread noise threshold can be attributed with numbers, not
+// estimates. Prints one line per second over USB serial — read it with
+//   screen /dev/tty.usbmodem<tab> 115200
+// Fields: act (sounding heads), units (service() calls that did work: emitted
+// slices + transitions), rnd (FFT frames rendered that second — the load
+// metric), svc_us (us of main-loop DSP work that second), avg_us (per unit),
+// isr_us (us inside the audio callback that second), du (underruns that
+// second), spread_m (spread * 1000), page (0 stretch / 1 spread).
+static volatile uint32_t profIsrUs = 0;
+#endif
+
 // --- storage ---------------------------------------------------------------
 #define SOURCE_SECONDS 10
 #define SAMPLE_RATE    48000
@@ -33,20 +46,21 @@ volatile uint32_t gUnderruns = 0;
 static float DSY_SDRAM_BSS sourceBuf[SOURCE_LEN];
 
 // The Sequencer stays in internal SRAM. It is a C++ object with member
-// initializers and Voice sub-objects; objects in .sdram_bss get NEITHER their
-// constructor run NOR their storage zeroed (the section is NOLOAD and SDRAM is
-// not even powered until Init()), so a Sequencer placed there boots with garbage
-// state and produces no sound. Its 8 voice buffers (~256 KB) fit in the 512 KB
-// SRAM. #130 revisits placement/budget deliberately; #129 needs it to run.
+// initializers and Head sub-objects (atomics); objects in .sdram_bss get
+// NEITHER their constructor run NOR their storage zeroed (the section is NOLOAD
+// and SDRAM is not even powered until Init()), so a Sequencer placed there
+// boots with garbage state and produces no sound. The heads' big buffers live
+// in headPool below; the Sequencer object itself is small.
 static Sequencer seq;
 
-// Voice working buffers (old_ + ring_ per voice, ~384 KB at SS_W 4096) live in
-// SDRAM: far too big for the 512 KB internal SRAM once anything else is present.
-// This is a plain array, NOT an object -- .sdram_bss is NOLOAD and SDRAM is
-// unpowered at static-init time, so constructors never run and storage is not
-// zeroed there. Sequencer::init() carves this up and hands each Voice a slice;
-// the Voice objects themselves stay in SRAM where C++ works normally.
-static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
+// Head working buffers (old_ + ring_ per head, 8 x 48 KB = 384 KB at SS_W 4096)
+// live in SDRAM: far too big for the 512 KB internal SRAM once anything else is
+// present. This is a plain array, NOT an object -- .sdram_bss is NOLOAD and
+// SDRAM is unpowered at static-init time, so constructors never run and storage
+// is not zeroed there. Sequencer::init() carves this up and hands each Head a
+// slice (memsetting it); the Head objects themselves stay in SRAM where C++
+// works normally.
+static float DSY_SDRAM_BSS headPool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
 static Source   src;
@@ -193,17 +207,26 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     out[i] = s; out[i + 1] = s;
   }
 #else
+#ifdef PROFILE
+  uint32_t t0 = System::GetUs();
+#endif
   for (size_t i = 0; i < size; i += 2) {
     float s     = seq.next();
     out[i]      = s;   // left
     out[i + 1]  = s;   // right
   }
+#ifdef PROFILE
+  profIsrUs += System::GetUs() - t0;
+#endif
 #endif
 }
 
 int main(void) {
   pod.Init();
   pod.SetAudioBlockSize(4);
+#ifdef PROFILE
+  pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
+#endif
 
   gTab.init();                       // ShyFFT tables + window; takes a moment
   src.data = sourceBuf;
@@ -214,7 +237,7 @@ int main(void) {
   // SD-card path (#131) once the controls are sorted.
   if (!load_qspi_sample()) fill_stub_source();
 
-  seq.init(&src, pod.AudioSampleRate(), voicePool);
+  seq.init(&src, pod.AudioSampleRate(), headPool);
   // Starting values; the knobs/encoder take over from here (see processControls).
   // The knobs snap to their physical positions on the first read, so duration and
   // drift are whatever the pots are set to within a few ms of boot.
@@ -229,8 +252,20 @@ int main(void) {
   // panel. Controls are polled here rather than in the audio ISR -- debouncing
   // and smoothing do not belong in an interrupt.
   uint32_t control_div = 0;
+#ifdef PROFILE
+  uint32_t profBusyUs = 0, profUnits = 0, profLastUnder = 0, profLastRnd = 0;
+  uint32_t profLastPrint = System::GetNow();
+#endif
   while (1) {
+#ifdef PROFILE
+    uint32_t s0 = System::GetUs();
+    if (seq.service()) {
+      profBusyUs += System::GetUs() - s0;
+      profUnits++;
+    }
+#else
     seq.service();
+#endif
     // Poll the panel ~1 kHz-ish rather than every service() pass: encoder
     // debouncing expects a steady-ish rate, and there is no reason to burn FFT
     // time on ADC reads.
@@ -238,5 +273,24 @@ int main(void) {
       control_div = 0;
       processControls();
     }
+#ifdef PROFILE
+    uint32_t now = System::GetNow();
+    if (now - profLastPrint >= 1000) {
+      profLastPrint = now;
+      uint32_t isr = profIsrUs;
+      profIsrUs = 0;
+      uint32_t rnd = seq.framesRendered();
+      pod.seed.PrintLine(
+          "act=%d units=%u rnd=%u svc_us=%u avg_us=%u isr_us=%u du=%u spread_m=%d page=%d",
+          seq.soundingHeads(), (unsigned)profUnits,
+          (unsigned)(rnd - profLastRnd), (unsigned)profBusyUs,
+          (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)isr,
+          (unsigned)(gUnderruns - profLastUnder), (int)(seq.spread * 1000.0f),
+          (int)encPage);
+      profLastUnder = gUnderruns;
+      profLastRnd = rnd;
+      profBusyUs = profUnits = 0;
+    }
+#endif
   }
 }

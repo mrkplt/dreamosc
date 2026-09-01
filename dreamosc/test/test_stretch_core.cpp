@@ -25,9 +25,13 @@ namespace {
 void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
               float duration, float spread, float drift = 0.0f,
               uint32_t seed = 0x12345678u) {
-  // Host-side voice pool; on device this lives in SDRAM (see dreamosc.cpp).
-  static std::vector<float> pool(SS_POOL_FLOATS);
-  seq.init(src, sr, pool.data(), seed);
+  // Host-side head pool; on device this lives in SDRAM (see dreamosc.cpp).
+  // One pool PER sequencer: init() primes each ring with silence, and tests
+  // that hold two sequencers at once (determinism, drift) would otherwise have
+  // the first render scribble over the second's primed regions.
+  static std::vector<std::vector<float>> pools;
+  pools.emplace_back(SS_POOL_FLOATS);
+  seq.init(src, sr, pools.back().data(), seed);
   seq.stretch  = stretch;
   seq.duration = duration;
   seq.spread   = spread;
@@ -78,12 +82,13 @@ TEST_CASE("deterministic: same config renders identically") {
 // discontinuities are guarded by the click-detector test below.)
 
 TEST_CASE("a genuinely starved ring counts an underrun and stays silent") {
-  // gUnderruns / the ring-empty branch in Voice::next() is only reached when a
-  // PRIMED, already-sounding voice outruns the worker — the onset lookahead
-  // deliberately prevents this in the normal case, and the rate-limited test
-  // above proves safe degradation without confirming this exact counter fires.
-  // Force it directly: let one head prime normally, then drain next() far past
-  // what a full ring (SS_RING samples) can supply with zero further service().
+  // gUnderruns / the ring-empty branch in Head::next() is only reached when the
+  // consumer outruns the producer past the whole prime depth — the silence
+  // prime deliberately prevents this in the normal case, and the rate-limited
+  // test above proves safe degradation without confirming this counter fires.
+  // Force it directly: run service()+next() together normally, then drain
+  // next() far past what a full ring (SS_RING samples) can supply with zero
+  // further service().
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
@@ -121,7 +126,10 @@ TEST_CASE("rate-limited worker degrades to silence, not garbage") {
   const float sr = 48000, dur = 1.0f;
   Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 1.0f);
   uint32_t interval = seq.intervalSamples();
-  auto out = render_rate_limited(seq, 2, /*block=*/48, /*fftsPerBlock=*/1);
+  // Budget in worker UNITS (emitted slices, at most one render each): demand
+  // is SS_STEPS heads * sr/SS_SLICE units/s (3000/s at 48 kHz), so one unit
+  // per 12 samples (4000/s) models a keeping-up-but-not-idle worker.
+  auto out = render_rate_limited(seq, 2, /*block=*/12, /*fftsPerBlock=*/1);
 
   auto near_seam = [&](size_t i) {
     for (uint32_t k = 0; k <= 2 * SS_STEPS + 2; k++) {
@@ -294,11 +302,11 @@ TEST_CASE("renders at multiple sample rates without blowing up") {
 
 TEST_CASE("spread ~0 fires all SS_STEPS heads together through render()") {
   // Every other test uses spread >= 0.25; the "all heads share one onset" burst
-  // path in Sequencer::next() (requestArm() called SS_STEPS times, interval==0)
-  // is otherwise never exercised through an actual render — only its length
-  // arithmetic (patternSamples()) is checked elsewhere. Distinct step positions
-  // + zero drift means each head is a distinguishable steady tone once primed;
-  // confirm real audible output appears (not silence) once heads are primed.
+  // lattice (interval==0: every head's onsets coincide, repeating each body
+  // length) is otherwise never exercised through an actual render — only its
+  // length arithmetic (patternSamples()) is checked elsewhere. Distinct step
+  // positions + zero drift means each head is a distinguishable steady tone
+  // once primed; confirm real audible output appears (not silence).
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
@@ -346,6 +354,177 @@ TEST_CASE("drift perturbs position within bounds and stays reproducible") {
   REQUIRE(differs);
 
   for (float v : a) REQUIRE(std::isfinite(v));
+}
+
+TEST_CASE("synthesis work is bounded by SS_STEPS streams at ANY spread") {
+  // The load-cliff regression guard. The old voice-pool design let sustained
+  // concurrency reach 2*SS_STEPS at low spread, roughly doubling FFT work
+  // exactly where the retrigger rate was already highest — past the device's
+  // render budget (the #132 near-zero-spread noise/underrun report). Persistent
+  // heads produce at hop rate ALWAYS (sound, handoff, or silence), so total
+  // service() work per rendered second must be ~SS_STEPS * sr / SS_H
+  // (187.5/s at 48 kHz) regardless of spread. Bounds are wide: the point is
+  // "flat, near 8 streams", not an exact count (startup fill and retrigger
+  // transitions, which advance the stream by up to 2 hops in one unit, move it
+  // slightly).
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+
+  auto renders_per_sec = [](Sequencer& seq) {
+    const uint32_t samples = 3 * 48000;
+    for (uint32_t n = 0; n < samples; n++) {
+      for (int g = 0; g < 64 && seq.service(); g++) {}
+      seq.next();
+    }
+    return (double)seq.framesRendered() / 3.0;
+  };
+
+  Sequencer hiSeq; make_seq(hiSeq, &src, 48000, 50.0f, 1.0f, 1.0f);
+  Sequencer loSeq; make_seq(loSeq, &src, 48000, 50.0f, 1.0f, 0.02f);
+  double hi = renders_per_sec(hiSeq);
+  double lo = renders_per_sec(loSeq);
+  INFO("renders/s at spread 1.0: " << hi << ", at spread 0.02: " << lo);
+  // Ceiling: SS_STEPS continuous streams at hop rate (187.5/s at 48 kHz),
+  // plus one transition render per retrigger. The worst case (all heads
+  // sounding, low spread) must sit near — never above ~1.6x — that ceiling;
+  // high spread renders far less (only ~1/spread heads sound at once).
+  const double ceiling = (double)SS_STEPS * 48000.0 / SS_H;   // 187.5
+  REQUIRE(lo > ceiling * 0.6);
+  REQUIRE(lo < ceiling * 1.6);
+  REQUIRE(hi < ceiling * 1.6);
+  REQUIRE(hi > 10.0);            // and the high-spread lattice still renders
+}
+
+TEST_CASE("live spread change recovers from near-zero without residue") {
+  // The #132 field report: spread driven toward 0, then turned back up, and
+  // the device never recovered. The core must carry no stuck state across that
+  // gesture: after raising spread the lattice re-spaces immediately (it is
+  // recomputed live, never stored), heads thin out to the high-spread duty
+  // cycle, and a fully-serviced render sees zero underruns throughout.
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.02f);
+
+  uint32_t underBefore = gUnderruns;
+  auto run = [&](uint32_t samples) {
+    for (uint32_t n = 0; n < samples; n++) {
+      for (int g = 0; g < 64 && seq.service(); g++) {}
+      float s = seq.next();
+      REQUIRE(std::isfinite(s));
+    }
+  };
+  run(2 * 48000);                        // hold near zero: all heads churning
+  REQUIRE(seq.soundingHeads() == SS_STEPS);
+  seq.spread = 0.8f;                     // "turn clockwise"
+  run(3 * 48000);                        // several patterns at the new spread
+  // At spread 0.8 a head sounds duration out of 8*0.8 durations, so on average
+  // ~1.6 heads sound; tail overlap can add one more. Anything near SS_STEPS
+  // means the old lattice left residue.
+  REQUIRE(seq.soundingHeads() <= 3);
+  REQUIRE(gUnderruns == underBefore);
+}
+
+TEST_CASE("sub-hop onsets: interiors stay click-free at a non-hop-aligned spread") {
+  // At spread 0.37 the onset lattice (k * interval) does not land on the hop
+  // grid, so every retrigger exercises the sample-accurate transition path
+  // (grid re-phase + overlap-added rise). If onsets were quantized to hops,
+  // the real seams would fall up to half a hop outside these exclusion
+  // windows and the splice would register as a click; if the transition
+  // overlap-add were wrong, the handoff itself would step. Same detector and
+  // thresholds as the aligned-spread click test.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.37f);
+  uint32_t interval = seq.intervalSamples();
+  REQUIRE(interval % SS_H != 0);         // the premise: onsets off the hop grid
+  auto out = render(seq, 2);
+
+  auto near_seam = [&](size_t i) {
+    for (uint32_t k = 0; k <= 2 * SS_STEPS + 2; k++) {
+      int64_t seam = (int64_t)SS_LOOKAHEAD + (int64_t)k * interval;
+      if ((int64_t)i > seam - 512 && (int64_t)i < seam + 512) return true;
+    }
+    return false;
+  };
+
+  const int W = 64;
+  int clicks = 0;
+  for (size_t i = W + 1; i + W < out.size(); i++) {
+    if (near_seam(i)) continue;
+    float d = std::abs(out[i] - out[i - 1]);
+    if (d < 5e-3f) continue;
+    float local = 0.0f;
+    for (int k = -W; k < W; k++)
+      local += std::abs(out[i + k] - out[i + k - 1]);
+    local /= (2 * W);
+    if (d > 8.0f * local) {
+      if (clicks < 5)
+        UNSCOPED_INFO("click at " << i << " (" << i / 48000.0 << "s): delta "
+                      << d << " vs local " << local);
+      clicks++;
+    }
+  }
+  REQUIRE(clicks == 0);
+}
+
+TEST_CASE("mid-life refresh is click-free and continues the same life") {
+  // refresh() re-sources a sounding life's spectrum from live parameters
+  // (the "rendered frames are disposable" hook for frame-size and other
+  // spectral controls). It must behave as a seam of the accepted retrigger
+  // construction — no click outside the seam neighborhood — and must NOT
+  // retrigger: the head keeps sounding through it and the body ends on the
+  // step's own clock, not a restarted one.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+
+  auto run = [&](bool doRefresh) {
+    Sequencer seq;
+    make_seq(seq, &src, 48000, 50.0f, 1.0f, 1.0f);
+    std::vector<float> out;
+    const uint32_t total = 48000;                  // first head's body
+    const uint32_t at = 24000;                     // mid-body refresh
+    for (uint32_t n = 0; n < total; n++) {
+      for (int g = 0; g < 64 && seq.service(); g++) {}
+      if (doRefresh && n == at) seq.refreshSounding();
+      out.push_back(seq.next());
+      if (n > SS_LOOKAHEAD + 4096 && n < total - 4096)
+        REQUIRE(seq.soundingHeads() >= 1);         // never drops out
+    }
+    return out;
+  };
+
+  auto a = run(true);
+  auto b = run(true);
+  for (size_t i = 0; i < a.size(); i++)            // deterministic
+    REQUIRE(a[i] == Approx(b[i]));
+  auto base = run(false);
+  bool differs = false;
+  for (size_t i = 0; i < a.size(); i++)
+    if (a[i] != base[i]) { differs = true; break; }
+  REQUIRE(differs);                                // it actually re-sources
+
+  // Click detector over the refresh region, excluding the seam neighborhood:
+  // the refresh enters the stream at the write position (~fill ahead of the
+  // ear) and blends over a hop, like any accepted seam.
+  const int64_t seam_lo = 24000 - 64;
+  const int64_t seam_hi = 24000 + SS_FILL_TARGET + SS_H + 512;
+  const int W = 64;
+  int clicks = 0;
+  for (size_t i = 20000; i + W < 32000; i++) {
+    if ((int64_t)i > seam_lo && (int64_t)i < seam_hi) continue;
+    float d = std::abs(a[i] - a[i - 1]);
+    if (d < 5e-3f) continue;
+    float local = 0.0f;
+    for (int k = -W; k < W; k++)
+      local += std::abs(a[i + k] - a[i + k - 1]);
+    local /= (2 * W);
+    if (d > 8.0f * local) clicks++;
+  }
+  REQUIRE(clicks == 0);
 }
 
 TEST_CASE("spread is clamped to [0,1]") {

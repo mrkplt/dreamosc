@@ -25,10 +25,27 @@ sweeps overlap.** Not one scanning cursor, not 8 fixed taps, and NOT polyphony.
   apart. So spread runs from fully-stacked (0) to fully-sequential (1) — note this
   is the INVERSE of the original spec/`.ino` comment ("0 butt-joined"), which was
   wrong; the code now implements the correct direction.
-- `SS_MAX_VOICES` (6) is NOT musical polyphony — it is the ceiling on how many
-  overlapping traveling heads / fade tails can render simultaneously. The spec's
-  "polyphonic voice allocator" phrasing describes that rendering machinery, not
-  chords. There is one source, one timeline, one sequence.
+- **The 8 heads are PERSISTENT objects, not allocated voices — and synthesis is
+  DEMAND-DRIVEN, not queued.** Each step owns one `Head` forever, modeled as
+  LANES: the active life plus the fading remnant of the previous one, each just
+  (old frame, cur frame, phase); the per-sample value is the PaulXStretch
+  raised-cosine blend, with null-old = natural rise and null-cur = natural
+  tail. A step re-firing is a sample-accurate life HANDOFF inside its own head;
+  a life re-fired while sounding finishes only its hop + tail (no extra
+  renders). The ring between synthesis and the ISR is a SMALL CUSHION
+  (`SS_FILL_TARGET` 512 / `SS_SLICE` 128: fill oscillates 384-512, ~8-11 ms
+  knob-to-ear), not committed audio: frames render as late as the cushion
+  allows, from LIVE controls — the fill IS the knob-to-ear latency (the first
+  build filled a 4-hop ring: ~170 ms, audibly rubbery; do not regress this).
+  **Nothing rendered is sacred**: `SS_W` is the analysis INPUT, not an output
+  quantum — `Head::refresh()` re-sources a sounding life's spectrum mid-hop
+  from live params (same srcPos/rng/body clock, so it is the same life, not a
+  retrigger), the hook for frame-size and other spectral controls. Worst-case
+  synthesis is 8 streams at hop rate, constant across the spread range. (The
+  original voice-pool design let sustained concurrency hit 16 at low spread —
+  the #132 "noise near spread 0" bug.) The spec's "polyphonic voice allocator"
+  phrasing describes rendering machinery, not chords: one source, one
+  timeline, one sequence.
 
 ## Toolchain (already installed on this machine)
 
@@ -185,9 +202,27 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   was audibly scratchy.
 - **DSP core: host-tested.** Run `dreamosc/test/run.sh` — vendored-source drift
   check plus Catch2 unit tests over `stretch_core.h` (determinism, NaN/bounds, the
-  spread model, constant-loudness, drift, multi-samplerate, click detection) and
-  `shy_fft.h` (round-trips across sizes/types). 20 cases; gates on exit code. See
+  spread model, constant-loudness, drift, multi-samplerate, click detection,
+  bounded-work-at-any-spread, live-spread-change recovery, sub-hop onsets) and
+  `shy_fft.h` (round-trips across sizes/types). 23 cases; gates on exit code. See
   `dreamosc/test/README.md`.
+- **Persistent-head / lane rework (#132).** The voice allocator (arm queue,
+  `SS_MAX_VOICES` slots, per-start memset/re-prime) is gone; see the
+  mental-model bullet above for the lane model and the demand cushion.
+  Scheduling is pattern-anchored on the producer side (`Sequencer::service`):
+  candidates at `anchor + s*interval` with the LIVE interval, per-head fired
+  flags, and a phase-fraction rescale on period change so live spread/duration
+  sweeps neither insert dead patterns nor double-fire (both failure modes were
+  measured on ramps before the rescale). The audio ISR is just 8 ring reads +
+  gain. There is NO one-hop content-latency floor: `renderFrame` reads stretch
+  at each render (advance-at-use, not banked at the previous render), and
+  `Head::refresh()` re-sources a sounding frame mid-hop — content latency is
+  cushion + render + blend ramp, at any `SS_W`. Frame size as a live control
+  (#136) rides the same refresh/handoff machinery.
+  `make PROFILE=1` (needs `make clean` first — flags aren't tracked) prints
+  per-second CPU accounting over USB serial (`rnd` = frames rendered/s is the
+  load metric) for on-device verification, and its numbers are what should
+  justify tightening `SS_FILL_TARGET` further.
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
   stereo->mono fold). Not yet run on hardware (no card yet).
@@ -210,12 +245,14 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   per parameter (and per-step, that is the spec's 16 numbers), so the
   encoder-juggling is provisional. Add knobs / dedicated controls as the hardware
   allows; don't treat two-knobs-plus-encoder as the design.
-- **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
-  `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
-  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). As built
-  in #129: the **source buffer (~1.9 MB) is in SDRAM** (it must be — too big for
-  SRAM), and the **`Sequencer` (with its 8 voice buffers, ~256 KB) is in internal
-  SRAM** (SRAM lands ~70% full). #130 is the deliberate budget/placement pass.
+- **Memory.** `SS_W = 4096`. Per Head: 4 rotating frame buffers (two lives x
+  old/cur) + a 1024-sample ring = 68 KB; 8 heads -> `headPool` = 544 KB, a
+  **plain float array in SDRAM** (`Sequencer::init` carves it up; rings are
+  memset so NOLOAD garbage never plays; frame buffers need no clearing — a
+  lane never reads a buffer it hasn't rendered). The **source buffer (~1.9 MB)
+  is also in SDRAM**; the `Sequencer` OBJECT (small: lane bookkeeping +
+  atomics) stays in internal SRAM (~19% full). #130 is the deliberate
+  budget/placement pass.
 - **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
   is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
   NEITHER their constructor run NOR their storage zeroed — they boot with garbage

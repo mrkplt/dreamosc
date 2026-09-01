@@ -88,6 +88,18 @@ run `dreamosc/test/run.sh` and keep it green. A change to `stretch_core.h` /
 tolerances from measurement with a written reason, never loosen one to hide a
 regression.** Details in `dreamosc/test/README.md`.
 
+### Flashing the Pod (DFU)
+
+`make program-dfu` uploads over USB DFU. The board must be in the bootloader first:
+on the Seed there are two unlabeled tactile buttons — **hold one, tap the other,
+release the first** (empirically on this board: hold the button [POSITION TBD —
+fill in relative to the USB connector], tap the other). Confirm with `dfu-util -l`
+showing `[0483:df11] ... @Internal Flash /0x08000000` before flashing.
+`make program-dfu` ends with `dfu-util: Error during download get_status` /
+`Error 74` on the "Submitting leave request" step — this is **harmless** on the
+STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
+`File downloaded successfully` line above it means the flash landed.
+
 ## State of play (what's done, what's next)
 
 - **DSP core: host-tested.** Run `dreamosc/test/run.sh` — Catch2 unit tests over
@@ -121,9 +133,17 @@ regression.** Details in `dreamosc/test/README.md`.
   allows; don't treat two-knobs-plus-encoder as the design.
 - **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
   `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
-  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). These +
-  the source buffer almost certainly must live in SDRAM, not internal SRAM. Watch
-  the linker map.
+  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). As built
+  in #129: the **source buffer (~1.9 MB) is in SDRAM** (it must be — too big for
+  SRAM), and the **`Sequencer` (with its 8 voice buffers, ~256 KB) is in internal
+  SRAM** (SRAM lands ~70% full). #130 is the deliberate budget/placement pass.
+- **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
+  is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
+  NEITHER their constructor run NOR their storage zeroed — they boot with garbage
+  state. This cost us a silent-firmware bug in #129 (a `Sequencer` in SDRAM never
+  activated its voices → no sound). SDRAM is fine for **plain arrays you memset
+  yourself** (like the source buffer); keep constructed objects in SRAM, or if a
+  voice pool must go to SDRAM later, placement-new it after `Init()`.
 - **libDaisy + GCC 15.3 wrinkle:** `WavPlayer.h` throws a `[-Wtemplate-body]`
   error (`FileReader` vs `IReader`) when transitively included. It is upstream, not
   ours. Avoid pulling that header, or pin/patch it when building `dreamosc.cpp`.

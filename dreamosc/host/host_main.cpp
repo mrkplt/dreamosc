@@ -166,8 +166,10 @@ int main(int argc, char** argv) {
   std::vector<float> out;
   out.reserve(total);
   for (uint32_t n = 0; n < total; n++) {
-    // Keep FIFOs ahead of the callback, same discipline as loop()/service().
-    for (int g = 0; g < SS_MAX_VOICES + 1; g++) seq.service();
+    // Drain service() each sample, same discipline as the device main loop
+    // (which spins service() continuously). Pre-roll is deferred into service()
+    // now, so a freshly-triggered head is filled here before next() reads it.
+    for (int g = 0; g < 64 && seq.service(); g++) {}
     out.push_back(seq.next());
   }
 

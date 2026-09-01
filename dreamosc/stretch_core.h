@@ -112,18 +112,26 @@ class Voice {
     if (rng_ == 0) rng_ = 0x9E3779B9u;
     memset(accum_, 0, sizeof(accum_));
     frame_ = -1;
-    // Pre-roll. Overlap-add means every output sample is the sum of two
-    // frames; starting cold leaves the first half-window ~3.5 dB down and
-    // spectrally thin. The dependency is exactly one frame deep, so render one
-    // frame ahead of the start point and discard its output.
-    renderFrame();
-    discardHop();
+    preRolled_ = false;   // pre-roll happens in topUp() (main loop), NOT here
     active_ = true;
   }
 
-  // Called from the main loop. Returns true if it did work.
+  // Called from the main loop. Returns true if it did work. The FFT-heavy work
+  // (pre-roll + frame rendering) lives here, off the audio callback, so
+  // triggering a voice never blocks next(). start() only arms the voice; the
+  // first topUp() does the one-frame pre-roll before emitting.
   bool topUp() {
     if (!active_) return false;
+    if (!preRolled_) {
+      // Pre-roll. Overlap-add means every output sample is the sum of two
+      // frames; starting cold leaves the first half-window ~3.5 dB down and
+      // spectrally thin. The dependency is exactly one frame deep, so render one
+      // frame ahead of the start point and discard its output.
+      renderFrame();
+      discardHop();
+      preRolled_ = true;
+      return true;
+    }
     if (fill() >= SS_H) return false;
     if (produced_ >= len_ + SS_H) return false;
     renderFrame();
@@ -201,6 +209,7 @@ class Voice {
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
   int32_t frame_ = -1;
   bool active_ = false;
+  bool preRolled_ = false;
   float accum_[SS_W];
   float ring_[SS_RING];
   volatile uint32_t wr_ = 0, rr_ = 0;
@@ -272,10 +281,13 @@ class Sequencer {
     return power > 1e-6f ? sum / sqrtf(power) : 0.0f;
   }
 
-  // Main loop. Keeps every voice's FIFO ahead of the audio callback.
-  void service() {
+  // Main loop. Keeps every voice's FIFO ahead of the audio callback. Does at
+  // most one FFT per call (to bound latency) and returns true if it did work, so
+  // a caller can spin it until there is nothing left to do.
+  bool service() {
     for (int i = 0; i < SS_MAX_VOICES; i++)
-      if (voice_[i].topUp()) return;   // one FFT per pass, to bound latency
+      if (voice_[i].topUp()) return true;
+    return false;
   }
 
  private:

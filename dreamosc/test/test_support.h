@@ -36,7 +36,10 @@ inline std::vector<float> render(Sequencer& seq, int passes = 1) {
   std::vector<float> out;
   out.reserve(total);
   for (uint32_t n = 0; n < total; n++) {
-    for (int g = 0; g < SS_MAX_VOICES + 1; g++) seq.service();
+    // Drain service() fully each sample: on-device the main loop spins service()
+    // continuously between callback samples. A bounded cap guards against a
+    // runaway while staying well above the worst case (8 heads * a few frames).
+    for (int g = 0; g < 64 && seq.service(); g++) {}
     out.push_back(seq.next());
   }
   return out;

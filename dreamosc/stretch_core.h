@@ -39,7 +39,15 @@ using stmlib::RotationPhasor;
 // Ceiling on simultaneously sounding heads. Heads start (duration * spread)
 // apart and each lives `duration`, so the number in flight is 1/spread. At
 // spread -> 0 all SS_STEPS heads sound at once, so the ceiling must be SS_STEPS.
-#define SS_MAX_VOICES SS_STEPS
+// Voice slots. Must EXCEED SS_STEPS: a head's audible span is len + SS_H (its
+// one-hop tail), which is longer than the re-fire period, so an incoming burst
+// has to overlap the outgoing one's tails. At spread 0 all SS_STEPS heads arm
+// together, and with only SS_STEPS slots every slot is still busy when the next
+// burst arrives -- startVoice() finds none free, drops all of them, and the
+// output goes silent until they expire (a measured 50% duty cycle: 1 s on,
+// 1 s off at duration 1 s). Doubling gives every head's tail room to ring out
+// while its replacement starts.
+#define SS_MAX_VOICES (2 * SS_STEPS)
 // Per-voice scratch: old_ (SS_W) + ring_ (SS_RING). The caller allocates
 // SS_POOL_FLOATS floats and passes them to Sequencer::init(); at SS_W 4096 that
 // is 8 voices * 48 KB = 384 KB, which must live in SDRAM, not internal SRAM.
@@ -169,13 +177,17 @@ class Voice {
   // The audible span is lenSamples + SS_H: the first frame rises naturally (no
   // pre-roll) and the last frame's tail rings out for one hop — those natural
   // window edges ARE the head's fades, identical to the stretch interior.
-  void start(const Source* src, float position, float stretch,
+  // stretch is taken by POINTER, not value: the read head advances by the LIVE
+  // stretch each frame, so turning the control moves heads that are already
+  // sounding. Latching it at start() meant a change was inaudible until the next
+  // head fired -- up to a full pattern (tens of seconds) of lag.
+  void start(const Source* src, float position, const float* stretch,
              uint32_t lenSamples, uint32_t seed, uint32_t onsetDelay = 0) {
     src_ = src;
+    stretch_ = stretch;
     if (position < 0.0f) position = 0.0f;
     if (position >= 1.0f) position = 0.999999f;
     srcPos_ = (double)position * (double)src->len;
-    srcHop_ = (double)SS_H / (double)stretch;
     len_ = lenSamples;
     out_ = 0;
     produced_ = 0;
@@ -290,7 +302,10 @@ class Voice {
     // whole frames back-to-back via emitHop()'s raised-cosine handoff instead.
     gTab.fft.Inverse(gSpec, gWork);
 
-    srcPos_ += srcHop_;
+    // Advance by the LIVE stretch (see start()); clamp so a control at or below
+    // zero cannot divide by zero or run the head backwards.
+    float st = (stretch_ && *stretch_ > 0.01f) ? *stretch_ : 0.01f;
+    srcPos_ += (double)SS_H / (double)st;
   }
 
   // Canonical PaulXStretch output block (one hop). The block blends the current
@@ -322,7 +337,8 @@ class Voice {
   }
 
   const Source* src_ = nullptr;
-  double srcPos_ = 0.0, srcHop_ = 0.0;   // double: position precision matters
+  double srcPos_ = 0.0;        // double: position precision matters
+  const float* stretch_ = nullptr;   // live stretch control (not a snapshot)
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
   uint32_t onsetDelay_ = 0;   // samples silent-and-filling before audible
   // Buffers live in SDRAM, supplied via setBuffers(); see the note there.
@@ -413,15 +429,34 @@ class Sequencer {
     // buffer while the voice sits silent; the head becomes audible exactly at its
     // scheduled onset — primed, no underrun.
     uint32_t interval = intervalSamples();
-    if (armClock_ == SS_LOOKAHEAD) {
+    // The controls are live, so the lattice can change out from under a pending
+    // countdown. Two guards:
+    //  - clamp: if duration/spread just shrank, a countdown scheduled against the
+    //    OLD (longer) lattice would leave a hole; pull it in to the new one.
+    //  - '<=' not '==': if the lattice shrank past SS_LOOKAHEAD entirely, an
+    //    equality test never fires and armClock_ runs down through zero and wraps
+    //    (it is unsigned), silencing the sequence until it counts all the way
+    //    back around. That was a measured ~0.09 s gap on an abrupt change.
+    // Samples from one onset to the next. At spread 0 all SS_STEPS heads share an
+    // onset, so the burst repeats when the heads END — one head span, NOT
+    // patternSamples() (which at spread 0 already IS one span, so using it made
+    // the burst wait a whole extra span: a measured 50% duty cycle, 1 s on / 1 s
+    // off at duration 1 s). Above spread 0 the onsets are one interval apart.
+    uint32_t period = (interval == 0) ? lenSamples() : interval;
+    // Controls are live, so the lattice can shrink out from under a countdown
+    // scheduled against the old one; pull it in so no hole opens up. '<=' rather
+    // than '==' because a shrink can step the countdown past SS_LOOKAHEAD, and an
+    // equality test would then miss and let armClock_ wrap (it is unsigned).
+    uint32_t ceiling = period + SS_LOOKAHEAD;
+    if (armClock_ > ceiling) armClock_ = ceiling;
+    if (armClock_ <= SS_LOOKAHEAD) {
+      uint32_t onset_delay = armClock_;
       if (interval == 0) {
-        // spread ~0: all SS_STEPS heads share this onset — request them together.
-        for (int k = 0; k < SS_STEPS; k++) requestArm(SS_LOOKAHEAD);
-        armClock_ = patternSamples() + SS_LOOKAHEAD;
+        for (int k = 0; k < SS_STEPS; k++) requestArm(onset_delay);
       } else {
-        requestArm(SS_LOOKAHEAD);
-        armClock_ = interval + SS_LOOKAHEAD;   // next onset one interval later
+        requestArm(onset_delay);
       }
+      armClock_ = period + SS_LOOKAHEAD;
     }
     armClock_--;
 
@@ -497,7 +532,7 @@ class Sequencer {
       if (p < 0.0f) p = 0.0f;
       if (p > 1.0f) p = 1.0f;
     }
-    voice_[slot].start(src_, p, stretch,
+    voice_[slot].start(src_, p, &stretch,
                        lenSamples(), seed_, onsetDelay);
     step_ = (step_ + 1) % SS_STEPS;
   }

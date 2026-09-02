@@ -8,6 +8,28 @@ phase-randomized sound from a named point in the stretch and fades into the next
 Read `archive/stretchsequencerspec.md` for the full design. It is the source of
 truth for behavior.
 
+## Issue tracking (Fizzy)
+
+dreamosc has its OWN board on the self-hosted Fizzy instance (PiHost, LAN-only) —
+**do NOT create dreamosc cards on the default Flail Whale board** (that's the
+play-by-post backlog). Use the `fizzy` CLI (see the `fizzy-cards` skill) with the
+dreamosc board id explicitly:
+
+```
+fizzy boards                                            # list boards (id + name)
+fizzy cards --all --board 03gsa1lwpx0m5f4k5f2p16toh     # dreamosc board
+fizzy create "<title>" "<body>" --board 03gsa1lwpx0m5f4k5f2p16toh
+fizzy move <card#> 03gsa1lwpx0m5f4k5f2p16toh            # if it landed on the wrong board
+```
+
+- **dreamosc board id: `03gsa1lwpx0m5f4k5f2p16toh`** (Flail Whale is the CLI
+  default at `03gmw8zdlnigtxsgs2hknc3bx` — always pass `--board` for dreamosc).
+- The dreamosc board currently has NO columns (only the synthetic "Maybe?"
+  untriaged bucket), so new cards stay untriaged until columns exist.
+- Open cards as of this writing: #140 layer mode (3 discrete voices), #141 wire
+  the SSD1309 OLED, #142 FFT pitch-shift for tuning (MIDI prereq), #143 revisit
+  the lane architecture now that spread is gone.
+
 ## Mental model (read this before reasoning about voices)
 
 **8 read heads stepping through the stretch SEQUENTIALLY, one at a time, with a

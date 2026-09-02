@@ -182,13 +182,15 @@ class Voice {
   // sounding. Latching it at start() meant a change was inaudible until the next
   // head fired -- up to a full pattern (tens of seconds) of lag.
   void start(const Source* src, float position, const float* stretch,
-             uint32_t lenSamples, uint32_t seed, uint32_t onsetDelay = 0) {
+             uint32_t lenSamples, uint32_t seed, uint32_t onsetDelay = 0,
+             uint32_t overlap = 0) {
     src_ = src;
     stretch_ = stretch;
     if (position < 0.0f) position = 0.0f;
     if (position >= 1.0f) position = 0.999999f;
     srcPos_ = (double)position * (double)src->len;
     len_ = lenSamples;
+    overlap_ = overlap;        // equal-power fade length (0 = butt-joint)
     out_ = 0;
     produced_ = 0;
     onsetDelay_ = onsetDelay;
@@ -258,9 +260,26 @@ class Voice {
     float raw = ring_[r & (SS_RING - 1)];
     rr_.store(r + 1, std::memory_order_release);
 
-    // No envelope. Audible span is the body plus the one-hop natural tail.
+    // Equal-power crossfade envelope. With overlap 0 the head is flat across its
+    // body (butt-joint, identical to the old no-envelope path); with overlap > 0
+    // it fades IN over the first `overlap` samples and OUT over the last, using
+    // a quarter-sine so fade_in^2 + fade_out^2 = 1 at the seam — adjacent heads,
+    // uncorrelated, sum to constant POWER (constant loudness) through the
+    // overlap. gTab.sinAtF indexes a 1024-entry sine LUT (full period = 1024).
+    float env = 1.0f;
+    if (overlap_ > 0) {
+      if (out_ < overlap_) {
+        // rising quarter-sine: sin(pi/2 * out_/overlap) via LUT index 0..256
+        env = gTab.sinAtF(256.0f * (float)out_ / (float)overlap_);
+      } else if (out_ >= len_ - overlap_ && out_ < len_) {
+        // falling quarter-sine over the body's last `overlap` samples
+        uint32_t k = out_ - (len_ - overlap_);
+        env = gTab.sinAtF(256.0f + 256.0f * (float)k / (float)overlap_);
+      }
+    }
+    // Audible span is the body plus the one-hop natural tail.
     if (++out_ >= len_ + SS_H) active_.store(false, std::memory_order_release);
-    return raw;
+    return raw * env;
   }
 
  private:
@@ -341,6 +360,7 @@ class Voice {
   const float* stretch_ = nullptr;   // live stretch control (not a snapshot)
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
   uint32_t onsetDelay_ = 0;   // samples silent-and-filling before audible
+  uint32_t overlap_ = 0;      // equal-power crossfade length in samples
   // Buffers live in SDRAM, supplied via setBuffers(); see the note there.
   // NOTE: pointers, not arrays -- sizeof() on these is a pointer size, so always
   // spell out the element count when memset/memcpy-ing them.
@@ -365,7 +385,14 @@ class Sequencer {
   float drift[SS_STEPS] = {0};
   float stretch = 50.0f;      // stretch factor
   float duration = 4.0f;      // step duration, seconds
-  float spread = 1.0f;        // 0..1: 0 = all heads together, 1 = end-to-end
+  // Crossfade between consecutive heads. Heads are SEQUENTIAL (one at a time);
+  // fade sets how much each head overlaps the next, as a fraction of the step
+  // duration, 0..0.5. 0 (or xfade off) = butt-joint, hard cut. 0.5 = maximum
+  // overlap: [mix][no clean middle][mix], still only TWO heads at once — the
+  // ceiling that keeps this off the 8-head CPU cliff the old `spread` model hit
+  // at its zero end. The overlap is an equal-power (constant-loudness) fade.
+  bool  xfade = false;        // crossfade enable (Pod button 2)
+  float fade  = 0.0f;         // 0..0.5 overlap fraction (encoder page 1)
 
   // pool: SS_MAX_VOICES * SS_VOICE_FLOATS floats of scratch for the voices'
   // old_/ring_ buffers, carved up here. Supplied by the caller so it can live in
@@ -397,11 +424,22 @@ class Sequencer {
     return (hops < 1 ? 1 : hops) * SS_H;
   }
 
-  // Samples between successive head starts. spread is 0..1 as a fraction of the
-  // (quantized) step duration: 0 fires all heads together, 1 end-to-end.
+  // Effective overlap fraction: 0 when crossfade is off, else fade clamped to
+  // [0, 0.5]. 0.5 is the hard ceiling — beyond it a THIRD head would overlap,
+  // which is exactly the multi-head CPU pileup this model exists to avoid.
+  float overlapFrac() const {
+    if (!xfade) return 0.0f;
+    return fade < 0.0f ? 0.0f : (fade > 0.5f ? 0.5f : fade);
+  }
+
+  // Samples between successive head starts. Heads are sequential; they overlap
+  // by overlapFrac() of the (quantized) duration, so the start interval is
+  // (1 - overlap) of a duration. Overlap 0 -> interval = duration (butt-joint,
+  // one head at a time). Overlap 0.5 -> interval = half a duration (two heads
+  // overlap, the max). This REPLACES the old spread model; interval never falls
+  // below half a duration, so at most two heads ever render at once.
   uint32_t intervalSamples() const {
-    float s = spread < 0.0f ? 0.0f : (spread > 1.0f ? 1.0f : spread);
-    return (uint32_t)(lenSamples() * s);
+    return (uint32_t)(lenSamples() * (1.0f - overlapFrac()));
   }
 
   // How long one full pass of all SS_STEPS heads takes: the last head starts at
@@ -462,17 +500,12 @@ class Sequencer {
 
     float sum = 0.0f;
     for (int i = 0; i < SS_MAX_VOICES; i++) sum += voice_[i].next();
-    // Constant loudness = a CONSTANT gain per spread setting, never an
-    // instantaneous divide. ~1/spread heads sound at once and uncorrelated
-    // sources sum in power, so scaling by sqrt(spread) (floored at 1/SS_STEPS
-    // heads) holds overall RMS flat across the spread range while leaving each
-    // head's fade intact — heads meet at silence, so the lattice is transient-
-    // free by construction. (The old sum/sqrt(instantaneous power) flattened a
-    // lone head to full-amplitude raw and spliced uncorrelated heads at the
-    // boundary: an audible click of random size at every step.)
-    float s = spread < 1.0f / SS_STEPS ? 1.0f / SS_STEPS
-                                       : (spread > 1.0f ? 1.0f : spread);
-    float out = sum * sqrtf(s) * SS_HEADROOM;
+    // Constant loudness needs NO global gain now: heads are sequential and their
+    // seams carry an equal-power crossfade envelope (Voice::next), so at every
+    // instant the overlapping heads sum to constant power. Only fixed headroom
+    // is applied. (The old sqrt(spread) gain compensated for ~1/spread stacked
+    // heads — a model this crossfade design replaces, capping overlap at two.)
+    float out = sum * SS_HEADROOM;
     // Hard clamp: the codec must never see an over-range sample (a clip is an
     // audible tick on hardware even though the float host plays it silently).
     if (out > 1.0f) out = 1.0f;
@@ -497,6 +530,15 @@ class Sequencer {
     for (int i = 0; i < SS_MAX_VOICES; i++)
       if (voice_[i].topUp()) return true;
     return false;
+  }
+
+  // Diagnostic: how many voice slots are currently active. Each active() is an
+  // acquire load; safe to call from the main loop.
+  int activeVoices() const {
+    int n = 0;
+    for (int i = 0; i < SS_MAX_VOICES; i++)
+      if (voice_[i].active()) n++;
+    return n;
   }
 
  private:
@@ -532,8 +574,13 @@ class Sequencer {
       if (p < 0.0f) p = 0.0f;
       if (p > 1.0f) p = 1.0f;
     }
+    // Overlap length in samples = overlap fraction of the step duration. This
+    // is the head's equal-power fade in/out length; it equals the gap between
+    // this head's start and the previous head's end, so the two crossfade
+    // exactly. 0 when crossfade is off -> flat envelope, butt-joint.
+    uint32_t overlap = (uint32_t)(lenSamples() * overlapFrac());
     voice_[slot].start(src_, p, &stretch,
-                       lenSamples(), seed_, onsetDelay);
+                       lenSamples(), seed_, onsetDelay, overlap);
     step_ = (step_ + 1) % SS_STEPS;
   }
 

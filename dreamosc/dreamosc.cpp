@@ -23,6 +23,16 @@ float         gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
 // the boundary artifact is a buffer underrun vs. a DSP/splice issue.
 volatile uint32_t gUnderruns = 0;
 
+#ifdef PROFILE
+// `make PROFILE=1`: per-second CPU accounting over USB serial. Read it with
+//   screen /dev/tty.usbmodem<tab> 115200
+// Fields: act (active voices), units (service() calls that did work), svc_us
+// (us of main-loop DSP that second), avg_us (per unit), isr_us (us in the audio
+// callback that second), du (underruns that second), fade_m (fade*1000),
+// xf (crossfade on/off), page (0 stretch / 1 fade).
+static volatile uint32_t profIsrUs = 0;
+#endif
+
 // --- storage ---------------------------------------------------------------
 #define SOURCE_SECONDS 10
 #define SAMPLE_RATE    48000
@@ -107,16 +117,18 @@ static void fill_stub_source() {
 
 // --- controls ---------------------------------------------------------------
 // Panel (2026 Daisy Pod): 2 knobs, encoder (turn + click), 2 buttons, 2 RGB LEDs.
-//   knob1          -> duration   0.25 .. 8 s
+//   knob1          -> duration   0.25 .. 60 s
 //   knob2          -> drift      0 .. 25 % (all steps share one value for now)
-//   encoder turn   -> stretch (page 0) or spread (page 1), exponential/linear
+//   encoder turn   -> stretch (page 0) or crossfade length (page 1)
 //   encoder click  -> toggle which parameter the encoder drives
+//   button2        -> crossfade on/off (butt-joint vs equal-power overlap)
 //   led1           -> underrun indicator (latches red if a voice ring starves)
-//   led2           -> page indicator (dim blue = stretch, dim green = spread)
+//   led2           -> page indicator (blue = stretch page, green = fade page)
+//                     dim when crossfade OFF, bright when ON
 //
 // Read from the MAIN LOOP, not the audio callback: debouncing and smoothing do
 // not belong in an interrupt, and the sequencer reads these values live anyway.
-enum EncoderPage { PAGE_STRETCH = 0, PAGE_SPREAD = 1 };
+enum EncoderPage { PAGE_STRETCH = 0, PAGE_FADE = 1 };
 static EncoderPage encPage = PAGE_STRETCH;
 
 // Knob smoothing: a one-pole on the raw ADC read, so a noisy pot does not
@@ -135,22 +147,42 @@ static void processControls() {
 
   // --- encoder click: flip page ---
   if (pod.encoder.RisingEdge())
-    encPage = (encPage == PAGE_STRETCH) ? PAGE_SPREAD : PAGE_STRETCH;
+    encPage = (encPage == PAGE_STRETCH) ? PAGE_FADE : PAGE_STRETCH;
+
+  // --- button2: crossfade on/off ---
+  if (pod.button2.RisingEdge()) seq.xfade = !seq.xfade;
 
   // --- encoder turn: drives the current page's parameter ---
   int32_t inc = pod.encoder.Increment();
   if (inc != 0) {
     if (encPage == PAGE_STRETCH) {
-      // Exponential: a detent is a fixed RATIO, so the knob is equally useful
-      // at 5x and at 500x. ~3% per detent.
-      seq.stretch *= powf(1.03f, (float)inc);
-      if (seq.stretch < 1.0f)   seq.stretch = 1.0f;
-      if (seq.stretch > 500.0f) seq.stretch = 500.0f;
+      // Two regimes by turn speed, measured from the GAP between detents --
+      // libDaisy's Encoder::Increment() only ever returns +-1, so speed can't
+      // come from the step magnitude; it comes from how fast detents arrive.
+      // SLOW (detents far apart): LINEAR trim, fixed +-0.5x additive step, easy
+      // to land an exact value. FAST (detents close together, a spin): LOG,
+      // multiply by a fixed ratio per detent so a flick crosses 1x..500x in
+      // about two turns from anywhere. Threshold: <= 40 ms since the last detent
+      // = fast (a spin is many detents/sec; a deliberate click is slower).
+      const float STRETCH_MAX = 500.0f;
+      static uint32_t lastDetentMs = 0;
+      uint32_t tnow = System::GetNow();
+      uint32_t gap  = tnow - lastDetentMs;
+      lastDetentMs  = tnow;
+      if (gap <= 40) {
+        const int   FAST_DETENTS = 24;                        // range in ~2 turns
+        const float perDetent = powf(STRETCH_MAX, 1.0f / FAST_DETENTS);
+        seq.stretch *= powf(perDetent, (float)inc);           // fast: log ratio
+      } else {
+        seq.stretch += 0.5f * (float)inc;                     // slow: linear trim
+      }
+      if (seq.stretch < 1.0f)         seq.stretch = 1.0f;
+      if (seq.stretch > STRETCH_MAX)  seq.stretch = STRETCH_MAX;
     } else {
-      // Linear over the whole 0..1 range; 1% per detent.
-      seq.spread += 0.01f * (float)inc;
-      if (seq.spread < 0.0f) seq.spread = 0.0f;
-      if (seq.spread > 1.0f) seq.spread = 1.0f;
+      // Crossfade length: linear 0..0.5 overlap fraction, 1% per detent.
+      seq.fade += 0.01f * (float)inc;
+      if (seq.fade < 0.0f) seq.fade = 0.0f;
+      if (seq.fade > 0.5f) seq.fade = 0.5f;
     }
   }
 
@@ -158,13 +190,14 @@ static void processControls() {
   float k1 = readKnob(0, pod.knob1.Value());
   float k2 = readKnob(1, pod.knob2.Value());
   knobPrimed = true;
-  seq.duration = 0.25f + 7.75f * k1;          // 0.25 .. 8 s
+  seq.duration = 0.25f + 59.75f * k1;         // 0.25 .. 60 s
   float d = 0.25f * k2;                        // 0 .. 25 % of the stretch
   for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = d;
 
-  // --- led2: which page the encoder is on ---
-  if (encPage == PAGE_STRETCH) pod.led2.Set(0.0f, 0.0f, 0.15f);   // blue
-  else                         pod.led2.Set(0.0f, 0.15f, 0.0f);   // green
+  // --- led2: page (hue) + crossfade state (brightness) ---
+  float b = seq.xfade ? 0.6f : 0.12f;         // bright = crossfade on
+  if (encPage == PAGE_STRETCH) pod.led2.Set(0.0f, 0.0f, b);   // blue = stretch
+  else                         pod.led2.Set(0.0f, b, 0.0f);   // green = fade
 
   // --- led1: underrun indicator. Latches red if a voice ring ever starves, so
   // a dropout is visible rather than something to guess at. Kept from #129.
@@ -193,17 +226,26 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     out[i] = s; out[i + 1] = s;
   }
 #else
+#ifdef PROFILE
+  uint32_t t0 = System::GetUs();
+#endif
   for (size_t i = 0; i < size; i += 2) {
     float s     = seq.next();
     out[i]      = s;   // left
     out[i + 1]  = s;   // right
   }
+#ifdef PROFILE
+  profIsrUs += System::GetUs() - t0;
+#endif
 #endif
 }
 
 int main(void) {
   pod.Init();
   pod.SetAudioBlockSize(4);
+#ifdef PROFILE
+  pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
+#endif
 
   gTab.init();                       // ShyFFT tables + window; takes a moment
   src.data = sourceBuf;
@@ -220,7 +262,8 @@ int main(void) {
   // drift are whatever the pots are set to within a few ms of boot.
   seq.stretch  = 50.0f;
   seq.duration = 1.0f;
-  seq.spread   = 1.0f;
+  seq.xfade    = false;   // butt-joint until button2 turns crossfade on
+  seq.fade     = 0.25f;   // default overlap once enabled
 
   pod.StartAdc();
   pod.StartAudio(AudioCallback);
@@ -228,15 +271,58 @@ int main(void) {
   // Main loop: keep every voice's FIFO ahead of the audio callback, and read the
   // panel. Controls are polled here rather than in the audio ISR -- debouncing
   // and smoothing do not belong in an interrupt.
-  uint32_t control_div = 0;
+  // Controls poll on a WALL-CLOCK 1 ms tick, NOT every-Nth-service(): a single
+  // service() call is a full FFT (~2.4 ms at low stretch), so gating controls on
+  // a service count polled the encoder only ~6x/sec -- it missed most detents of
+  // a real spin and never saw the multi-detent bursts the fast-log branch needs.
+  // System::GetNow() is milliseconds; poll every 1 ms so a fast spin registers.
+  uint32_t lastControlMs = System::GetNow();
+#ifdef PROFILE
+  uint32_t profBusyUs = 0, profUnits = 0, profLastUnder = 0;
+  uint32_t profLastPrint = System::GetNow();
+#endif
   while (1) {
+#ifdef PROFILE
+    uint32_t s0 = System::GetUs();
+    if (seq.service()) {
+      profBusyUs += System::GetUs() - s0;
+      profUnits++;
+    }
+#else
     seq.service();
-    // Poll the panel ~1 kHz-ish rather than every service() pass: encoder
-    // debouncing expects a steady-ish rate, and there is no reason to burn FFT
-    // time on ADC reads.
-    if (++control_div >= 64) {
-      control_div = 0;
+#endif
+    // Poll the panel on the 1 ms wall clock (see lastControlMs above).
+    uint32_t nowMs = System::GetNow();
+    if (nowMs != lastControlMs) {
+      lastControlMs = nowMs;
       processControls();
     }
+#ifdef PROFILE
+    uint32_t now = System::GetNow();
+    if (now - profLastPrint >= 1000) {
+      profLastPrint = now;
+      uint32_t isr = profIsrUs;
+      profIsrUs = 0;
+      // SETTINGS line: the full instrument state. Floats are unreliable through
+      // the nano-newlib printf, so values print as integers (milli- or scaled
+      // suffixes): stretch_c = stretch*100, dur_ms, drift_m = drift*1000,
+      // fade_m = fade*1000, xf = crossfade on/off, page = encoder page.
+      pod.seed.PrintLine(
+          "SET stretch_c=%d dur_ms=%d drift_m=%d fade_m=%d xf=%d page=%d",
+          (int)(seq.stretch * 100.0f + 0.5f),
+          (int)(seq.duration * 1000.0f + 0.5f),
+          (int)(seq.drift[0] * 1000.0f + 0.5f),
+          (int)(seq.fade * 1000.0f + 0.5f),
+          (int)seq.xfade, (int)encPage);
+      // HEALTH line: CPU and dropout accounting for this second.
+      pod.seed.PrintLine(
+          "HLTH act=%d units=%u svc_us=%u avg_us=%u isr_us=%u du=%u",
+          seq.activeVoices(), (unsigned)profUnits, (unsigned)profBusyUs,
+          (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)isr,
+          (unsigned)(gUnderruns - profLastUnder));
+      profLastUnder = gUnderruns;
+      profBusyUs = profUnits = 0;
+    }
+#endif
   }
 }

@@ -28,6 +28,14 @@ VENDOR_STAMP = vendor_stmlib/shy_fft.h
 # so these vendor rules -- which appear before that include -- do not steal it.
 .DEFAULT_GOAL := all
 
+# `make PROFILE=1`: diagnostic build that prints per-second CPU accounting
+# (active voices, service us, per-unit us, ISR us, underruns) over USB serial.
+# See the PROFILE blocks in dreamosc.cpp. Run `make clean` when toggling it;
+# command-line defines are not tracked by the dependency files.
+ifdef PROFILE
+C_DEFS += -DPROFILE
+endif
+
 # Core location, and generic Makefile.
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile

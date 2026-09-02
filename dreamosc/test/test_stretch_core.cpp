@@ -22,15 +22,18 @@ namespace {
 
 // Configure a sequencer in place (Sequencer is non-copyable: its voices hold
 // atomics). `src` must outlive it — it holds a Source*.
+// Configure a sequencer. `fade` is the crossfade overlap fraction (0..0.5); a
+// value > 0 also enables crossfade. fade 0 = butt-joint (heads sequential, one
+// at a time), the default.
 void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
-              float duration, float spread, float drift = 0.0f,
+              float duration, float fade = 0.0f, float drift = 0.0f,
               uint32_t seed = 0x12345678u) {
-  // Host-side voice pool; on device this lives in SDRAM (see dreamosc.cpp).
   static std::vector<float> pool(SS_POOL_FLOATS);
   seq.init(src, sr, pool.data(), seed);
   seq.stretch  = stretch;
   seq.duration = duration;
-  seq.spread   = spread;
+  seq.fade     = fade;
+  seq.xfade    = fade > 0.0f;
   for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = drift;
 }
 
@@ -222,59 +225,68 @@ TEST_CASE("no per-step volume dips at full spread (end-to-end without dips)") {
   REQUIRE(20.0 * std::log10(hi / std::max(lo, 1e-9f)) < 12.0);
 }
 
-TEST_CASE("pattern length follows (SS_STEPS-1)*dur*spread + dur") {
+TEST_CASE("pattern length: heads sequential, overlapping by the crossfade") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   const float sr = 48000, dur = 4.0f;
-
-  // Durations quantize to the hop grid, and each head's audible span carries a
-  // one-hop natural tail beyond its body.
   const uint32_t len = ((uint32_t)(dur * sr / SS_H + 0.5f)) * SS_H;
-  SECTION("spread 0 = all heads together = one duration (+ tail hop)") {
-    Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 0.0f);
-    REQUIRE(seq.patternSamples() == len + SS_H);
-  }
-  SECTION("spread 0.5 = heads half a duration apart") {
-    Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 0.5f);
-    uint32_t expected = (SS_STEPS - 1) * (uint32_t)(len * 0.5f) + len + SS_H;
-    REQUIRE(seq.patternSamples() == expected);
-  }
-  SECTION("spread 1 = end-to-end = SS_STEPS durations (+ tail hop)") {
-    Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, 1.0f);
+
+  SECTION("no crossfade = butt-joint = end-to-end (SS_STEPS durations)") {
+    Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.0f);
+    // interval = full duration, so the pattern is SS_STEPS durations + tail.
     REQUIRE(seq.patternSamples() == SS_STEPS * len + SS_H);
+  }
+  SECTION("fade 0.25 = heads overlap a quarter duration") {
+    Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.25f);
+    uint32_t interval = (uint32_t)(len * 0.75f);   // (1 - overlap)
+    REQUIRE(seq.patternSamples() == (SS_STEPS - 1) * interval + len + SS_H);
+  }
+  SECTION("fade 0.5 (max) = heads overlap half a duration") {
+    Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.5f);
+    uint32_t interval = (uint32_t)(len * 0.5f);
+    REQUIRE(seq.patternSamples() == (SS_STEPS - 1) * interval + len + SS_H);
   }
 }
 
-TEST_CASE("interval matches duration*spread (the corrected model)") {
+TEST_CASE("interval = (1 - overlap) * duration; overlap clamped to 0.5") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  // 4s duration, 50% spread -> half the (hop-quantized) duration between
-  // head starts: ~2 s to within the ~43 ms hop quantization.
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.5f);
   uint32_t len = ((uint32_t)(4.0f * 48000 / SS_H + 0.5f)) * SS_H;
-  REQUIRE(seq.intervalSamples() == (uint32_t)(len * 0.5f));
-  REQUIRE(std::abs((double)seq.intervalSamples() - 2.0 * 48000)
-          <= (double)SS_H);
-  // spread 0 -> interval 0 (all together).
-  Sequencer seq0; make_seq(seq0, &src, 48000, 50.0f, 4.0f, 0.0f);
-  REQUIRE(seq0.intervalSamples() == 0u);
+
+  // fade off -> interval = full duration (butt-joint, one head at a time).
+  Sequencer off; make_seq(off, &src, 48000, 50.0f, 4.0f, /*fade=*/0.0f);
+  REQUIRE(off.intervalSamples() == len);
+
+  // fade 0.25 -> interval = 0.75 of a duration.
+  Sequencer q; make_seq(q, &src, 48000, 50.0f, 4.0f, /*fade=*/0.25f);
+  REQUIRE(q.intervalSamples() == (uint32_t)(len * 0.75f));
+
+  // fade beyond 0.5 is clamped to 0.5 (interval never below half a duration —
+  // the ceiling that keeps at most two heads overlapping).
+  Sequencer hi; make_seq(hi, &src, 48000, 50.0f, 4.0f, /*fade=*/0.9f);
+  Sequencer half; make_seq(half, &src, 48000, 50.0f, 4.0f, /*fade=*/0.5f);
+  REQUIRE(hi.intervalSamples() == half.intervalSamples());
+  REQUIRE(half.intervalSamples() == (uint32_t)(len * 0.5f));
 }
 
-TEST_CASE("level held roughly flat across spread (constant-loudness invariant)") {
+TEST_CASE("level held roughly flat across crossfade (constant-loudness)") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
 
+  // Equal-power crossfade should hold RMS roughly flat from butt-joint through
+  // the maximum overlap — the seams sum to constant power, not silence-dips or
+  // level-swells.
   double prev = -1.0;
-  for (float spread : {0.25f, 0.5f, 0.75f, 1.0f}) {
-    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, spread);
+  for (float fade : {0.0f, 0.15f, 0.3f, 0.5f}) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, fade);
     double r = rms(render(seq));
     REQUIRE(r > 0.0);
     if (prev > 0.0) {
       double db = 20.0 * std::log10(r / prev);
-      REQUIRE(std::abs(db) < 3.0);   // spread must not swing level wildly
+      REQUIRE(std::abs(db) < 3.0);   // crossfade must not swing level wildly
     }
     prev = r;
   }
@@ -292,28 +304,23 @@ TEST_CASE("renders at multiple sample rates without blowing up") {
   }
 }
 
-TEST_CASE("spread ~0 fires all SS_STEPS heads together through render()") {
-  // Every other test uses spread >= 0.25; the "all heads share one onset" burst
-  // path in Sequencer::next() (requestArm() called SS_STEPS times, interval==0)
-  // is otherwise never exercised through an actual render — only its length
-  // arithmetic (patternSamples()) is checked elsewhere. Distinct step positions
-  // + zero drift means each head is a distinguishable steady tone once primed;
-  // confirm real audible output appears (not silence) once heads are primed.
+TEST_CASE("max crossfade renders audibly with at most two heads overlapping") {
+  // At fade 0.5 (max) consecutive heads overlap by half a duration, so exactly
+  // two heads sound through each seam and one through each clean middle — never
+  // more. Confirm real audible output (the crossfade path fires) and that it
+  // stays finite/bounded; the two-head ceiling is what keeps this off the old
+  // multi-head CPU pileup.
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
-  seq.spread = 0.0f;
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, /*fade=*/0.5f);
   auto out = render(seq, 2);
   REQUIRE(out.size() > 0);
 
-  // Some part of the render must be genuinely audible: SS_LOOKAHEAD samples of
-  // startup priming are silence by design, but the render must not be silent
-  // throughout (which would mean the burst-arm path silently failed to fire).
   bool any_audible = false;
   for (float v : out) if (std::abs(v) > 1e-3f) { any_audible = true; break; }
   REQUIRE(any_audible);
-  for (float v : out) REQUIRE(std::isfinite(v));
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.5f); }
 }
 
 TEST_CASE("drift perturbs position within bounds and stays reproducible") {
@@ -328,9 +335,9 @@ TEST_CASE("drift perturbs position within bounds and stays reproducible") {
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
 
-  Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 0.5f, /*spread=*/1.0f,
+  Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 0.5f, /*fade=*/1.0f,
                            /*drift=*/0.3f, /*seed=*/42u);
-  Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 0.5f, /*spread=*/1.0f,
+  Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 0.5f, /*fade=*/1.0f,
                            /*drift=*/0.3f, /*seed=*/42u);
   auto a = render(seqA);
   auto b = render(seqB);
@@ -348,13 +355,26 @@ TEST_CASE("drift perturbs position within bounds and stays reproducible") {
   for (float v : a) REQUIRE(std::isfinite(v));
 }
 
-TEST_CASE("spread is clamped to [0,1]") {
+TEST_CASE("crossfade disabled ignores fade; enabled clamps overlap to 0.5") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer hi; make_seq(hi, &src, 48000, 50.0f, 2.0f, 5.0f);   // out of range high
-  Sequencer at1; make_seq(at1, &src, 48000, 50.0f, 2.0f, 1.0f);
-  REQUIRE(hi.intervalSamples() == at1.intervalSamples());
-  Sequencer lo; make_seq(lo, &src, 48000, 50.0f, 2.0f, -1.0f);  // out of range low
-  REQUIRE(lo.intervalSamples() == 0u);
+  uint32_t len = ((uint32_t)(2.0f * 48000 / SS_H + 0.5f)) * SS_H;
+
+  // xfade off: any fade value is ignored, interval = full duration (butt-joint).
+  Sequencer off; off.init(&src, 48000, [] {
+    static std::vector<float> p(SS_POOL_FLOATS); return p.data(); }());
+  off.duration = 2.0f; off.fade = 0.4f; off.xfade = false;
+  REQUIRE(off.intervalSamples() == len);
+
+  // xfade on, fade out of range high -> clamped to 0.5.
+  Sequencer hi; make_seq(hi, &src, 48000, 50.0f, 2.0f, /*fade=*/5.0f);
+  Sequencer half; make_seq(half, &src, 48000, 50.0f, 2.0f, /*fade=*/0.5f);
+  REQUIRE(hi.intervalSamples() == half.intervalSamples());
+  REQUIRE(half.intervalSamples() == (uint32_t)(len * 0.5f));
+
+  // xfade on, fade negative -> clamped to 0 (butt-joint).
+  Sequencer lo; make_seq(lo, &src, 48000, 50.0f, 2.0f, /*fade=*/0.0f);
+  lo.fade = -1.0f; lo.xfade = true;
+  REQUIRE(lo.intervalSamples() == len);
 }

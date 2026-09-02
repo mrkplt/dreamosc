@@ -191,6 +191,48 @@ TEST_CASE("no local discontinuity in head interiors (click detector)") {
   REQUIRE(clicks == 0);
 }
 
+TEST_CASE("crossfade seam has no full-volume-tail click") {
+  // Regression guard. The crossfade envelope faded a head OUT over its last
+  // `overlap` body samples, but the head then kept sounding a one-hop natural
+  // tail at env 1.0 -- jumping back to full volume right after the fade-out
+  // completed: an audible click at every seam (measured ~0.22 sample jump, 30x
+  // the interior). The fix ends a crossfaded head's audible life at len_ (no
+  // tail). Assert the max sample-to-sample jump with crossfade on stays in the
+  // interior-normal range, not the click range.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+
+  auto max_interior_jump = [](Sequencer& s) {
+    auto out = render(s, 2);
+    float mx = 0.0f;
+    for (size_t i = 48001; i + 48000 < out.size(); i++)   // skip ramp + final fade
+      mx = std::max(mx, std::abs(out[i] - out[i - 1]));
+    return mx;
+  };
+
+  // Baseline: butt-joint (no crossfade). Its max interior jump is the natural
+  // sample-to-sample delta of this broadband material, seams included.
+  Sequencer butt; make_seq(butt, &src, 48000, 50.0f, 1.0f, /*fade=*/0.0f);
+  float base = max_interior_jump(butt);
+
+  // Measured (via this exact render() harness, make_source, dur 1s, stretch 50):
+  //   butt-joint (fade 0):  0.0824
+  //   crossfade 0.10:       0.0824  (identical)
+  //   crossfade 0.25:       0.0964
+  //   crossfade 0.50:       0.0877
+  // So the crossfade's worst interior jump is at most ~1.17x the butt-joint
+  // baseline -- pure material variation, no seam artifact. The full-volume-tail
+  // BUG measured 0.22 (~2.7x). Bound = 1.25x baseline: comfortably above the
+  // measured 1.17x material spread, comfortably below the 2.7x regression.
+  for (float fade : {0.1f, 0.25f, 0.5f}) {
+    Sequencer xf; make_seq(xf, &src, 48000, 50.0f, 1.0f, fade);
+    float withXfade = max_interior_jump(xf);
+    INFO("fade " << fade << ": jump " << withXfade << " vs butt-joint " << base);
+    REQUIRE(withXfade < base * 1.25f);
+  }
+}
+
 TEST_CASE("no per-step volume dips at full spread (end-to-end without dips)") {
   // Spread 1.0 means "joined end to end as sonically possible WITHOUT volume
   // dips": heads carry a short equal-power crossfade at their edges and overlap

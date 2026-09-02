@@ -260,25 +260,35 @@ class Voice {
     float raw = ring_[r & (SS_RING - 1)];
     rr_.store(r + 1, std::memory_order_release);
 
-    // Equal-power crossfade envelope. With overlap 0 the head is flat across its
-    // body (butt-joint, identical to the old no-envelope path); with overlap > 0
-    // it fades IN over the first `overlap` samples and OUT over the last, using
-    // a quarter-sine so fade_in^2 + fade_out^2 = 1 at the seam — adjacent heads,
-    // uncorrelated, sum to constant POWER (constant loudness) through the
-    // overlap. gTab.sinAtF indexes a 1024-entry sine LUT (full period = 1024).
+    // Two seam constructions, chosen by overlap_:
+    //
+    // overlap_ == 0 (butt-joint): NO envelope, and the audible span is the body
+    // PLUS a one-hop natural tail. That tail is the window-mediated overlap that
+    // makes a butt-joint click-free (the next head's natural rise meets it) --
+    // keep it exactly as before.
+    //
+    // overlap_ > 0 (crossfade): an equal-power quarter-sine envelope, fade IN
+    // over the first `overlap` samples and OUT over the LAST `overlap` samples
+    // of the body, reaching 0 exactly at len_. The head then STOPS at len_ with
+    // no full-volume tail -- the next head (started `len_ - overlap` earlier)
+    // is fading in over this same region, so fade_out^2 + fade_in^2 = 1 holds
+    // and the pair sums to constant power. (The old code kept the +SS_H tail at
+    // env 1.0 even when crossfading, which jumped the head back to full volume
+    // after its fade-out: a ~20 dB seam swell + click, measured.)
     float env = 1.0f;
+    uint32_t span = len_;
     if (overlap_ > 0) {
+      span = len_;                              // no tail when crossfading
       if (out_ < overlap_) {
-        // rising quarter-sine: sin(pi/2 * out_/overlap) via LUT index 0..256
-        env = gTab.sinAtF(256.0f * (float)out_ / (float)overlap_);
-      } else if (out_ >= len_ - overlap_ && out_ < len_) {
-        // falling quarter-sine over the body's last `overlap` samples
+        env = gTab.sinAtF(256.0f * (float)out_ / (float)overlap_);       // in
+      } else if (out_ >= len_ - overlap_) {
         uint32_t k = out_ - (len_ - overlap_);
-        env = gTab.sinAtF(256.0f + 256.0f * (float)k / (float)overlap_);
+        env = gTab.sinAtF(256.0f + 256.0f * (float)k / (float)overlap_); // out
       }
+    } else {
+      span = len_ + SS_H;                       // butt-joint keeps the tail
     }
-    // Audible span is the body plus the one-hop natural tail.
-    if (++out_ >= len_ + SS_H) active_.store(false, std::memory_order_release);
+    if (++out_ >= span) active_.store(false, std::memory_order_release);
     return raw * env;
   }
 

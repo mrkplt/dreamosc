@@ -179,8 +179,17 @@ static void processControls() {
       if (seq.stretch < 1.0f)         seq.stretch = 1.0f;
       if (seq.stretch > STRETCH_MAX)  seq.stretch = STRETCH_MAX;
     } else {
-      // Crossfade length: linear 0..0.5 overlap fraction, 1% per detent.
-      seq.fade += 0.01f * (float)inc;
+      // Crossfade length, 0..0.5 overlap fraction. Same speed model as stretch,
+      // but the range is small and additive so both regimes are LINEAR, just
+      // coarser when spinning: slow detent = 0.5% (fine, ~100 clicks end to end
+      // is deliberate), fast spin (<=40 ms gap) = 4% (whole range in ~2 turns).
+      // (Encoder::Increment() is only +-1, so speed is the detent gap, not |inc|.)
+      static uint32_t lastFadeMs = 0;
+      uint32_t tnow = System::GetNow();
+      uint32_t gap  = tnow - lastFadeMs;
+      lastFadeMs    = tnow;
+      float stepv = (gap <= 40) ? 0.04f : 0.005f;
+      seq.fade += stepv * (float)inc;
       if (seq.fade < 0.0f) seq.fade = 0.0f;
       if (seq.fade > 0.5f) seq.fade = 0.5f;
     }

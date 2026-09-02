@@ -25,8 +25,9 @@ volatile uint32_t gUnderruns = 0;
 
 #ifdef PROFILE
 // #132 diagnostic build (`make PROFILE=1`): measure where the CPU actually goes
-// so the low-spread noise threshold can be attributed with numbers, not
-// estimates. Prints one line per second over USB serial — read it with
+// so the cushion depth can be sized from numbers, not estimates. Flag changes
+// are tracked by the Makefile's cflags stamp, so no `make clean` is needed when
+// toggling PROFILE / FILL. Prints one line per second over USB serial:
 //   screen /dev/tty.usbmodem<tab> 115200
 // Fields: act (sounding heads), units (service() calls that did work: emitted
 // slices + transitions), rnd (FFT frames rendered that second — the load
@@ -223,7 +224,11 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 
 int main(void) {
   pod.Init();
-  pod.SetAudioBlockSize(4);
+  // 48-sample blocks (1 ms): the callback fires 1000x/s instead of 12000x/s,
+  // cutting interrupt entry/exit overhead ~12x and smoothing the jitter the
+  // main loop's render bursts have to ride out. Costs 1 ms of fixed output
+  // latency — noise next to the ~10 ms demand cushion.
+  pod.SetAudioBlockSize(48);
 #ifdef PROFILE
   pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
 #endif

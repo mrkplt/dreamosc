@@ -219,7 +219,8 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   `Head::refresh()` re-sources a sounding frame mid-hop — content latency is
   cushion + render + blend ramp, at any `SS_W`. Frame size as a live control
   (#136) rides the same refresh/handoff machinery.
-  `make PROFILE=1` (needs `make clean` first — flags aren't tracked) prints
+  `make PROFILE=1` (a cflags stamp tracks flag changes, so no `make clean`
+  needed when toggling PROFILE / FILL) prints
   per-second CPU accounting over USB serial (`rnd` = frames rendered/s is the
   load metric) for on-device verification, and its numbers are what should
   justify tightening `SS_FILL_TARGET` further.

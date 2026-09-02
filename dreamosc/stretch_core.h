@@ -50,17 +50,10 @@ using stmlib::RotationPhasor;
 // content are deterministic to regenerate, so the design principle is to keep
 // the committed region too small to matter rather than to build rewind
 // machinery for a fat one.
-// Overridable per build (`make FILL=1024`) so cushion depth can be A/B'd on
-// the bench against the measured render cost without editing the core.
-#ifndef SS_FILL_TARGET
 #define SS_FILL_TARGET 512
-#endif
-#if (SS_FILL_TARGET & (SS_FILL_TARGET - 1)) != 0
-#error "SS_FILL_TARGET must be a power of two (SS_RING derives from it)"
-#endif
-#define SS_SLICE (SS_FILL_TARGET / 4)  // emission quantum; may cross a boundary
+#define SS_SLICE 128         // emission quantum; a slice may cross one boundary
 // Ring CAPACITY, power of two >= SS_FILL_TARGET + SS_SLICE.
-#define SS_RING (2 * SS_FILL_TARGET)
+#define SS_RING 1024
 // One PERSISTENT head per step: a synthesis side that renders on demand and a
 // reader side that consumes one sample per output tick, always. There is no
 // voice allocator: a step re-firing is a LIFE HANDOFF inside its own head (see
@@ -429,21 +422,9 @@ class Head {
       float st = (l.stretch && *l.stretch > 0.01f) ? *l.stretch : 0.01f;
       l.srcPos += (double)SS_H / (double)st;
     }
-    // Keep srcPos wrapped into the source once per render: it otherwise grows
-    // without bound and the int cast below would overflow after minutes at low
-    // stretch. Wrapping here also lets the window read use a compare-and-reset
-    // instead of Source::at's per-sample modulo — 4096 integer divisions per
-    // render was measurable waste on the M7.
-    double dlen = (double)src_->len;
-    l.srcPos = fmod(l.srcPos, dlen);
-    if (l.srcPos < 0.0) l.srcPos += dlen;
-    uint32_t b = (uint32_t)l.srcPos;
-    const float* data = src_->data;
-    const uint32_t len = src_->len;
-    for (int i = 0; i < SS_W; i++) {
-      gWork[i] = data[b] * gTab.window[i];
-      if (++b == len) b = 0;
-    }
+    int32_t base = (int32_t)l.srcPos;
+    for (int i = 0; i < SS_W; i++)
+      gWork[i] = src_->at(base + i) * gTab.window[i];
 
     gTab.fft.Direct(gWork, gSpec);
 

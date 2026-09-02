@@ -35,38 +35,9 @@ ifdef PROFILE
 C_DEFS += -DPROFILE
 endif
 
-# `make FILL=1024`: override the per-head demand-cushion depth (samples,
-# power of two; default 512 in stretch_core.h). The cushion IS the knob-to-ear
-# latency (~fill/48 ms) AND the budget the worst render burst must fit inside —
-# raise it if LED 1 latches underruns, lower it once PROFILE numbers show
-# headroom. Flag changes are tracked (cflags.stamp), so no `make clean` is
-# needed between differing-flag builds.
-ifdef FILL
-C_DEFS += -DSS_FILL_TARGET=$(FILL)
-endif
-
 # Core location, and generic Makefile.
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile
-
-# --- Flag tracking -----------------------------------------------------------
-# The core Makefile's dependency files track headers but not command-line
-# defines (PROFILE, FILL), so an incremental `make PROFILE=1` after a plain
-# `make` reuses stale objects. A stamp file whose CONTENT is the current C_DEFS
-# fixes this without cleaning the world every build: it is a prerequisite of
-# every object and is only rewritten (moving its mtime) when the defines
-# actually change, so objects rebuild exactly on a flag change and are left
-# alone otherwise. The comparison happens at parse time via $(file <...), and
-# the stamp is written at parse time too — both before the object rules run, so
-# by the time make checks prerequisites the mtimes are settled. mkdir guards a
-# clean tree; the stamp is recreated (and thus objects rebuilt) after a clean,
-# which is correct — a clean tree has no objects anyway.
-FLAGSTAMP := $(BUILD_DIR)/cflags.stamp
-$(shell mkdir -p $(BUILD_DIR))
-ifneq ($(strip $(file < $(FLAGSTAMP))),$(strip $(C_DEFS)))
-$(shell printf '%s' '$(strip $(C_DEFS))' > $(FLAGSTAMP))
-endif
-$(OBJECTS): $(FLAGSTAMP)
 
 .PHONY: vendor vendor-check
 vendor:

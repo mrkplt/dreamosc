@@ -24,11 +24,34 @@ fizzy move <card#> 03gsa1lwpx0m5f4k5f2p16toh            # if it landed on the wr
 
 - **dreamosc board id: `03gsa1lwpx0m5f4k5f2p16toh`** (Flail Whale is the CLI
   default at `03gmw8zdlnigtxsgs2hknc3bx` — always pass `--board` for dreamosc).
-- The dreamosc board currently has NO columns (only the synthetic "Maybe?"
-  untriaged bucket), so new cards stay untriaged until columns exist.
-- Open cards as of this writing: #140 layer mode (3 discrete voices), #141 wire
-  the SSD1309 OLED, #142 FFT pitch-shift for tuning (MIDI prereq), #143 revisit
-  the lane architecture now that spread is gone.
+- Columns are by nature of work: Now / Next / Sound / Controls / Infra / Ideas.
+- **Fizzy is the live source of truth for what's open, done, and next** — query
+  it (`fizzy cards --all --board …`) rather than trusting a card list frozen in
+  this file. Don't maintain a card snapshot here; it rots.
+
+## Architecture: hardware glue vs testable cores
+
+The load-bearing structural rule of this codebase:
+
+- **`dreamosc.cpp` holds ONLY what is exclusive to the hardware** — the audio
+  callback, ADC/knob/encoder/button reads, `led.Set`, `PrintLine`, DFU/QSPI
+  wiring, `System::GetNow`. It `#include`s `daisy_pod.h`, so it **cannot be
+  compiled on the host** and cannot be unit-tested. Keep it as thin as possible:
+  it reads the panel, calls into a core, and writes the result to the hardware.
+- **Everything else — all real logic — lives in platform-free `*_core.h`
+  headers** (`stretch_core.h` = DSP, `controls_core.h` = control-surface logic).
+  These have no Daisy/Arduino dependency, so they compile and run on a desktop
+  and are exhaustively host-tested (`dreamosc/test/run.sh`).
+- **When you write behavior in `dreamosc.cpp`** — a mapping, a clamp, a state
+  machine, a stepping rule, a decision — **EXTRACT it to a core header and test
+  it.** The bar is that as little as sensibly possible is left in the untestable
+  edge. This is not optional polish: real bugs shipped precisely because they
+  lived in the un-host-compilable firmware (a drift double-add; a pickup
+  reference that chased the pot). Extracting them is what made them testable and
+  caught the next regression.
+
+The testing-culture note under "Build & flash" restates the discipline; this is
+the *why* and the *where*.
 
 ## Mental model (read this before reasoning about voices)
 
@@ -45,13 +68,19 @@ polyphony.
   it has to travel, so at very short durations stretch is nearly inaudible (the
   head barely moves either way) — it comes alive at multi-second durations.
 - **Heads are sequential.** Head N ends, head N+1 begins. The only thing that
-  varies is the SEAM between them, set by the **crossfade** (button 2 on/off):
-  - **Crossfade OFF:** butt-joint — a hard cut from one head to the next.
-  - **Crossfade ON:** the two heads overlap and equal-power (constant-loudness)
-    crossfade. The overlap length is variable 0..50% of the duration (`fade`, on
-    the encoder's fade page). At 50% each step is [mix ¼][clean ½... shrinking to
-    0][mix ¼]; **50% is the hard ceiling because beyond it a THIRD head would
-    overlap** — the whole point is that AT MOST TWO heads ever sound at once.
+  varies is the SEAM between them, set by **`fade`** (the crossfade overlap, on
+  the encoder's fade page):
+  - **fade 0:** butt-joint — a hard cut from one head to the next.
+  - **fade > 0:** the two heads overlap and equal-power (constant-loudness)
+    crossfade. Overlap is 0..50% of the duration. At 50% each step is
+    [mix ¼][clean ½ → 0][mix ¼]; **50% is the hard ceiling because beyond it a
+    THIRD head would overlap** — the whole point is that AT MOST TWO heads ever
+    sound at once. (There is no separate on/off toggle: fade 0 IS butt-joint.)
+- **Frame size (`SS_W`) is a sound-CHARACTER axis** (Fizzy #136), a live control:
+  small window = grainy/articulated, large = glassy/frozen. `SS_W` is the
+  compile-time buffer MAX; the active window is runtime-adjustable (one ShyFFT
+  instance, its runtime-length overload). Stretch and frame size together set
+  "how frozen" a head is.
 - **This REPLACES the old `spread` model** (which let all 8 heads stack at
   spread 0 — a ~2.3× CPU overload on the H750 that caused constant dropouts,
   measured via `make PROFILE=1`). The crossfade design caps concurrency at two
@@ -88,14 +117,17 @@ make -C libDaisy && make -C DaisySP        # build the static libs once
 
 ```
 dreamosc/
-  stretch_core.h      DSP core: Source, Voice, Sequencer (portable, verified)
-  shy_fft.h           Emilie Gillet's embedded real FFT (MIT)
+  stretch_core.h      DSP core: Source, Voice, Sequencer, StretchTables (portable)
+  controls_core.h     Control-surface logic: PanelEditor, encoder stepping, LED
+                      colors (portable, host-tested — see CONTROLS.md)
+  shy_fft.h           Emilie Gillet's embedded real FFT (MIT; vendored)
   sd_source.h         Load a WAV off microSD -> SDRAM -> Source. THE source seam.
-  dreamosc.cpp        (WIP) Pod firmware — currently a placeholder oscillator
+  dreamosc.cpp        Pod firmware: hardware glue (audio callback, controls, LEDs)
+  CONTROLS.md         The current control mapping (progressive disclosure)
   Makefile            libDaisy build; targets ../libDaisy and ../DaisySP
   host/
     host_main.cpp     Host harness: WAV -> Sequencer -> WAV (defines the globals)
-    stretchseq.py     Python reference (ground truth for the DSP)
+    stretchseq.py     Python reference (origin convention; see note below)
 archive/              The original reference files, as delivered (see below)
 ```
 
@@ -242,22 +274,28 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   frame's IFFT is a full periodic waveform; each output block raised-cosine-blends
   the current frame's second half against the previous frame's first half, times
   the `0.853553…` = `(1+1/√2)/2` AM-correction curve (ported against the real
-  `essej/paulxstretch` `Stretch.cpp`, not a summary of it). Seams between heads
-  are **window-mediated overlap** — no envelope, no crossfade, no pre-roll — which
-  beat the butt-joint alternative in an A/B on hardware. Analysis window is
-  Nasca's `(1-x²)^1.25`; a rectangular window leaked 0.6% out-of-band energy and
-  was audibly scratchy.
-- **DSP core: host-tested.** Run `dreamosc/test/run.sh` — vendored-source drift
-  check plus Catch2 unit tests over `stretch_core.h` (determinism, NaN/bounds, the
-  spread model, constant-loudness, drift, multi-samplerate, click detection) and
-  `shy_fft.h` (round-trips across sizes/types). 20 cases; gates on exit code. See
-  `dreamosc/test/README.md`.
+  `essej/paulxstretch` `Stretch.cpp`, not a summary of it). Within a head, block
+  junctions are window-mediated overlap. BETWEEN heads the seam is the **`fade`
+  crossfade**: fade 0 keeps the natural one-hop tail (butt-joint); fade > 0
+  applies an equal-power (quarter-sine) fade so ≤2 heads sum to constant power
+  (a full-volume-tail bug that clicked at every crossfaded seam is fixed and
+  guarded by a test). Analysis window is Nasca's `(1-x²)^1.25`; a rectangular
+  window leaked 0.6% out-of-band energy and was audibly scratchy.
+- **DSP + control cores: host-tested.** Run `dreamosc/test/run.sh` — vendored-
+  source drift check plus Catch2 unit tests over `stretch_core.h` (determinism,
+  bounds, the crossfade/interval model, constant-loudness, drift, multi-
+  samplerate, click detection, per-frame-size rendering), `controls_core.h`
+  (pickup, mode navigation, drift-fold, encoder stepping, LED colors), and
+  `shy_fft.h` (round-trips). Gates on exit code; the count grows with behavior —
+  read it from the run, don't hardcode it here. See `dreamosc/test/README.md`.
+- **Pod firmware: WORKING on hardware through `alpha2`** (crossfade model,
+  detented stretch to 10000×, two-mode panel controls, PROFILE diagnostics).
+  `experimental` adds live frame size on top (host-tested, not yet heard on the
+  bench). See the tag discipline above and Fizzy for what's next.
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
-  stereo->mono fold). Not yet run on hardware (no card yet).
-- **Pod firmware (`dreamosc.cpp`): NOT DONE.** Still the throwaway oscillator.
-  Needs: voices/source buffers in SDRAM (`DSY_SDRAM_BSS`), `Sequencer::next()` in
-  the audio callback, `service()` in the main loop, Pod controls mapped.
+  stereo->mono fold). Not yet run on hardware (no card yet — Fizzy #131). Source
+  today is the QSPI sample scaffolding (see below).
 
 ## Key facts a future agent needs
 
@@ -266,24 +304,14 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   where audio comes from. Today: SD card at boot (card not present yet — stub with
   a test tone until one is). This SD path is reused in later projects, so it was
   built for real, not faked.
-- **Controls = Daisy Pod, not a bare Seed.** 2 knobs + encoder (turn+click) +
-  2 buttons + 2 RGB LEDs + a PERMANENTLY attached SSD1309 OLED (I²C). Current map:
-  - **knob1** → duration (0.25..60 s), **knob2** → drift.
-  - **encoder turn** → stretch (page 0) or crossfade length (page 1);
-    **encoder click** toggles page.
-  - **stretch mapping is speed-sensitive:** slow single detents are LINEAR trim
-    (±0.5×, easy to land a value); a fast spin (≤40 ms between detents) switches
-    to LOGARITHMIC ratio steps so the full 1×..500× range is ~2 turns. This
-    matters because `Encoder::Increment()` only ever returns ±1 — speed must be
-    inferred from the detent GAP, not the step magnitude.
-  - **button2** → crossfade on/off. **led2** → page hue (blue=stretch,
-    green=fade) with brightness = crossfade state. **led1** → underrun latch.
-  - **Controls poll on a 1 ms WALL-CLOCK tick**, not every-Nth-`service()`: a
-    `service()` call is a full FFT (~2.4 ms), so the old service-count gate polled
-    the encoder only ~6×/s and dropped most detents. Poll on `System::GetNow()`.
-  **This mapping is a first-cut constraint of the Pod's panel, NOT the intended
-  final control surface** — the design wants a knob per parameter. Add dedicated
-  controls as the hardware allows.
+- **Controls → see `dreamosc/CONTROLS.md`** for the full, current mapping (two
+  knob modes global/step via button1, encoder pages stretch/fade/frame, pickup,
+  the ROYGBIVW step LED, the speed model, and the hard-won pickup/polling facts).
+  The one-line summary: it's a DEVELOPMENT surface (reach every parameter), not
+  the intended performance interface — the design wants a knob per parameter.
+  All the pure control logic is host-tested in `controls_core.h`; `dreamosc.cpp`
+  is only glue. **Keep CONTROLS.md updated when the mapping changes** — don't let
+  a control snapshot rot in this file.
 - **`make PROFILE=1`** builds a diagnostic firmware that prints per-second lines
   over USB serial (`screen /dev/tty.usbmodem* 115200`): a `SET` line (full
   instrument state), `KNOB`/`POS`/`DRF` lines (per-step + control state), and an
@@ -301,12 +329,14 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   "is this working?" by ear or by theory wasted whole sessions; a value on the
   serial line settles it in one glance. No new parameter is done until it's
   visible in `make PROFILE=1`.
-- **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
-  `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
-  all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). As built
-  in #129: the **source buffer (~1.9 MB) is in SDRAM** (it must be — too big for
-  SRAM), and the **`Sequencer` (with its 8 voice buffers, ~256 KB) is in internal
-  SRAM** (SRAM lands ~70% full). #130 is the deliberate budget/placement pass.
+- **Memory.** `SS_W = 4096` is the compile-time buffer MAX (the runtime window is
+  ≤ this — frame-size control). Per Voice: `old_[SS_W]` + `ring_[2*SS_W]` = 48 KB;
+  `SS_MAX_VOICES = 2*SS_STEPS = 16` slots (a voice's tail outlives the re-fire
+  period, so slots must exceed SS_STEPS or steps drop) → the voice pool (~768 KB)
+  lives in **SDRAM** (`headPool`, a plain float array `init()` carves + memsets),
+  as does the **source buffer (~1.9 MB)**. The `Sequencer` OBJECT stays in
+  internal SRAM (~19% full). The crossfade model caps CONCURRENT sounding heads at
+  2, so CPU is comfortable even though 16 slots exist.
 - **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
   is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
   NEITHER their constructor run NOR their storage zeroed — they boot with garbage

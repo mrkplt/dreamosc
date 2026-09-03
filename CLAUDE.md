@@ -138,8 +138,8 @@ archive/              The original reference files, as delivered (see below)
 cd dreamosc && make                 # -> build/dreamosc.bin
 make program-dfu                    # BOOT+RESET the Seed into DFU first
 
-# Host tests (run before committing a DSP change)
-cd dreamosc/test && ./run.sh    # Catch2 unit tests + golden C++-vs-Python regression
+# Host tests (run before committing a core change)
+cd dreamosc/test && ./run.sh    # Catch2 unit tests over the *_core.h headers + shy_fft
 
 # Ad-hoc render (manual listening / debugging)
 cd dreamosc/host
@@ -236,15 +236,15 @@ STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
 
 ### Sample audio: QSPI (temporary scaffolding)
 
-**Why:** internal flash is 128 KB and the firmware already uses ~89 KB, so real
-sample material (hundreds of KB) cannot be embedded. QSPI is 8 MB and
-memory-mapped, so the firmware reads samples in place with no copy.
+**Why:** internal flash is only 128 KB, so real sample material (hundreds of KB)
+cannot be embedded. QSPI is 8 MB and memory-mapped, so the firmware reads samples
+in place with no copy.
 
-**This is temporary.** It exists so the #132 controls can be judged on broadband
+**This is temporary.** It exists so the controls can be judged on broadband
 material — a sine has no spectral variation across the buffer, so moving a read
 head sounds identical everywhere and the controls appear to do nothing. The
-intended long-term source is the SD card path (#131, `sd_source.h`, already
-written). Revert this once controls are settled.
+intended long-term source is the SD card path (Fizzy #131, `sd_source.h`, already
+written); swap to it once a card is present.
 
 ```
 make sample SAMPLE_SRC=/path/to.wav   # WAV -> tools/wav2raw.py blob
@@ -256,13 +256,13 @@ make program-sample                   # upload the blob to QSPI
 only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
 
 - **Use `APP_TYPE = BOOT_SRAM`**, never `BOOT_QSPI`. SRAM execution is
-  "comparable speed to internal flash" with a 480 KB limit (we use ~89 KB);
-  QSPI execution is "more cache-dependent" i.e. slower, which is a real risk
-  for a real-time audio callback.
+  "comparable speed to internal flash" with a 480 KB limit (we use ~105 KB,
+  ~21%); QSPI execution is "more cache-dependent" i.e. slower, which is a real
+  risk for a real-time audio callback.
 - The bootloader **reserves the first 256 KB of QSPI** (firmware images load at
-  `0x90040000`). Sample data therefore lives at **`0x90100000`** (1 MB in) —
-  `QSPI_BASE` in `dreamosc.cpp` and the address in `make program-sample` must
-  agree.
+  `0x90040000`). Sample data therefore lives at **`0x90400000`** (the third
+  region, past the firmware area) — `QSPI_BASE` in `dreamosc.cpp` and
+  `SAMPLE_ADDR` in the Makefile must agree (both are `0x90400000`).
 - With the bootloader installed, programs **cannot use internal flash**.
 - The blob is self-describing (magic `DRMO`, count, rate) so the firmware
   validates it and falls back to a synthesized source if QSPI is empty or
@@ -350,6 +350,11 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
 - **Two Pythons, one truth:** `paulstretch.py` is the older origin convention;
   `stretchseq.py` + `stretch_core.h` are the current, matching pair. Verify against
   `stretchseq.py`.
+- **Host harness lag:** `host/host_main.cpp` still exposes `--spread` (the retired
+  onset-offset model), not the current `fade` crossfade — the host CLI predates
+  the crossfade rework. The DSP core it drives IS current; only the harness's
+  command-line surface is stale. Update it (spread → fade) when host_main next
+  needs touching; the unit tests (`test/`) already exercise the current model.
 
 ## archive/
 

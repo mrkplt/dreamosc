@@ -115,6 +115,27 @@ c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
 ./stretchcore in.wav out.wav --stretch 50 --duration 4 --spread 1
 ```
 
+### Tag discipline (hardware checkpoints)
+
+Tags mark **hardware-verified** vs **experimental** states, because host tests
+passing does NOT mean it sounds right on the Pod — this project's whole history
+is bugs that only showed on hardware.
+
+- **`alphaN`** (`alpha1`, `alpha2`, …): a state **confirmed working on hardware**
+  by ear. Bump to the next `alphaN` only after a bench session validated it.
+  These are the safe fall-back points.
+- **`experimental`**: the latest change that is **host-tested but NOT yet heard
+  on hardware**. Moves forward freely; graduates to the next `alphaN` once
+  confirmed on the bench, or gets abandoned if it doesn't hold up. Always
+  re-pointable (`git tag -f experimental <commit>` + `git push -f origin
+  experimental`).
+- When the user asks to "tag alphaN" / "tag experimental", create an **annotated**
+  tag (`git tag -a`) on the right commit and **push the tag to origin** (a plain
+  `git push` does NOT push tags — `git push origin <tag>`). Verify with
+  `git ls-remote --tags origin <tag>`.
+- Reference the driving Fizzy card (dreamosc board `03gsa1lwpx0m5f4k5f2p16toh`)
+  in the commit message when a change implements one.
+
 **Testing culture: push high coverage, test all the time.** The bar is that as
 little as sensibly possible is left untested. The mechanism is architectural:
 **pure decision logic lives in platform-free `*_core.h` headers so it compiles
@@ -263,12 +284,23 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   **This mapping is a first-cut constraint of the Pod's panel, NOT the intended
   final control surface** — the design wants a knob per parameter. Add dedicated
   controls as the hardware allows.
-- **`make PROFILE=1`** builds a diagnostic firmware that prints two lines/sec over
-  USB serial (`screen /dev/tty.usbmodem* 115200`): a `SET` line (full instrument
-  state — stretch, duration, drift, fade, xfade, page, as scaled integers) and an
-  `HLTH` line (active voices, service µs, per-render `avg_us`, ISR µs, underruns).
-  This is how the spread-0 CPU overload was measured and how control/DSP behavior
-  is confirmed on-device. Gated behind `-DPROFILE`; costs nothing in normal builds.
+- **`make PROFILE=1`** builds a diagnostic firmware that prints per-second lines
+  over USB serial (`screen /dev/tty.usbmodem* 115200`): a `SET` line (full
+  instrument state), `KNOB`/`POS`/`DRF` lines (per-step + control state), and an
+  `HLTH` line (active voices, service µs, per-render `avg_us`, ISR µs, underruns),
+  all as scaled integers (nano-newlib printf can't do floats). This is how the
+  spread-0 CPU overload was measured, how the pickup and "steps go silent" bugs
+  were diagnosed from the board instead of by conjecture, and how any control/DSP
+  behavior is confirmed on-device. Gated behind `-DPROFILE`; costs nothing in
+  normal builds.
+  **DIRECTIVE: every variable parameter goes in the profiler.** When you add a
+  control or a piece of runtime state (a new global, a per-step value, a mode,
+  frame size, an engagement flag), add it to the relevant PROFILE line in the
+  same change. The recurring lesson this project keeps teaching is that
+  bench debugging is only fast when the board can *show* its state — chasing
+  "is this working?" by ear or by theory wasted whole sessions; a value on the
+  serial line settles it in one glance. No new parameter is done until it's
+  visible in `make PROFILE=1`.
 - **Memory.** `SS_W = 4096`. Per Voice: `accum_[4096]` + `ring_[4096]` = 32 KB;
   `SS_MAX_VOICES = SS_STEPS = 8` -> ~256 KB (raised from 6 because spread 0 fires
   all 8 heads at once — the ceiling must be 8 or 0% silently drops heads). As built

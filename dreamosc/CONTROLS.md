@@ -49,14 +49,21 @@ Two implementation facts that were hard-won bugs:
 
 ## Encoder
 
-Turn drives the current page; click cycles the page. led2 = page hue, brightness
-= crossfade active (`fade > 0`).
+Turn drives the current page; click cycles the page. led2 = page hue (**RoYG**
+over the four pages, in click order), brightness carries a second signal per page
+(see the table).
 
 | Page | led2 | encoder turn |
 |------|------|--------------|
-| **stretch** | blue | index a detent table `STRETCH_STOPS` (1×..10000×) |
-| **fade** | green | crossfade overlap 0..0.5 (additive) |
+| **stretch** | red | index a detent table `STRETCH_STOPS` (1×..10000×) |
+| **fade** | orange | crossfade overlap 0..0.5 (additive) |
 | **frame** | yellow | index `FRAME_STOPS` {256,512,1024,2048,4096} → `seq.setFrame()` |
+| **steps** | green | active step count 1..8 → `seq.setSteps()` (one step/detent) |
+
+- **led2 brightness:** on stretch/fade/frame, brightness = crossfade active
+  (`fade > 0`). On the **steps** page, brightness = the **active step count** —
+  green dims for a short sequence, brightens toward full for all 8 steps
+  (`stepBrightness`), so the count reads at a glance without the OLED.
 
 - **Stretch is a detent table**, not continuous: PaulStretch factors aren't
   perceptually linear, so what matters is the regime (scan/drift/freeze). Fine
@@ -67,6 +74,13 @@ Turn drives the current page; click cycles the page. led2 = page hue, brightness
   identical to it and was removed, freeing button 2 for the mode navigation).
 - **Frame size** is a SOUND-CHARACTER control (Fizzy #136): small = grainy/
   articulated, large = glassy/frozen. Takes effect on the next voice fire.
+- **Step count** (Fizzy #149): how many of the 8 steps the sequence walks, 1..8.
+  Fewer steps = a shorter, faster-repeating pattern (a real compositional
+  control). The `position[]`/`drift[]` arrays stay sized to 8; only steps below
+  the count are walked. The step-select nav (button1) only visits ACTIVE steps,
+  and dropping the count off a currently-selected step snaps the panel back to
+  GLOBAL. On the real hardware build this likely becomes per-step select buttons
+  (Fizzy #151), a mask that generalizes this contiguous count.
 
 ### Encoder speed model
 

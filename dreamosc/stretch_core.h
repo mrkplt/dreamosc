@@ -416,8 +416,9 @@ class Voice {
 };
 
 // ---------------------------------------------------------------------------
-// Sequencer - eight steps on an even lattice.
-// Per step: position, drift.  Global: stretch, duration, spread.
+// Sequencer - up to SS_STEPS steps on an even lattice (activeSteps of them are
+// walked, #149).  Per step: position, drift.  Global: stretch, duration, fade,
+// frame size, step count.
 // ---------------------------------------------------------------------------
 
 class Sequencer {
@@ -449,6 +450,25 @@ class Sequencer {
   void setFrame(int w) {
     frameSize = w;
     gTab.setWindow(w);
+  }
+
+  // Number of ACTIVE sequence steps the walk uses (#149). The position[]/drift[]
+  // arrays stay sized to SS_STEPS (the buffer max); only steps [0, activeSteps)
+  // are walked. Fewer steps = a shorter, faster-repeating pattern -- a real
+  // compositional control, not just a limit. Runtime-settable via setSteps();
+  // default = SS_STEPS, so untouched behavior is identical to before. A
+  // contiguous count for now; #151 may generalize this to a per-step mask on the
+  // hardware build (step-select buttons), which is a superset of the count.
+  int activeSteps = SS_STEPS;
+
+  // Set the active step count, clamped to [1, SS_STEPS]. If the current step_
+  // fell outside the new (shorter) range, wrap it back in so the very next fire
+  // is a valid step rather than one past the end.
+  void setSteps(int n) {
+    if (n < 1) n = 1;
+    if (n > SS_STEPS) n = SS_STEPS;
+    activeSteps = n;
+    if (step_ >= activeSteps) step_ %= activeSteps;
   }
 
   // pool: SS_MAX_VOICES * SS_VOICE_FLOATS floats of scratch for the voices'
@@ -500,10 +520,11 @@ class Sequencer {
     return (uint32_t)(lenSamples() * (1.0f - overlapFrac()));
   }
 
-  // How long one full pass of all SS_STEPS heads takes: the last head starts at
-  // (SS_STEPS-1)*interval; its audible span is its body plus a one-hop tail.
+  // How long one full pass of all ACTIVE heads takes: the last head starts at
+  // (activeSteps-1)*interval; its audible span is its body plus a one-hop tail.
+  // Uses activeSteps (#149), not SS_STEPS, so a shorter sequence loops sooner.
   uint32_t patternSamples() const {
-    return (SS_STEPS - 1) * intervalSamples() + lenSamples() + gTab.activeH;
+    return (activeSteps - 1) * intervalSamples() + lenSamples() + gTab.activeH;
   }
 
   // Audio callback. One sample of the whole sequence.
@@ -548,7 +569,7 @@ class Sequencer {
     if (armClock_ <= SS_LOOKAHEAD) {
       uint32_t onset_delay = armClock_;
       if (interval == 0) {
-        for (int k = 0; k < SS_STEPS; k++) requestArm(onset_delay);
+        for (int k = 0; k < activeSteps; k++) requestArm(onset_delay);
       } else {
         requestArm(onset_delay);
       }
@@ -639,7 +660,7 @@ class Sequencer {
     uint32_t overlap = (uint32_t)(lenSamples() * overlapFrac());
     voice_[slot].start(src_, p, &stretch,
                        lenSamples(), seed_, onsetDelay, overlap);
-    step_ = (step_ + 1) % SS_STEPS;
+    step_ = (step_ + 1) % activeSteps;   // walk only the active steps (#149)
   }
 
   const Source* src_ = nullptr;

@@ -8,6 +8,29 @@ phase-randomized sound from a named point in the stretch and fades into the next
 Read `archive/stretchsequencerspec.md` for the full design. It is the source of
 truth for behavior.
 
+## Surface bugs — do NOT silently fix them
+
+**This is an audio instrument, and every change can alter the character of the
+synth.** A "bug" you spot in the DSP or control path may be load-bearing to how
+the instrument SOUNDS — the tuning that made it settle on hardware by ear. Treat
+the current behavior as intentional until proven otherwise.
+
+- **When you find a bug, SURFACE it — report it, explain it, and propose the
+  fix — but do NOT just apply the fix as part of unrelated work.** Silently
+  "correcting" something can change the sound out from under the user, who tuned
+  it on the bench and cannot hear your host build.
+- This applies most sharply to anything that touches the audio: window curves,
+  gain/headroom constants, the AM-correction factor, crossfade envelopes,
+  quantization grids, phase seeding, hop/frame geometry, clamps in the render
+  path. A one-line "obvious" fix here is a sound change.
+- A genuinely mechanical, sound-neutral fix (a typo in a comment, a test-only
+  helper, a build-flag guard) can be made directly. When in doubt, it is NOT
+  sound-neutral — surface it and let the user decide.
+- The user validates by EAR on hardware (see the tag discipline: `alphaN` =
+  heard on the bench). Host tests passing is necessary, not sufficient — they
+  cannot tell you it still sounds right. So a sound-affecting fix is not "done"
+  when the test is green; it is a proposal awaiting a bench session.
+
 ## Issue tracking (Fizzy)
 
 dreamosc has its OWN board on the self-hosted Fizzy instance (PiHost, LAN-only) —

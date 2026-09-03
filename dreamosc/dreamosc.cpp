@@ -34,6 +34,10 @@ volatile uint32_t gUnderruns = 0;
 static volatile uint32_t profIsrUs = 0;
 // Last knob reads (raw + smoothed) for the KNOB diagnostic line.
 static float dbgR1 = 0, dbgR2 = 0, dbgK1 = 0, dbgK2 = 0;
+// Peak per-poll knob speed since the last profiler print (instantaneous speed is
+// ~0 at any given print instant; the peak catches an actual turn). *1000 in the
+// line. Used to tune the potFast threshold from board data.
+static float dbgPk1 = 0, dbgPk2 = 0;
 #endif
 
 // --- storage ---------------------------------------------------------------
@@ -123,8 +127,9 @@ static void fill_stub_source() {
 // Two KNOB MODES (button1 cycles GLOBAL -> step1..8 -> GLOBAL; button2 = GLOBAL):
 //   GLOBAL mode (led1 OFF):  knob1 -> duration (0.25..60s), knob2 -> global drift
 //   step mode  (led1 ROYGBIVW): knob1 -> that step's position, knob2 -> its drift
-//   encoder turn   -> stretch (page 0) or crossfade length (page 1)
-//   encoder click  -> cycle encoder page: stretch(blue) / fade(green) / frame(yellow)
+//   encoder turn   -> the current page's parameter (stretch / fade / frame / steps)
+//   encoder click  -> cycle page: stretch(red)/fade(orange)/frame(yellow)/steps(green)
+//                     steps LED green intensity encodes the active step count
 //   led2           -> encoder page color; brightness = crossfade active (fade>0)
 //
 // PICKUP (soft takeover) EVERYWHERE: landing on GLOBAL or a step does NOT snap
@@ -191,11 +196,12 @@ static uint32_t lastDetentMs = 0;
 static void processControls() {
   pod.ProcessAllControls();
 
-  // --- encoder click: cycle page (stretch <-> fade) ---
+  // --- encoder click: cycle page (stretch/fade/frame/steps) ---
   if (pod.encoder.RisingEdge()) encPage = nextPage(encPage);
 
-  // --- button1: advance panel mode (GLOBAL -> step1..8 -> GLOBAL) ---
-  if (pod.button1.RisingEdge()) panel.advance();
+  // --- button1: advance panel mode (GLOBAL -> step1..N -> GLOBAL) where N is
+  // the active step count (#149) -- the tour only visits active steps ---
+  if (pod.button1.RisingEdge()) panel.advance(seq.activeSteps);
   // --- button2: jump back to GLOBAL ---
   if (pod.button2.RisingEdge()) panel.toGlobal();
 
@@ -213,6 +219,12 @@ static void processControls() {
     } else if (encPage == PAGE_FRAME) {
       frameIdx = stepIndex(frameIdx, inc, 1, FRAME_NSTOPS);   // 1 stop/detent
       seq.setFrame(FRAME_STOPS[frameIdx]);                    // recompute window
+    } else if (encPage == PAGE_STEPS) {
+      // Active step count 1..SS_STEPS (#149): one step per detent (small range,
+      // no fast/coarse mode). Keep the panel nav on a valid slot if the count
+      // shrank past the currently selected step.
+      seq.setSteps(stepCount(seq.activeSteps, inc, 1, SS_STEPS));
+      panel.clampToActive(seq.activeSteps);
     } else {   // PAGE_FADE
       seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
     }
@@ -229,10 +241,16 @@ static void processControls() {
   panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
 #ifdef PROFILE
   dbgR1 = r1; dbgR2 = r2; dbgK1 = k1; dbgK2 = k2;   // for the KNOB profiler line
+  if (panel.speed1() > dbgPk1) dbgPk1 = panel.speed1();   // peak since last print
+  if (panel.speed2() > dbgPk2) dbgPk2 = panel.speed2();
 #endif
 
-  // --- led2: encoder page color; brightness = crossfade active (fade > 0) ---
-  Rgb c2 = pageColor(encPage, (seq.fade > 0.0f) ? 0.6f : 0.15f);
+  // --- led2: encoder page color (RoYG over stretch/fade/frame/steps). Brightness
+  // carries a second signal: on the STEPS page it encodes the active step count
+  // (green, dim=few steps, bright=full sequence); on the others, crossfade-active.
+  float b2 = (encPage == PAGE_STEPS) ? stepBrightness(seq.activeSteps)
+                                     : ((seq.fade > 0.0f) ? 0.6f : 0.15f);
+  Rgb c2 = pageColor(encPage, b2);
   pod.led2.Set(c2.r, c2.g, c2.b);
 
   // --- led1: OFF in GLOBAL mode; ROYGBIVW for the selected step otherwise ---
@@ -342,24 +360,31 @@ int main(void) {
       // SETTINGS line: globals + which step is selected. Integers *1000 (or
       // *100 for stretch) since nano-newlib printf can't do floats reliably.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d frame=%d page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d frame=%d steps=%d page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(globalDrift * 1000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
           seq.frameSize,
+          seq.activeSteps,   // active step count (#149)
           (int)encPage,
-          panel.slot());   // 0 = GLOBAL, 1..8 = step
+          panel.slot());   // 0 = GLOBAL, 1..N = step
       // KNOB line: raw + smoothed knob reads (*1000) and whether pickup has
       // engaged on the current slot (k1L/k2L = 1 once the pot has moved past
       // threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
       // the move; if k1L=1 but the value doesn't change, the write is the bug.
+      // pk1/pk2 = PEAK per-poll knob speed since last print (*1000, i.e. per-mil
+      // of full travel per poll). potFast threshold is 10 in these units (0.01).
+      // Turn a knob and read pk to see what "fast" actually measures -> tune the
+      // threshold. f1/f2 = the fast verdict at print time.
       pod.seed.PrintLine(
-          "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d b1=%d b2=%d",
+          "KNOB r1=%d r2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d",
           (int)(dbgR1 * 1000.0f + 0.5f), (int)(dbgR2 * 1000.0f + 0.5f),
-          (int)(dbgK1 * 1000.0f + 0.5f), (int)(dbgK2 * 1000.0f + 0.5f),
           (int)panel.k1Live(), (int)panel.k2Live(),
+          (int)(dbgPk1 * 1000.0f + 0.5f), (int)(dbgPk2 * 1000.0f + 0.5f),
+          (int)panel.fast1(), (int)panel.fast2(),
           (int)pod.button1.Pressed(), (int)pod.button2.Pressed());
+      dbgPk1 = dbgPk2 = 0.0f;   // reset peak for the next window
       // POS line: all 8 step positions (*1000). Homing every knob should make
       // these equal; if they differ, that's why steps sound different.
       pod.seed.PrintLine(

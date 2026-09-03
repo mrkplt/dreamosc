@@ -53,6 +53,34 @@ TEST_CASE("panel starts in GLOBAL; advance walks steps then returns to GLOBAL") 
   REQUIRE(pe.inGlobal());
 }
 
+TEST_CASE("advance(N) tours only the active steps then wraps to GLOBAL (#149)") {
+  // With activeSteps = 3, button1 should walk GLOBAL -> 1 -> 2 -> 3 -> GLOBAL,
+  // never visiting steps 4..8 (they're not in the sequence).
+  PanelEditor pe;
+  REQUIRE(pe.inGlobal());
+  pe.advance(3); REQUIRE(pe.slot() == 1);
+  pe.advance(3); REQUIRE(pe.slot() == 2);
+  pe.advance(3); REQUIRE(pe.slot() == 3);
+  pe.advance(3); REQUIRE(pe.inGlobal());     // wraps after the last ACTIVE step
+  // activeSteps = 1: GLOBAL <-> step 1 only.
+  pe.advance(1); REQUIRE(pe.slot() == 1);
+  pe.advance(1); REQUIRE(pe.inGlobal());
+}
+
+TEST_CASE("clampToActive: shrinking the count off a parked step returns to GLOBAL (#149)") {
+  PanelEditor pe;
+  pe.advance(); pe.advance(); pe.advance();   // full tour: on step 3
+  REQUIRE(pe.slot() == 3);
+  pe.clampToActive(3);                        // still valid: stays put
+  REQUIRE(pe.slot() == 3);
+  pe.clampToActive(2);                        // step 3 now inactive: back to GLOBAL
+  REQUIRE(pe.inGlobal());
+  // On an active step, clamp is a no-op.
+  pe.advance(2);                              // step 1
+  pe.clampToActive(2);
+  REQUIRE(pe.slot() == 1);
+}
+
 TEST_CASE("button2 (toGlobal) jumps back to GLOBAL from any step") {
   PanelEditor pe;
   pe.advance(); pe.advance(); pe.advance();   // on step 3
@@ -244,6 +272,13 @@ TEST_CASE("stepIndex: index moves by stops*inc, clamped to [0,count-1]") {
   REQUIRE(stepIndex(54, +1, 3, 56) == 55);     // clamp hi (not 57)
 }
 
+TEST_CASE("stepCount: +/-1 per detent, clamped to [lo,hi] (#149)") {
+  REQUIRE(stepCount(4, +1, 1, SS_STEPS) == 5);
+  REQUIRE(stepCount(4, -1, 1, SS_STEPS) == 3);
+  REQUIRE(stepCount(1, -1, 1, SS_STEPS) == 1);          // clamp lo (never 0)
+  REQUIRE(stepCount(SS_STEPS, +1, 1, SS_STEPS) == SS_STEPS);  // clamp hi
+}
+
 TEST_CASE("smoothKnob: first read jumps, then eases") {
   float s = 0.0f;
   REQUIRE(smoothKnob(s, 0.7f, /*primed=*/false) == Approx(0.7f));   // jump
@@ -255,21 +290,40 @@ TEST_CASE("smoothKnob: first read jumps, then eases") {
 
 // --- page + LED color -------------------------------------------------------
 
-TEST_CASE("nextPage cycles stretch -> fade -> frame -> stretch") {
+TEST_CASE("nextPage cycles stretch -> fade -> frame -> steps -> stretch") {
   REQUIRE(nextPage(PAGE_STRETCH) == PAGE_FADE);
   REQUIRE(nextPage(PAGE_FADE)    == PAGE_FRAME);
-  REQUIRE(nextPage(PAGE_FRAME)   == PAGE_STRETCH);   // wraps (3 pages)
+  REQUIRE(nextPage(PAGE_FRAME)   == PAGE_STEPS);
+  REQUIRE(nextPage(PAGE_STEPS)   == PAGE_STRETCH);   // wraps (4 pages)
 }
 
-TEST_CASE("pageColor: distinct hue per page, brightness folded in") {
-  Rgb blue = pageColor(PAGE_STRETCH, 0.6f);
-  REQUIRE(blue.b == Approx(0.6f)); REQUIRE(blue.r == Approx(0.0f));
-  Rgb green = pageColor(PAGE_FADE, 0.6f);
-  REQUIRE(green.g == Approx(0.6f)); REQUIRE(green.b == Approx(0.0f));
+TEST_CASE("pageColor: RoYG over the four pages, brightness folded in") {
+  // stretch = red, fade = orange, frame = yellow, steps = green (click order).
+  Rgb red = pageColor(PAGE_STRETCH, 0.6f);
+  REQUIRE(red.r == Approx(0.6f)); REQUIRE(red.g == Approx(0.0f)); REQUIRE(red.b == Approx(0.0f));
+  Rgb orange = pageColor(PAGE_FADE, 0.6f);
+  REQUIRE(orange.r == Approx(0.6f)); REQUIRE(orange.b == Approx(0.0f));
+  REQUIRE(orange.g > 0.0f); REQUIRE(orange.g < orange.r);   // some green, less than red
   Rgb yellow = pageColor(PAGE_FRAME, 0.6f);
-  REQUIRE(yellow.r == Approx(0.6f)); REQUIRE(yellow.g == Approx(0.6f)); REQUIRE(yellow.b == Approx(0.0f));
+  REQUIRE(yellow.r == Approx(yellow.g)); REQUIRE(yellow.b == Approx(0.0f)); REQUIRE(yellow.r > 0.0f);
+  Rgb green = pageColor(PAGE_STEPS, 0.6f);
+  REQUIRE(green.g == Approx(0.6f)); REQUIRE(green.r == Approx(0.0f)); REQUIRE(green.b == Approx(0.0f));
   // brightness actually scales
-  REQUIRE(pageColor(PAGE_STRETCH, 0.15f).b == Approx(0.15f));
+  REQUIRE(pageColor(PAGE_STRETCH, 0.15f).r == Approx(0.15f));
+}
+
+TEST_CASE("stepBrightness: green intensity tracks the active step count (#149)") {
+  // 1 step = the dim floor, SS_STEPS = full brightness, monotonic between.
+  REQUIRE(stepBrightness(1) == Approx(0.15f));            // floor
+  REQUIRE(stepBrightness(SS_STEPS) == Approx(1.0f));      // full
+  REQUIRE(stepBrightness(4) > stepBrightness(2));         // more steps = brighter
+  REQUIRE(stepBrightness(7) < stepBrightness(SS_STEPS));
+  // clamped outside [1, SS_STEPS]
+  REQUIRE(stepBrightness(0) == Approx(0.15f));
+  REQUIRE(stepBrightness(99) == Approx(1.0f));
+  // paired with pageColor, the STEPS LED is pure green at that brightness
+  Rgb c = pageColor(PAGE_STEPS, stepBrightness(SS_STEPS));
+  REQUIRE(c.g == Approx(1.0f)); REQUIRE(c.r == Approx(0.0f)); REQUIRE(c.b == Approx(0.0f));
 }
 
 TEST_CASE("stepColor: 8 distinct colors, index clamped") {

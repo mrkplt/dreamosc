@@ -17,13 +17,15 @@
 
 #include "stretch_core.h"   // for SS_STEPS
 
-// Encoder pages (the parameter the encoder turn drives; click cycles). Just
-// stretch and fade -- duration and drift moved to the knobs (global mode).
+// Encoder pages (the parameter the encoder turn drives; click cycles):
+// stretch, fade, frame size (#136), step count (#149). Duration and drift live
+// on the knobs (global mode). LED2 shows the page as RoYG (see pageColor).
 enum EncoderPage {
   PAGE_STRETCH  = 0,   // blue
   PAGE_FADE     = 1,   // green
   PAGE_FRAME    = 2,   // yellow (frame/window size, #136)
-  PAGE_COUNT    = 3,
+  PAGE_STEPS    = 3,   // cyan (active step count, #149)
+  PAGE_COUNT    = 4,
 };
 
 struct Rgb { float r, g, b; };
@@ -117,6 +119,16 @@ inline int stepIndex(int idx, int inc, int stopsPerDetent, int count) {
   return out;
 }
 
+// Integer count step (active step count #149): value + inc, clamped to
+// [lo, hi]. One unit per detent -- a small integer range wants no fast/coarse
+// mode. Returns the new count.
+inline int stepCount(int value, int inc, int lo, int hi) {
+  int out = value + inc;
+  if (out < lo) out = lo;
+  if (out > hi) out = hi;
+  return out;
+}
+
 // One-pole knob smoothing on a raw ADC read. First read jumps to the raw value
 // (primed=false), afterward eases toward it. Returns the smoothed value AND
 // updates `state`.
@@ -131,15 +143,28 @@ inline EncoderPage nextPage(EncoderPage p) {
   return (EncoderPage)((p + 1) % PAGE_COUNT);
 }
 
-// LED2 color for the encoder page: hue = page, brightness `b` folded in so the
-// caller can encode a second signal (crossfade-active) via brightness.
+// LED2 color for the encoder page: hue = page (RoYG over the four pages, in
+// click order), brightness `b` folded in so the caller can encode a second
+// signal via brightness. On PAGE_STEPS the brightness encodes the active step
+// count (see stepBrightness); on the others it encodes crossfade-active.
 inline Rgb pageColor(EncoderPage page, float b) {
   switch (page) {
-    case PAGE_STRETCH:  return {0.0f, 0.0f, b};        // blue
-    case PAGE_FADE:     return {0.0f, b,    0.0f};      // green
-    case PAGE_FRAME:    return {b,    b,    0.0f};      // yellow
-    default:            return {0.0f, 0.0f, 0.0f};
+    case PAGE_STRETCH:  return {b,        0.0f,      0.0f};   // red
+    case PAGE_FADE:     return {b,        b * 0.35f, 0.0f};   // orange
+    case PAGE_FRAME:    return {b * 0.5f, b * 0.5f,  0.0f};   // yellow
+    case PAGE_STEPS:    return {0.0f,     b,         0.0f};   // green
+    default:            return {0.0f,     0.0f,      0.0f};
   }
+}
+
+// Brightness for the PAGE_STEPS LED: green whose INTENSITY tracks the active
+// step count -- fewer steps dim, the full sequence bright -- so the count reads
+// at a glance without a separate display. Maps count in [1, SS_STEPS] to a
+// [floorB, 1.0] brightness (a small floor so 1 step is still visibly lit).
+inline float stepBrightness(int activeSteps, float floorB = 0.15f) {
+  int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
+  float t = (float)(n - 1) / (float)(SS_STEPS - 1);   // 0 at 1 step, 1 at SS_STEPS
+  return floorB + (1.0f - floorB) * t;
 }
 
 // LED1 color for the selected step, ROYGBIVW over the 8 steps. `i` is clamped
@@ -196,14 +221,34 @@ class PanelEditor {
   // Diagnostic: has each knob's pickup engaged on the CURRENT slot?
   bool k1Live() const { return k1Live_[slot_]; }
   bool k2Live() const { return k2Live_[slot_]; }
+  // Diagnostic: last per-poll knob speed (|Δraw|) and its fast/slow verdict,
+  // for tuning the potFast threshold from board data.
+  float speed1() const { return spd1_; }
+  float speed2() const { return spd2_; }
+  bool  fast1()  const { return potFast(spd1_); }
+  bool  fast2()  const { return potFast(spd2_); }
   float anchor1() const { return k1Anchor_; }
   float anchor2() const { return k2Anchor_; }
 
-  // button1: GLOBAL -> step1 -> ... -> step8 -> GLOBAL. Re-arms pickup for the
-  // slot we land on.
-  void advance() { goTo((slot_ + 1) % PE_NSLOTS); }
+  // button1: GLOBAL -> step1 -> ... -> stepN -> GLOBAL, where N = activeSteps
+  // (#149): the nav only visits ACTIVE steps, so shrinking the sequence shrinks
+  // the tour. `activeSteps` is clamped into [1, SS_STEPS]; default SS_STEPS
+  // preserves the old full-tour behavior. Re-arms pickup for the slot we land on.
+  void advance(int activeSteps = SS_STEPS) {
+    int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
+    // Slots in play: GLOBAL (0) + steps 1..n, so (n + 1) slots, wrapping.
+    goTo((slot_ + 1) % (n + 1));
+  }
   // button2: shortcut back to GLOBAL (re-arms its pickup).
   void toGlobal() { goTo(PE_GLOBAL); }
+
+  // Keep the editor on a valid slot when the active step count shrinks (#149):
+  // if we're parked on a step past the new count, jump back to GLOBAL so the
+  // knobs never edit an inactive step. Call after the step count changes.
+  void clampToActive(int activeSteps) {
+    int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
+    if (slot_ > n) goTo(PE_GLOBAL);
+  }
 
   // One control pass. Movement is detected on the RAW knob (r1/r2) -- the
   // physical pot position -- while the VALUE written uses the smoothed knob
@@ -237,6 +282,7 @@ class PanelEditor {
     // the KnobSpec (range + fast/slow grids) differs per target.
     float spd1 = fabsf(r1 - r1Prev_);
     float spd2 = fabsf(r2 - r2Prev_);
+    spd1_ = spd1; spd2_ = spd2;   // exposed for the profiler (threshold tuning)
     r1Prev_ = r1;
     r2Prev_ = r2;
 
@@ -275,6 +321,7 @@ class PanelEditor {
   float perStepDrift_[SS_STEPS] = {0};
   float k1Anchor_ = 0.0f, k2Anchor_ = 0.0f;   // frozen move reference (per entry)
   float r1Prev_ = 0.0f, r2Prev_ = 0.0f;       // last raw reads (per-poll speed)
+  float spd1_ = 0.0f, spd2_ = 0.0f;           // last measured speed (diagnostic)
   bool  anchorPending_ = false;
   bool  primed_ = false;
 };

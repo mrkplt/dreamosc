@@ -290,6 +290,58 @@ TEST_CASE("pattern length: heads sequential, overlapping by the crossfade") {
   }
 }
 
+TEST_CASE("configurable step count: setSteps clamps to [1, SS_STEPS] (#149)") {
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f);
+
+  REQUIRE(seq.activeSteps == SS_STEPS);      // default = full sequence
+  seq.setSteps(3);  REQUIRE(seq.activeSteps == 3);
+  seq.setSteps(1);  REQUIRE(seq.activeSteps == 1);
+  seq.setSteps(0);  REQUIRE(seq.activeSteps == 1);          // clamp lo (never 0)
+  seq.setSteps(-4); REQUIRE(seq.activeSteps == 1);
+  seq.setSteps(SS_STEPS + 5); REQUIRE(seq.activeSteps == SS_STEPS);   // clamp hi
+}
+
+TEST_CASE("pattern length shrinks with the active step count (#149)") {
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  const float sr = 48000, dur = 4.0f;
+  const uint32_t len = ((uint32_t)(dur * sr / SS_H + 0.5f)) * SS_H;
+
+  // Butt-joint (interval = full duration): a K-step pattern is K durations + the
+  // one-hop tail, so the pattern length is directly proportional to activeSteps.
+  Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.0f);
+  uint32_t interval = seq.intervalSamples();
+  REQUIRE(interval == len);
+  for (int k = 1; k <= SS_STEPS; k++) {
+    seq.setSteps(k);
+    REQUIRE(seq.patternSamples() == (uint32_t)(k - 1) * interval + len + SS_H);
+  }
+  // A single step is just one duration + tail -- the shortest possible loop.
+  seq.setSteps(1);
+  REQUIRE(seq.patternSamples() == len + SS_H);
+}
+
+TEST_CASE("a K-step sequence renders and stays bounded (#149)") {
+  // End-to-end: with activeSteps < SS_STEPS the sequence still produces clean,
+  // in-bounds audio (only the active heads fire; the walk wraps at K).
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f);
+  seq.setSteps(3);
+  auto out = render(seq, 3);   // 3 full 3-step patterns: exercises the wrap at K
+  for (float s : out) {
+    REQUIRE(std::isfinite(s));
+    REQUIRE(s <= 1.0f);
+    REQUIRE(s >= -1.0f);
+  }
+  REQUIRE(rms(out) > 0.0f);        // it actually sounds
+}
+
 TEST_CASE("interval = (1 - overlap) * duration; overlap clamped to 0.5") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);

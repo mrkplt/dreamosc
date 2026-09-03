@@ -353,9 +353,12 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   serial line settles it in one glance. No new parameter is done until it's
   visible in `make PROFILE=1`.
 - **Memory.** `SS_W = 4096` is the compile-time buffer MAX (the runtime window is
-  ≤ this — frame-size control). Per Voice: `old_[SS_W]` + `ring_[2*SS_W]` = 48 KB;
+  ≤ this — frame-size control). Per Voice: `old_[SS_W]` + `ring_[2*SS_W]` +
+  `win_[SS_W]` = 64 KB (`win_` is the voice's own snapshot of the analysis window
+  curve, so a live frame-size change can't corrupt a sounding voice — the
+  fast-scroll noise bug);
   `SS_MAX_VOICES = 2*SS_STEPS = 16` slots (a voice's tail outlives the re-fire
-  period, so slots must exceed SS_STEPS or steps drop) → the voice pool (~768 KB)
+  period, so slots must exceed SS_STEPS or steps drop) → the voice pool (~1 MB)
   lives in **SDRAM** (`headPool`, a plain float array `init()` carves + memsets),
   as does the **source buffer (~1.9 MB)**. The `Sequencer` OBJECT stays in
   internal SRAM (~19% full). The crossfade model caps CONCURRENT sounding heads at

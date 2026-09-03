@@ -55,12 +55,15 @@ led1** (`hueROYGBIVW`, so a color means the same on both LEDs and orange/yellow
 stay distinct). **Brightness on EVERY page tracks that page's encoded level** —
 a bright LED always means "this parameter is turned up".
 
+Click order: **stretch → steps → fade → window → stretch** (the page index is
+also the color index, so click order = RoYG).
+
 | Page | led2 hue | encoder turn | brightness = |
 |------|----------|--------------|--------------|
 | **stretch** | red | index `STRETCH_STOPS` (1×..10000×) | stretch index (low dim → max bright) |
-| **fade** | orange | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
-| **frame** | yellow | index `FRAME_STOPS` {256,512,1024,2048,4096} → `seq.setFrame()` | frame index (small dim → large bright) |
-| **steps** | green | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
+| **steps** | orange | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
+| **fade** | yellow | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
+| **window** (frame) | green | index `FRAME_STOPS` {4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**) | knob position (CCW dim → CW bright) |
 
 - All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
   bottom of a range is still lit, never off): `stretchBrightness`,

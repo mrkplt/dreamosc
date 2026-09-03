@@ -48,10 +48,13 @@ using stmlib::RotationPhasor;
 // 1 s off at duration 1 s). Doubling gives every head's tail room to ring out
 // while its replacement starts.
 #define SS_MAX_VOICES (2 * SS_STEPS)
-// Per-voice scratch: old_ (SS_W) + ring_ (SS_RING). The caller allocates
-// SS_POOL_FLOATS floats and passes them to Sequencer::init(); at SS_W 4096 that
-// is 8 voices * 48 KB = 384 KB, which must live in SDRAM, not internal SRAM.
-#define SS_VOICE_FLOATS (SS_W + SS_RING)
+// Per-voice scratch: old_ (SS_W) + ring_ (SS_RING) + win_ (SS_W). win_ is this
+// voice's OWN snapshot of the analysis window curve, copied at start() so a live
+// frame-size change (setWindow rebuilding the shared gTab.window) can never
+// corrupt a sounding voice's render -- the fast-scroll volume-jump / white-noise
+// bug. The caller allocates SS_POOL_FLOATS floats and passes them to
+// Sequencer::init(); at SS_W 4096 that is SS_MAX_VOICES * 64 KB, in SDRAM.
+#define SS_VOICE_FLOATS (SS_W + SS_RING + SS_W)
 #define SS_POOL_FLOATS  (SS_MAX_VOICES * SS_VOICE_FLOATS)
 // Arm each head this many samples before its audible onset, giving the main loop
 // time to pre-roll + fill the FIFO off the audio callback. ~85 ms at 48 kHz —
@@ -180,9 +183,10 @@ class Voice {
   // memory. Objects placed in .sdram_bss get neither their constructor run nor
   // their storage zeroed (NOLOAD section, SDRAM unpowered at static init), so
   // only plain data may live there — see CLAUDE.md.
-  void setBuffers(float* old_buf, float* ring_buf) {
+  void setBuffers(float* old_buf, float* ring_buf, float* win_buf) {
     old_  = old_buf;
     ring_ = ring_buf;
+    win_  = win_buf;   // per-voice window snapshot (see SS_VOICE_FLOATS note)
   }
 
   void reset() {
@@ -217,6 +221,14 @@ class Voice {
     w_ = gTab.activeW;
     h_ = gTab.activeH;
     passes_ = gTab.activePasses;
+    // Snapshot the window CURVE and synthGain too, not just the size. renderFrame
+    // and emitHop must read THIS voice's frozen copy: a live setWindow() (frame-
+    // size control) rebuilds the shared gTab.window/synthGain for a new size, and
+    // if a sounding voice read them live it would multiply its w_-sample frame by
+    // a curve/gain built for a different size -- a volume jump + broadband noise
+    // on every fast frame-size scroll (measured on the bench).
+    memcpy(win_, gTab.window, w_ * sizeof(float));
+    synthGain_ = gTab.synthGain;
     out_ = 0;
     produced_ = 0;
     onsetDelay_ = onsetDelay;
@@ -338,7 +350,7 @@ class Voice {
     // on the NEXT voice fire (like duration/position).
     int32_t base = (int32_t)srcPos_;
     for (int i = 0; i < w_; i++)
-      gWork[i] = src_->at(base + i) * gTab.window[i];
+      gWork[i] = src_->at(base + i) * win_[i];   // this voice's frozen window
 
     gTab.fft.Direct(gWork, gSpec, passes_);    // runtime-length: passes = log2(w_)
 
@@ -385,7 +397,7 @@ class Voice {
       // corr = h - (1-h)*cos(2*pi*i/h_): 1/sqrt2 at the (single-frame) edges,
       // 1.0 at the (mixed) middle.
       float corr = h - (1.0f - h) * gTab.cosAtF(1024.0f * i / (float)h_);
-      ring_[(w + i) & (SS_RING - 1)] = mixed * corr * gTab.synthGain;
+      ring_[(w + i) & (SS_RING - 1)] = mixed * corr * synthGain_;   // frozen gain
     }
     // Release-store publishes the hop: all ring_ writes above are guaranteed
     // visible to the ISR before it can observe the advanced wr_.
@@ -408,6 +420,8 @@ class Voice {
   // spell out the element count when memset/memcpy-ing them.
   float* old_  = nullptr;   // previous frame's full IFFT waveform (PXS handoff)
   float* ring_ = nullptr;   // SS_RING-sample output FIFO
+  float* win_  = nullptr;   // this voice's snapshot of the analysis window curve
+  float  synthGain_ = 1.0f; // this voice's snapshot of the synthesis gain
   // Cross-thread state (main-loop producer / audio-ISR consumer). active_ is the
   // publication gate for a freshly start()ed voice; wr_/rr_ are the SPSC ring
   // indices. Release/acquire pairs make the data they guard visible in order.
@@ -482,7 +496,8 @@ class Sequencer {
     rng_ = seed;
     for (int i = 0; i < SS_MAX_VOICES; i++) {
       float* base = pool + (size_t)i * SS_VOICE_FLOATS;
-      voice_[i].setBuffers(/*old_=*/base, /*ring_=*/base + SS_W);
+      voice_[i].setBuffers(/*old_=*/base, /*ring_=*/base + SS_W,
+                           /*win_=*/base + SS_W + SS_RING);
       voice_[i].reset();
     }
     step_ = 0;

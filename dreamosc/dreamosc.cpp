@@ -128,8 +128,8 @@ static void fill_stub_source() {
 //   GLOBAL mode (led1 OFF):  knob1 -> duration (0.25..60s), knob2 -> global drift
 //   step mode  (led1 ROYGBIVW): knob1 -> that step's position, knob2 -> its drift
 //   encoder turn   -> the current page's parameter (stretch / fade / frame / steps)
-//   encoder click  -> cycle page: stretch(red)/fade(orange)/frame(yellow)/steps(green)
-//                     steps LED green intensity encodes the active step count
+//   encoder click  -> cycle page: stretch(red)/steps(orange)/fade(yellow)/window(green)
+//                     each page's led2 brightness encodes that page's level
 //   led2           -> encoder page color; brightness = crossfade active (fade>0)
 //
 // PICKUP (soft takeover) EVERYWHERE: landing on GLOBAL or a step does NOT snap
@@ -179,10 +179,12 @@ static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
 // Frame/window size stops (#136): powers of two up to SS_W (the compile-time
 // buffer max). Smaller = grainier/more articulated, larger = glassy/frozen.
 // Encoder page PAGE_FRAME indexes this; the value goes to seq.setFrame().
-static const int FRAME_STOPS[] = { 256, 512, 1024, 2048, 4096 };
+// LARGEST FIRST (idx 0 = SS_W, the default): a clockwise detent (inc +1) walks
+// toward SMALLER windows, so turning right shrinks the frame.
+static const int FRAME_STOPS[] = { 4096, 2048, 1024, 512, 256 };
 static const int FRAME_NSTOPS =
     (int)(sizeof(FRAME_STOPS) / sizeof(FRAME_STOPS[0]));
-static int frameIdx = FRAME_NSTOPS - 1;   // start at SS_W (4096), the default
+static int frameIdx = 0;   // start at SS_W (4096), the default (largest window)
 
 // Knob smoothing state (the smoothing math is smoothKnob() in controls_core.h).
 static float knobSmooth[2] = {0.0f, 0.0f};
@@ -196,7 +198,7 @@ static uint32_t lastDetentMs = 0;
 static void processControls() {
   pod.ProcessAllControls();
 
-  // --- encoder click: cycle page (stretch/fade/frame/steps) ---
+  // --- encoder click: cycle page (stretch/steps/fade/window) ---
   if (pod.encoder.RisingEdge()) encPage = nextPage(encPage);
 
   // --- button1: advance panel mode (GLOBAL -> step1..N -> GLOBAL) where N is
@@ -245,13 +247,13 @@ static void processControls() {
   if (panel.speed2() > dbgPk2) dbgPk2 = panel.speed2();
 #endif
 
-  // --- led2: encoder page color (RoYG over stretch/fade/frame/steps, same
+  // --- led2: encoder page color (RoYG over stretch/steps/fade/window, same
   // ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
   // encoded LEVEL, so a bright LED always means "this parameter is turned up":
   //   stretch -> red    = stretch detent index
-  //   fade    -> orange = crossfade amount (0..0.5)
-  //   frame   -> yellow = frame-size index
-  //   steps   -> green  = active step count
+  //   steps   -> orange = active step count
+  //   fade    -> yellow = crossfade amount (0..0.5)
+  //   frame   -> green  = frame-size (window) index
   float b2;
   switch (encPage) {
     case PAGE_STRETCH: b2 = stretchBrightness(stretchIdx, STRETCH_NSTOPS); break;

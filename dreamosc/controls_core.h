@@ -17,14 +17,16 @@
 
 #include "stretch_core.h"   // for SS_STEPS
 
-// Encoder pages (the parameter the encoder turn drives; click cycles):
-// stretch, fade, frame size (#136), step count (#149). Duration and drift live
-// on the knobs (global mode). LED2 shows the page as RoYG (see pageColor).
+// Encoder pages (the parameter the encoder turn drives; click cycles). Duration
+// and drift live on the knobs (global mode); these four are the encoder's.
+// Click order: stretch -> steps -> fade -> frame(window) -> stretch. The page
+// INDEX maps to the RoYG hue via hueROYGBIVW (0=red..3=green), so this order is
+// also the LED color order: stretch=red, steps=orange, fade=yellow, window=green.
 enum EncoderPage {
-  PAGE_STRETCH  = 0,   // blue
-  PAGE_FADE     = 1,   // green
-  PAGE_FRAME    = 2,   // yellow (frame/window size, #136)
-  PAGE_STEPS    = 3,   // cyan (active step count, #149)
+  PAGE_STRETCH  = 0,   // red
+  PAGE_STEPS    = 1,   // orange (active step count, #149)
+  PAGE_FADE     = 2,   // yellow
+  PAGE_FRAME    = 3,   // green  (frame/window size, #136)
   PAGE_COUNT    = 4,
 };
 
@@ -204,10 +206,13 @@ inline float fadeBrightness(float fade, float fadeMax = 0.5f, float floorB = 0.1
   return levelBrightness(fadeMax > 0.0f ? fade / fadeMax : 0.0f, floorB);
 }
 
-// PAGE_FRAME yellow intensity = frame-size index, idx in [0, count-1] (same
-// shape as stretch: the encoder indexes a small stops table).
+// PAGE_FRAME green intensity tracks the KNOB position, not window size: it
+// follows the detent INDEX so counterclockwise (lower idx) dims and clockwise
+// (higher idx) brightens -- the light moves the way the knob turns. The table is
+// largest-first (idx 0 = SS_W), so CW also shrinks the window; brightness rising
+// as the window shrinks is intentional (it tracks the knob, not the size).
 inline float frameBrightness(int idx, int count, float floorB = 0.15f) {
-  return stretchBrightness(idx, count, floorB);   // identical index->level mapping
+  return stretchBrightness(idx, count, floorB);   // idx 0 dim -> max idx bright
 }
 
 // LED1 color for the selected step, ROYGBIVW over the 8 steps, at a fixed

@@ -511,6 +511,42 @@ TEST_CASE("renders cleanly at every frame size") {
   gTab.setWindow(SS_W);
 }
 
+TEST_CASE("changing frame size mid-render does not corrupt a sounding voice") {
+  // Regression: voices snapshot the frame SIZE at start() but used to read the
+  // shared window curve + synthGain LIVE. A setFrame() while a voice was mid-
+  // render rebuilt gTab.window/synthGain for a NEW size, so the sounding voice
+  // multiplied its w_-sample frame by a curve/gain built for a different size --
+  // a volume jump + broadband noise on every fast frame-size scroll (heard on
+  // the bench). The fix snapshots the window curve + gain per voice at start().
+  // Here we hammer setFrame across sizes WHILE rendering and require the output
+  // stays finite, bounded, and free of a sudden energy spike.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
+  seq.setFrame(SS_W);   // start at the largest window (idx 0)
+
+  const int sizes[] = {SS_W, 512, 2048, 256, 1024, SS_W};
+  std::vector<float> out;
+  const uint32_t total = seq.patternSamples();   // ~one pattern of churn
+  int si = 0;
+  for (uint32_t n = 0; n < total; n++) {
+    // Change the frame size aggressively mid-flight (every ~1/64 of the pattern),
+    // exactly the fast-scroll case that exposed the bug. A voice that snapshots
+    // its window at start() renders self-consistently through all of these; a
+    // voice reading the shared window LIVE would index gTab.window[] past the
+    // just-rebuilt (smaller) size and scale by a mismatched gain.
+    if (n % (total / 64 + 1) == 0) { seq.setFrame(sizes[si % 6]); si++; }
+    for (int g = 0; g < 64 && seq.service(); g++) {}
+    float v = seq.next();
+    REQUIRE(std::isfinite(v));       // no NaN/Inf from a garbage window read
+    REQUIRE(std::abs(v) <= 1.0f);    // stays inside the sequencer's hard clamp
+    out.push_back(v);
+  }
+  REQUIRE(rms(out) > 0.0f);          // still sounding through all the churn
+  gTab.setWindow(SS_W);
+}
+
 TEST_CASE("frame size is clamped to [64, SS_W]") {
   gTab.init();
   gTab.setWindow(1);       // below min

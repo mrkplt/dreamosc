@@ -10,6 +10,7 @@
 
 #include "daisy_pod.h"
 #include "stretch_core.h"
+#include "controls_core.h"
 
 using namespace daisy;
 
@@ -117,19 +118,35 @@ static void fill_stub_source() {
 
 // --- controls ---------------------------------------------------------------
 // Panel (2026 Daisy Pod): 2 knobs, encoder (turn + click), 2 buttons, 2 RGB LEDs.
-//   knob1          -> duration   0.25 .. 60 s
-//   knob2          -> drift      0 .. 25 % (all steps share one value for now)
-//   encoder turn   -> stretch (page 0) or crossfade length (page 1)
-//   encoder click  -> toggle which parameter the encoder drives
-//   button2        -> (free — crossfade on/off removed; fade=0 IS butt-joint)
-//   led1           -> underrun indicator (latches red if a voice ring starves)
-//   led2           -> page indicator (blue = stretch page, green = fade page)
-//                     dim when crossfade OFF, bright when ON
+//   knob1          -> current step's POSITION (0..1)
+//   knob2          -> current step's DRIFT    (0..0.25)
+//   button1        -> advance the SELECTED STEP (0..7, wraps)
+//   encoder turn   -> the current page's global parameter
+//   encoder click  -> cycle the encoder page: stretch / fade / duration / drift
+//   button2        -> (free)
+//   led1           -> selected step, ROYGBIVW (steps 1..8)
+//   led2           -> encoder page color; brightness = crossfade active (fade>0)
+//
+// PER-STEP EDITING with PICKUP (soft takeover): the two knobs edit the CURRENTLY
+// SELECTED step's position/drift. Selecting a new step (button1) does NOT snap
+// the step to the pot position -- the step keeps its stored value UNTIL a knob
+// is physically moved, at which point that knob takes over. This lets you tour
+// the 8 steps and only change the ones you touch.
 //
 // Read from the MAIN LOOP, not the audio callback: debouncing and smoothing do
 // not belong in an interrupt, and the sequencer reads these values live anyway.
-enum EncoderPage { PAGE_STRETCH = 0, PAGE_FADE = 1 };
+// EncoderPage enum + LED color helpers live in controls_core.h (host-tested).
 static EncoderPage encPage = PAGE_STRETCH;
+
+// Global drift: a fun all-steps shimmer, added on top of each step's own
+// per-step drift (knob2). Effective drift per step = perStep + global, clamped.
+// (How these two should ultimately combine is still open; additive is the
+// simplest sensible first cut.)
+static float globalDrift = 0.0f;
+
+// Per-step edit state (pickup latches, step select, drift shadow) lives in the
+// platform-free StepEditor so it is host-testable — see controls_core.h.
+static StepEditor stepEd;
 
 // Stretch is a fixed, musically-spaced DETENT TABLE rather than a continuous
 // range: PaulStretch factors are not perceptually linear, so what matters is the
@@ -154,86 +171,76 @@ static const int STRETCH_NSTOPS =
     (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 56
 static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
 
-// Knob smoothing: a one-pole on the raw ADC read, so a noisy pot does not
-// dither the parameter. ~pot-speed, same idea as the original .ino.
+// Knob smoothing state (the smoothing math is smoothKnob() in controls_core.h).
 static float knobSmooth[2] = {0.0f, 0.0f};
 static bool  knobPrimed    = false;
 
-static float readKnob(int idx, float raw) {
-  if (!knobPrimed) return raw;            // jump to the real value on first read
-  knobSmooth[idx] += 0.02f * (raw - knobSmooth[idx]);
-  return knobSmooth[idx];
-}
+// Milliseconds since the last encoder detent on the current page, for the
+// shared fast/slow speed detection (encoderFast). Reset when the page changes
+// so a page switch doesn't read as a fast spin.
+static uint32_t lastDetentMs = 0;
 
 static void processControls() {
   pod.ProcessAllControls();
 
-  // --- encoder click: flip page ---
-  if (pod.encoder.RisingEdge())
-    encPage = (encPage == PAGE_STRETCH) ? PAGE_FADE : PAGE_STRETCH;
+  // --- encoder click: cycle page (stretch -> fade -> duration -> drift) ---
+  if (pod.encoder.RisingEdge()) encPage = nextPage(encPage);
 
+  // --- button1: advance the selected step (arm knob pickup for the new step) ---
+  if (pod.button1.RisingEdge()) stepEd.advanceStep();
 
   // --- encoder turn: drives the current page's parameter ---
+  // Speed comes from the GAP between detents (Increment is only +-1); the pure
+  // stepping math is in controls_core.h so it is host-tested. Fast = coarse
+  // step, slow = fine, per the values below (chosen so a page's full range is
+  // ~1-2 turns fast / fine when clicked deliberately).
   int32_t inc = pod.encoder.Increment();
   if (inc != 0) {
-    if (encPage == PAGE_STRETCH) {
-      // Move an INDEX into STRETCH_STOPS. Two regimes by turn speed (from the
-      // detent GAP -- Encoder::Increment() only ever returns +-1, so speed
-      // can't come from step magnitude): SLOW click = 1 stop (land an exact
-      // value); FAST spin (<=40 ms since last detent) = several stops per
-      // detent so a quick full turn (~24 detents) crosses all 41 stops --
-      // "one turn to 1000x". STEPS_PER_FAST_DETENT ~= NSTOPS / 24.
-      static uint32_t lastDetentMs = 0;
-      uint32_t tnow = System::GetNow();
-      uint32_t gap  = tnow - lastDetentMs;
-      lastDetentMs  = tnow;
-      int step = (gap <= 40) ? 3 : 1;         // fast: 3 stops/detent, slow: 1
-                                              // (56 stops / ~24 detents = one
-                                              // full turn spans the range)
-      stretchIdx += inc * step;
-      if (stretchIdx < 0)                 stretchIdx = 0;
-      if (stretchIdx > STRETCH_NSTOPS - 1) stretchIdx = STRETCH_NSTOPS - 1;
-      seq.stretch = STRETCH_STOPS[stretchIdx];
-    } else {
-      // Crossfade length, 0..0.5 overlap fraction. Same speed model as stretch,
-      // but the range is small and additive so both regimes are LINEAR, just
-      // coarser when spinning: slow detent = 0.5% (fine, ~100 clicks end to end
-      // is deliberate), fast spin (<=40 ms gap) = 4% (whole range in ~2 turns).
-      // (Encoder::Increment() is only +-1, so speed is the detent gap, not |inc|.)
-      static uint32_t lastFadeMs = 0;
-      uint32_t tnow = System::GetNow();
-      uint32_t gap  = tnow - lastFadeMs;
-      lastFadeMs    = tnow;
-      float stepv = (gap <= 40) ? 0.04f : 0.005f;
-      seq.fade += stepv * (float)inc;
-      if (seq.fade < 0.0f) seq.fade = 0.0f;
-      if (seq.fade > 0.5f) seq.fade = 0.5f;
+    uint32_t tnow = System::GetNow();
+    bool fast = encoderFast(tnow - lastDetentMs);
+    lastDetentMs = tnow;
+    switch (encPage) {
+      case PAGE_DURATION:
+        seq.duration = stepRatio(seq.duration, inc, fast ? 1.08f : 1.015f,
+                                 0.25f, 60.0f);
+        break;
+      case PAGE_DRIFT:   // global drift, additive
+        globalDrift = stepAdditive(globalDrift, inc, fast ? 0.02f : 0.0025f,
+                                   0.0f, 0.25f);
+        break;
+      case PAGE_STRETCH: // index into the detent table; 3 stops/detent fast
+        stretchIdx = stepIndex(stretchIdx, inc, fast ? 3 : 1, STRETCH_NSTOPS);
+        seq.stretch = STRETCH_STOPS[stretchIdx];
+        break;
+      case PAGE_FADE:    // crossfade length, additive
+        seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
+        break;
+      default: break;
     }
   }
 
-  // --- knobs ---
-  float k1 = readKnob(0, pod.knob1.Value());
-  float k2 = readKnob(1, pod.knob2.Value());
+  // --- knobs: edit the SELECTED step's position (k1) and per-step drift (k2),
+  // with PICKUP. A knob takes over its parameter for the current step only once
+  // it has physically MOVED since the step was selected; until then the step
+  // holds its stored value. The move test is a small threshold on the raw read
+  // so pot noise doesn't trip it.
+  float k1 = smoothKnob(knobSmooth[0], pod.knob1.Value(), knobPrimed);
+  float k2 = smoothKnob(knobSmooth[1], pod.knob2.Value(), knobPrimed);
   knobPrimed = true;
-  seq.duration = 0.25f + 59.75f * k1;         // 0.25 .. 60 s
-  float d = 0.25f * k2;                        // 0 .. 25 % of the stretch
-  for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = d;
+  // StepEditor applies pickup, writes the selected step's position/drift, and
+  // folds per-step + global drift into seq.drift[] for every step. All the
+  // decision logic is here and host-tested (controls_core.h).
+  stepEd.update(seq, k1, k2, globalDrift);
 
-  // --- led2: page (hue) + crossfade active (brightness) ---
-  // Brightness now tracks fade > 0 (crossfading) vs fade == 0 (butt-joint) --
-  // the same at-a-glance signal the removed xfade toggle gave, derived from the
-  // one remaining control.
-  float b = (seq.fade > 0.0f) ? 0.6f : 0.12f;                 // bright = crossfade
-  if (encPage == PAGE_STRETCH) pod.led2.Set(0.0f, 0.0f, b);   // blue = stretch
-  else                         pod.led2.Set(0.0f, b, 0.0f);   // green = fade
+  // --- led2: encoder page color; brightness = crossfade active (fade > 0) ---
+  // (pageColor/stepColor are host-tested pure lookups in controls_core.h.)
+  Rgb c2 = pageColor(encPage, (seq.fade > 0.0f) ? 0.6f : 0.15f);
+  pod.led2.Set(c2.r, c2.g, c2.b);
 
-  // --- led1: underrun indicator. Latches red if a voice ring ever starves, so
-  // a dropout is visible rather than something to guess at. Kept from #129.
-  static uint32_t last_underruns = 0;
-  if (gUnderruns != last_underruns) {
-    last_underruns = gUnderruns;
-    pod.led1.Set(0.5f, 0.0f, 0.0f);   // red = underrun happened
-  }
+  // --- led1: selected step, ROYGBIVW (steps 1..8) ---
+  Rgb c1 = stepColor(stepEd.selected());
+  pod.led1.Set(c1.r, c1.g, c1.b);
+
   pod.UpdateLeds();
 }
 
@@ -330,17 +337,20 @@ int main(void) {
       profLastPrint = now;
       uint32_t isr = profIsrUs;
       profIsrUs = 0;
-      // SETTINGS line: the full instrument state. Floats are unreliable through
-      // the nano-newlib printf, so values print as integers (milli- or scaled
-      // suffixes): stretch_c = stretch*100, dur_ms, drift_m = drift*1000,
-      // fade_m = fade*1000 (0 = butt-joint), page = encoder page.
+      // SETTINGS line: full state, integers (nano-newlib printf can't do floats
+      // reliably). Globals: stretch*100, dur_ms, gdrift_m=globalDrift*1000,
+      // fade_m=fade*1000, page. Selected step: sel (0..7), its pos*1000 and
+      // per-step drift*1000.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d drift_m=%d fade_m=%d page=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d page=%d sel=%d pos_m=%d sdrift_m=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
-          (int)(seq.drift[0] * 1000.0f + 0.5f),
+          (int)(globalDrift * 1000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
-          (int)encPage);
+          (int)encPage,
+          stepEd.selected(),
+          (int)(seq.position[stepEd.selected()] * 1000.0f + 0.5f),
+          (int)(stepEd.perStepDrift(stepEd.selected()) * 1000.0f + 0.5f));
       // HEALTH line: CPU and dropout accounting for this second.
       pod.seed.PrintLine(
           "HLTH act=%d units=%u svc_us=%u avg_us=%u isr_us=%u du=%u",

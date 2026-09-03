@@ -14,6 +14,7 @@ echo
 echo "== Catch2 unit tests (DSP core + vendored FFT) =="
 c++ -std=c++17 -O1 -I"$TEST_DIR/.." -I"$TEST_DIR" \
     "$TEST_DIR/test_stretch_core.cpp" "$TEST_DIR/test_shy_fft.cpp" \
+    "$TEST_DIR/test_controls_core.cpp" \
     -o "$TEST_DIR/unit_tests"
 "$TEST_DIR/unit_tests"
 

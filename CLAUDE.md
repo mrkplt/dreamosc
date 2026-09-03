@@ -115,11 +115,21 @@ c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
 ./stretchcore in.wav out.wav --stretch 50 --duration 4 --spread 1
 ```
 
-**Testing culture: the DSP core is platform-free so it can be tested on the host —
-run `dreamosc/test/run.sh` and keep it green. A change to `stretch_core.h` /
-`shy_fft.h` is not done until the suite passes. Add a test with new behavior; set
-tolerances from measurement with a written reason, never loosen one to hide a
-regression.** Details in `dreamosc/test/README.md`.
+**Testing culture: push high coverage, test all the time.** The bar is that as
+little as sensibly possible is left untested. The mechanism is architectural:
+**pure decision logic lives in platform-free `*_core.h` headers so it compiles
+and is tested on the host; `dreamosc.cpp` holds ONLY hardware glue** (ADC reads,
+`led.Set`, `PrintLine`, `RisingEdge`, `System::GetNow`) — the thin, untestable
+edge. When you write logic in `dreamosc.cpp` that has behavior worth checking
+(a mapping, a clamp, a state machine, a stepping rule), EXTRACT it to a core
+header and test it rather than leaving it in the firmware. This is not optional
+polish — a real bug (a drift double-add) shipped precisely because it lived in
+the un-host-compilable `dreamosc.cpp`; extracting it (`controls_core.h`) is what
+made it testable. Cores today: `stretch_core.h` (DSP), `controls_core.h`
+(control-surface logic). Run `dreamosc/test/run.sh` and keep it green; a change
+to any core is not done until the suite passes. Add a test with new behavior;
+set tolerances from measurement with a written reason, never loosen one to hide
+a regression. Details in `dreamosc/test/README.md`.
 
 ### Vendored dependencies
 

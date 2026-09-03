@@ -53,6 +53,48 @@ inline float clampf(float v, float lo, float hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// --- Speed-adaptive pot quantization ----------------------------------------
+// A knob's raw ADC read is effectively continuous (12-bit + noise), so you
+// can't reliably land on a clean value. These map a raw pot to a value with
+// SPEED-ADAPTIVE resolution, the same fast/slow philosophy as the encoder: a
+// FAST move (large per-poll raw delta) snaps to a COARSE grid so you land on
+// round landmarks; a SLOW move uses a FINE grid (or continuous) for exact
+// placement. `speed` is the caller's measured per-poll |Δraw| (raw is 0..1).
+//
+// Speed threshold: per-poll raw delta above which a move counts as FAST. At the
+// 1 kHz control poll a deliberate spin moves the pot several % per poll; a slow
+// dial creeps <1%. 0.01 (1% of full travel per poll) separates them well.
+inline bool potFast(float speed, float thresh = 0.01f) { return speed > thresh; }
+
+// Snap `value` to a grid of `grid` size (grid<=0 = continuous, pass-through),
+// clamped to [lo, hi].
+inline float snapTo(float value, float grid, float lo, float hi) {
+  float v = value;
+  if (grid > 0.0f) v = (float)((int)(value / grid + 0.5f)) * grid;
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// One knob's behavior, reusable across all pots so FEEL stays consistent as we
+// add knobs -- the only per-knob differences are the RANGE and the two GRIDS.
+// Maps a normalized 0..1 pot read to a parameter value in [lo, hi] with
+// SPEED-ADAPTIVE resolution: a FAST move snaps to `fastGrid` (coarse landmarks),
+// a SLOW move to `slowGrid` (fine placement; 0 = continuous). Grids are in the
+// OUTPUT units, so e.g. position lo=0 hi=1 fastGrid=0.05 (5%) slowGrid=0 (cont),
+// or drift lo=0 hi=0.25 fastGrid=0.25/30 slowGrid=0.001 (0.1%).
+struct KnobSpec {
+  float lo, hi;         // parameter range
+  float fastGrid;       // coarse grid, used on a fast move
+  float slowGrid;       // fine grid (0 = continuous), used on a slow move
+};
+
+// Apply a KnobSpec: scale the 0..1 read to [lo,hi], pick the grid by speed,
+// snap. `speed` is |Δraw| this poll (raw in 0..1).
+inline float applyKnob(const KnobSpec& k, float read01, float speed) {
+  float v = k.lo + (k.hi - k.lo) * read01;
+  float grid = potFast(speed) ? k.fastGrid : k.slowGrid;
+  return snapTo(v, grid, k.lo, k.hi);
+}
+
 // Additive step (fade, global drift): value +/- perDetent*inc, clamped.
 inline float stepAdditive(float value, int inc, float perDetent,
                           float lo, float hi) {
@@ -140,7 +182,11 @@ class PanelEditor {
  public:
   // Prime with the initial RAW knob reads so a stationary pot at boot isn't a
   // move.
-  void prime(float r1, float r2) { k1Anchor_ = r1; k2Anchor_ = r2; primed_ = true; }
+  void prime(float r1, float r2) {
+    k1Anchor_ = r1; k2Anchor_ = r2;
+    r1Prev_ = r1; r2Prev_ = r2;   // so the first pass reads speed 0, not a jump
+    primed_ = true;
+  }
   bool primed() const { return primed_; }
 
   int  slot() const { return slot_; }        // 0 = global, 1..SS_STEPS = step
@@ -186,13 +232,29 @@ class PanelEditor {
     if (!k1Live_[slot_] && fabsf(r1 - k1Anchor_) > moveThresh) k1Live_[slot_] = true;
     if (!k2Live_[slot_] && fabsf(r2 - k2Anchor_) > moveThresh) k2Live_[slot_] = true;
 
+    // Per-poll knob SPEED (|Δraw| since last update). All four knob targets use
+    // the SAME speed-adaptive behavior (applyKnob) so feel is consistent; only
+    // the KnobSpec (range + fast/slow grids) differs per target.
+    float spd1 = fabsf(r1 - r1Prev_);
+    float spd2 = fabsf(r2 - r2Prev_);
+    r1Prev_ = r1;
+    r2Prev_ = r2;
+
+    // Per-knob specs. Position: fast = 5% (20 detents), slow = continuous.
+    // Drift: fast = driftMax/30, slow = 0.1%. Duration: continuous both (a
+    // smooth sweep; grid TBD). Global drift: same as per-step drift.
+    const KnobSpec POSITION { 0.0f, 1.0f, 0.05f, 0.0f };
+    const KnobSpec DRIFT    { 0.0f, driftMax, driftMax / 30.0f, 0.001f };
+    const KnobSpec DURATION { durMin, durMax, 0.0f, 0.0f };
+    const KnobSpec GDRIFT   { 0.0f, gdriftMax, gdriftMax / 30.0f, 0.001f };
+
     if (slot_ == PE_GLOBAL) {
-      if (k1Live_[slot_]) *dur    = durMin + (durMax - durMin) * k1;   // duration
-      if (k2Live_[slot_]) *gdrift = gdriftMax * k2;                    // global drift
+      if (k1Live_[slot_]) *dur    = applyKnob(DURATION, k1, spd1);
+      if (k2Live_[slot_]) *gdrift = applyKnob(GDRIFT,   k2, spd2);
     } else {
       int s = slot_ - 1;
-      if (k1Live_[slot_]) seq.position[s]  = k1;                       // position
-      if (k2Live_[slot_]) perStepDrift_[s] = driftMax * k2;            // per-step drift
+      if (k1Live_[slot_]) seq.position[s]  = applyKnob(POSITION, k1, spd1);
+      if (k2Live_[slot_]) perStepDrift_[s] = applyKnob(DRIFT,    k2, spd2);
     }
 
     for (int i = 0; i < SS_STEPS; i++)
@@ -212,6 +274,7 @@ class PanelEditor {
   bool  k2Live_[PE_NSLOTS] = {false};
   float perStepDrift_[SS_STEPS] = {0};
   float k1Anchor_ = 0.0f, k2Anchor_ = 0.0f;   // frozen move reference (per entry)
+  float r1Prev_ = 0.0f, r2Prev_ = 0.0f;       // last raw reads (per-poll speed)
   bool  anchorPending_ = false;
   bool  primed_ = false;
 };

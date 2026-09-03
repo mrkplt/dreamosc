@@ -286,3 +286,46 @@ TEST_CASE("stepColor: 8 distinct colors, index clamped") {
   REQUIRE(lo.r == Approx(first.r)); REQUIRE(lo.g == Approx(first.g)); REQUIRE(lo.b == Approx(first.b));
   REQUIRE(hi.r == Approx(last.r));  REQUIRE(hi.g == Approx(last.g));  REQUIRE(hi.b == Approx(last.b));
 }
+
+// --- speed-adaptive knob quantization ---------------------------------------
+
+TEST_CASE("potFast: per-poll raw delta above threshold is fast") {
+  REQUIRE(potFast(0.05f));            // a quick spin
+  REQUIRE_FALSE(potFast(0.005f));     // a slow dial
+  REQUIRE(potFast(0.011f));           // just over the 0.01 default
+  REQUIRE_FALSE(potFast(0.01f));      // exactly at threshold is NOT fast
+}
+
+TEST_CASE("snapTo: grid rounding, clamp; grid 0 = continuous") {
+  REQUIRE(snapTo(0.42f, 0.05f, 0.0f, 1.0f) == Approx(0.40f));   // nearest 0.05
+  REQUIRE(snapTo(0.43f, 0.05f, 0.0f, 1.0f) == Approx(0.45f));
+  REQUIRE(snapTo(0.42f, 0.0f,  0.0f, 1.0f) == Approx(0.42f));   // continuous
+  REQUIRE(snapTo(1.20f, 0.05f, 0.0f, 1.0f) == Approx(1.00f));   // clamp hi
+  REQUIRE(snapTo(-0.1f, 0.05f, 0.0f, 1.0f) == Approx(0.00f));   // clamp lo
+}
+
+TEST_CASE("applyKnob: fast move snaps to coarse grid, slow to fine") {
+  // Position: fast = 5% grid, slow = continuous.
+  KnobSpec pos{0.0f, 1.0f, 0.05f, 0.0f};
+  // 0.423 moved FAST -> nearest 5% = 0.40; 0.437 -> 0.45.
+  REQUIRE(applyKnob(pos, 0.423f, /*speed=*/0.05f) == Approx(0.40f));
+  REQUIRE(applyKnob(pos, 0.437f, /*speed=*/0.05f) == Approx(0.45f));
+  // Same read moved SLOW -> continuous, lands exactly.
+  REQUIRE(applyKnob(pos, 0.423f, /*speed=*/0.002f) == Approx(0.423f));
+
+  // Drift: range 0..0.25, fast = 0.25/30 grid, slow = 0.001 (0.1%).
+  KnobSpec drift{0.0f, 0.25f, 0.25f / 30.0f, 0.001f};
+  float fastD = applyKnob(drift, 0.5f, /*speed=*/0.05f);   // 0.5*0.25=0.125
+  // 0.125 / (0.25/30) = 15.0 -> exact detent
+  REQUIRE(fastD == Approx(0.125f));
+  float slowD = applyKnob(drift, 0.5137f, /*speed=*/0.001f);  // 0.128425 -> 0.1%
+  REQUIRE(slowD == Approx(0.128f));   // snapped to 0.001 grid
+}
+
+TEST_CASE("applyKnob: one behavior, ranges differ per spec") {
+  // Same call shape scales into different ranges -- the point of one knob object.
+  KnobSpec dur{0.25f, 60.0f, 0.0f, 0.0f};   // continuous
+  REQUIRE(applyKnob(dur, 0.0f, 0.0f) == Approx(0.25f));
+  REQUIRE(applyKnob(dur, 1.0f, 0.0f) == Approx(60.0f));
+  REQUIRE(applyKnob(dur, 0.5f, 0.0f) == Approx(0.25f + (60.0f - 0.25f) * 0.5f));
+}

@@ -17,14 +17,12 @@
 
 #include "stretch_core.h"   // for SS_STEPS
 
-// Encoder pages (the parameter the encoder turn drives; click cycles). Kept in
-// the core so the LED-color mapping below can be tested against it.
+// Encoder pages (the parameter the encoder turn drives; click cycles). Just
+// stretch and fade -- duration and drift moved to the knobs (global mode).
 enum EncoderPage {
   PAGE_STRETCH  = 0,   // blue
   PAGE_FADE     = 1,   // green
-  PAGE_DURATION = 2,   // yellow
-  PAGE_DRIFT    = 3,   // purple (GLOBAL drift, added on top of per-step)
-  PAGE_COUNT    = 4,
+  PAGE_COUNT    = 2,
 };
 
 struct Rgb { float r, g, b; };
@@ -96,8 +94,6 @@ inline Rgb pageColor(EncoderPage page, float b) {
   switch (page) {
     case PAGE_STRETCH:  return {0.0f, 0.0f, b};        // blue
     case PAGE_FADE:     return {0.0f, b,    0.0f};      // green
-    case PAGE_DURATION: return {b,    b,    0.0f};      // yellow
-    case PAGE_DRIFT:    return {b * 0.6f, 0.0f, b};     // purple
     default:            return {0.0f, 0.0f, 0.0f};
   }
 }
@@ -120,64 +116,101 @@ inline Rgb stepColor(int i) {
   return table[i];
 }
 
-// Per-step knob editing with PICKUP. Two knobs edit the SELECTED step's
-// position and (per-step) drift. Selecting a new step does NOT snap it to the
-// pot position; a knob takes over its parameter for the current step only once
-// it has physically MOVED (> moveThresh raw) since selection. Until then the
-// step holds its stored value. This lets you tour the 8 steps and change only
-// the ones you touch.
+// Two-knob panel editor with a mode + PICKUP everywhere.
 //
-// The caller owns the Sequencer (position[]/drift[]); this class owns the edit
-// STATE (which step, the pickup latches, the per-step drift shadow, last knob
-// reads). It never touches hardware -- the caller passes raw knob values in and
-// reads results out.
-class StepEditor {
+// MODES, cycled by button1: GLOBAL (slot 0) then steps 1..SS_STEPS, then back to
+// GLOBAL (a SS_STEPS+1 loop). button2 jumps straight to GLOBAL.
+//   - GLOBAL: knob1 = global duration, knob2 = global drift.
+//   - step i: knob1 = that step's position, knob2 = that step's per-step drift.
+//
+// PICKUP everywhere: landing on any slot (global or a step) does NOT snap its
+// value to the pot. A knob takes over its parameter for the CURRENT slot only
+// after it has physically MOVED (> moveThresh) since arriving. Each of the
+// SS_STEPS+1 slots has its own k1/k2 latch, so touring never disturbs untouched
+// values. Effective drift per step = per-step + global, clamped.
+//
+// The caller owns the Sequencer and the global duration/drift floats; this class
+// owns the mode/pickup/shadow state and never touches hardware.
+constexpr int PE_GLOBAL = 0;                 // slot 0 = global page
+constexpr int PE_NSLOTS = SS_STEPS + 1;      // global + 8 steps
+
+class PanelEditor {
  public:
-  // Call once before the first update(), with the initial raw knob reads, so a
-  // stationary knob at boot doesn't count as a move.
-  void prime(float k1, float k2) {
-    k1Last_ = k1;
-    k2Last_ = k2;
-    primed_ = true;
-  }
-
+  // Prime with the initial RAW knob reads so a stationary pot at boot isn't a
+  // move.
+  void prime(float r1, float r2) { k1Anchor_ = r1; k2Anchor_ = r2; primed_ = true; }
   bool primed() const { return primed_; }
-  int  selected() const { return sel_; }
+
+  int  slot() const { return slot_; }        // 0 = global, 1..SS_STEPS = step
+  bool inGlobal() const { return slot_ == PE_GLOBAL; }
+  int  step() const { return slot_ - 1; }    // valid only when !inGlobal()
   float perStepDrift(int i) const { return perStepDrift_[i]; }
+  // Diagnostic: has each knob's pickup engaged on the CURRENT slot?
+  bool k1Live() const { return k1Live_[slot_]; }
+  bool k2Live() const { return k2Live_[slot_]; }
+  float anchor1() const { return k1Anchor_; }
+  float anchor2() const { return k2Anchor_; }
 
-  // Advance to the next step (wraps), and RE-ARM pickup for it: its knobs won't
-  // take over until moved again.
-  void advanceStep() {
-    sel_ = (sel_ + 1) % SS_STEPS;
-    k1Live_[sel_] = false;
-    k2Live_[sel_] = false;
-  }
+  // button1: GLOBAL -> step1 -> ... -> step8 -> GLOBAL. Re-arms pickup for the
+  // slot we land on.
+  void advance() { goTo((slot_ + 1) % PE_NSLOTS); }
+  // button2: shortcut back to GLOBAL (re-arms its pickup).
+  void toGlobal() { goTo(PE_GLOBAL); }
 
-  // One control pass. Raw knob values k1/k2 in [0,1]; on the selected step, once
-  // a knob has moved past moveThresh it drives that parameter. Writes the
-  // selected step's position (0..1) and the per-step drift shadow (0..driftMax),
-  // then folds per-step + global into seq.drift[] for EVERY step.
-  void update(Sequencer& seq, float k1, float k2, float globalDrift,
-              float moveThresh = 0.02f, float driftMax = 0.25f) {
-    if (!primed_) prime(k1, k2);
+  // One control pass. Movement is detected on the RAW knob (r1/r2) -- the
+  // physical pot position -- while the VALUE written uses the smoothed knob
+  // (k1/k2). Detecting on the smoothed value is wrong: a one-pole caps the
+  // per-pass delta below any sane threshold (turning a pot to the far end moves
+  // the smoothed read only ~2% that pass), so pickup would never engage. The
+  // pickup latch tracks the pot; the smoothing only de-zippers the output.
+  // In GLOBAL, knobs drive *dur and *gdrift; in a step, position + per-step
+  // drift. Always folds per-step + global into seq.drift[].
+  void update(Sequencer& seq, float* dur, float* gdrift,
+              float r1, float r2, float k1, float k2,
+              float moveThresh = 0.02f, float driftMax = 0.25f,
+              float durMin = 0.25f, float durMax = 60.0f, float gdriftMax = 0.25f) {
+    if (!primed_) { prime(r1, r2); }
 
-    if (!k1Live_[sel_] && fabsf(k1 - k1Last_) > moveThresh) k1Live_[sel_] = true;
-    if (!k2Live_[sel_] && fabsf(k2 - k2Last_) > moveThresh) k2Live_[sel_] = true;
-    if (k1Live_[sel_]) seq.position[sel_]  = k1;
-    if (k2Live_[sel_]) perStepDrift_[sel_] = driftMax * k2;
-    k1Last_ = k1;
-    k2Last_ = k2;
+    // Anchor pending from a slot change (goTo can't see the raw reads): capture
+    // the pot position on arrival as this slot's move reference.
+    if (anchorPending_) { k1Anchor_ = r1; k2Anchor_ = r2; anchorPending_ = false; }
+
+    // Pickup: measure movement from the ANCHOR (pot position at entry), which is
+    // FROZEN until the knob engages -- so a SLOW sweep accumulates and eventually
+    // crosses the threshold. (Comparing against the previous poll let the
+    // reference chase the pot, so a slow turn never accumulated a crossing delta
+    // and pickup never engaged -- the "control feels dead" bug.) After engaging,
+    // the anchor is irrelevant; the knob drives the value directly.
+    if (!k1Live_[slot_] && fabsf(r1 - k1Anchor_) > moveThresh) k1Live_[slot_] = true;
+    if (!k2Live_[slot_] && fabsf(r2 - k2Anchor_) > moveThresh) k2Live_[slot_] = true;
+
+    if (slot_ == PE_GLOBAL) {
+      if (k1Live_[slot_]) *dur    = durMin + (durMax - durMin) * k1;   // duration
+      if (k2Live_[slot_]) *gdrift = gdriftMax * k2;                    // global drift
+    } else {
+      int s = slot_ - 1;
+      if (k1Live_[slot_]) seq.position[s]  = k1;                       // position
+      if (k2Live_[slot_]) perStepDrift_[s] = driftMax * k2;            // per-step drift
+    }
 
     for (int i = 0; i < SS_STEPS; i++)
-      seq.drift[i] = foldDrift(perStepDrift_[i], globalDrift);
+      seq.drift[i] = foldDrift(perStepDrift_[i], *gdrift);
   }
 
  private:
-  int   sel_ = 0;
-  bool  k1Live_[SS_STEPS] = {false};
-  bool  k2Live_[SS_STEPS] = {false};
+  void goTo(int slot) {
+    slot_ = slot;
+    k1Live_[slot_] = false;   // re-arm pickup on arrival
+    k2Live_[slot_] = false;
+    anchorPending_ = true;    // next update() captures the anchor from raw reads
+  }
+
+  int   slot_ = PE_GLOBAL;
+  bool  k1Live_[PE_NSLOTS] = {false};
+  bool  k2Live_[PE_NSLOTS] = {false};
   float perStepDrift_[SS_STEPS] = {0};
-  float k1Last_ = 0.0f, k2Last_ = 0.0f;
+  float k1Anchor_ = 0.0f, k2Anchor_ = 0.0f;   // frozen move reference (per entry)
+  bool  anchorPending_ = false;
   bool  primed_ = false;
 };
 

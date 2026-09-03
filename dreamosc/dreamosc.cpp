@@ -32,6 +32,8 @@ volatile uint32_t gUnderruns = 0;
 // callback that second), du (underruns that second), fade_m (fade*1000),
 // xf (crossfade on/off), page (0 stretch / 1 fade).
 static volatile uint32_t profIsrUs = 0;
+// Last knob reads (raw + smoothed) for the KNOB diagnostic line.
+static float dbgR1 = 0, dbgR2 = 0, dbgK1 = 0, dbgK2 = 0;
 #endif
 
 // --- storage ---------------------------------------------------------------
@@ -118,20 +120,17 @@ static void fill_stub_source() {
 
 // --- controls ---------------------------------------------------------------
 // Panel (2026 Daisy Pod): 2 knobs, encoder (turn + click), 2 buttons, 2 RGB LEDs.
-//   knob1          -> current step's POSITION (0..1)
-//   knob2          -> current step's DRIFT    (0..0.25)
-//   button1        -> advance the SELECTED STEP (0..7, wraps)
-//   encoder turn   -> the current page's global parameter
-//   encoder click  -> cycle the encoder page: stretch / fade / duration / drift
-//   button2        -> (free)
-//   led1           -> selected step, ROYGBIVW (steps 1..8)
+// Two KNOB MODES (button1 cycles GLOBAL -> step1..8 -> GLOBAL; button2 = GLOBAL):
+//   GLOBAL mode (led1 OFF):  knob1 -> duration (0.25..60s), knob2 -> global drift
+//   step mode  (led1 ROYGBIVW): knob1 -> that step's position, knob2 -> its drift
+//   encoder turn   -> stretch (page 0) or crossfade length (page 1)
+//   encoder click  -> toggle encoder page (stretch <-> fade)
 //   led2           -> encoder page color; brightness = crossfade active (fade>0)
 //
-// PER-STEP EDITING with PICKUP (soft takeover): the two knobs edit the CURRENTLY
-// SELECTED step's position/drift. Selecting a new step (button1) does NOT snap
-// the step to the pot position -- the step keeps its stored value UNTIL a knob
-// is physically moved, at which point that knob takes over. This lets you tour
-// the 8 steps and only change the ones you touch.
+// PICKUP (soft takeover) EVERYWHERE: landing on GLOBAL or a step does NOT snap
+// its value to the pot -- a knob takes over only after it physically moves since
+// arriving. So you can tour steps (and hop to global) without disturbing values
+// you don't touch. All the mode/pickup logic is the host-tested PanelEditor.
 //
 // Read from the MAIN LOOP, not the audio callback: debouncing and smoothing do
 // not belong in an interrupt, and the sequencer reads these values live anyway.
@@ -144,9 +143,10 @@ static EncoderPage encPage = PAGE_STRETCH;
 // simplest sensible first cut.)
 static float globalDrift = 0.0f;
 
-// Per-step edit state (pickup latches, step select, drift shadow) lives in the
-// platform-free StepEditor so it is host-testable — see controls_core.h.
-static StepEditor stepEd;
+// Panel edit state (mode/pickup/shadow) lives in the platform-free PanelEditor
+// so it is host-testable — see controls_core.h. GLOBAL mode: knobs = duration
+// + global drift. Step mode: knobs = that step's position + per-step drift.
+static PanelEditor panel;
 
 // Stretch is a fixed, musically-spaced DETENT TABLE rather than a continuous
 // range: PaulStretch factors are not perceptually linear, so what matters is the
@@ -183,63 +183,54 @@ static uint32_t lastDetentMs = 0;
 static void processControls() {
   pod.ProcessAllControls();
 
-  // --- encoder click: cycle page (stretch -> fade -> duration -> drift) ---
+  // --- encoder click: cycle page (stretch <-> fade) ---
   if (pod.encoder.RisingEdge()) encPage = nextPage(encPage);
 
-  // --- button1: advance the selected step (arm knob pickup for the new step) ---
-  if (pod.button1.RisingEdge()) stepEd.advanceStep();
+  // --- button1: advance panel mode (GLOBAL -> step1..8 -> GLOBAL) ---
+  if (pod.button1.RisingEdge()) panel.advance();
+  // --- button2: jump back to GLOBAL ---
+  if (pod.button2.RisingEdge()) panel.toGlobal();
 
-  // --- encoder turn: drives the current page's parameter ---
-  // Speed comes from the GAP between detents (Increment is only +-1); the pure
-  // stepping math is in controls_core.h so it is host-tested. Fast = coarse
-  // step, slow = fine, per the values below (chosen so a page's full range is
-  // ~1-2 turns fast / fine when clicked deliberately).
+  // --- encoder turn: stretch (index into detent table) or fade (additive) ---
+  // Speed from the detent GAP (Increment is only +-1); stepping math is pure
+  // and host-tested in controls_core.h.
   int32_t inc = pod.encoder.Increment();
   if (inc != 0) {
     uint32_t tnow = System::GetNow();
     bool fast = encoderFast(tnow - lastDetentMs);
     lastDetentMs = tnow;
-    switch (encPage) {
-      case PAGE_DURATION:
-        seq.duration = stepRatio(seq.duration, inc, fast ? 1.08f : 1.015f,
-                                 0.25f, 60.0f);
-        break;
-      case PAGE_DRIFT:   // global drift, additive
-        globalDrift = stepAdditive(globalDrift, inc, fast ? 0.02f : 0.0025f,
-                                   0.0f, 0.25f);
-        break;
-      case PAGE_STRETCH: // index into the detent table; 3 stops/detent fast
-        stretchIdx = stepIndex(stretchIdx, inc, fast ? 3 : 1, STRETCH_NSTOPS);
-        seq.stretch = STRETCH_STOPS[stretchIdx];
-        break;
-      case PAGE_FADE:    // crossfade length, additive
-        seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
-        break;
-      default: break;
+    if (encPage == PAGE_STRETCH) {
+      stretchIdx = stepIndex(stretchIdx, inc, fast ? 3 : 1, STRETCH_NSTOPS);
+      seq.stretch = STRETCH_STOPS[stretchIdx];
+    } else {   // PAGE_FADE
+      seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
     }
   }
 
-  // --- knobs: edit the SELECTED step's position (k1) and per-step drift (k2),
-  // with PICKUP. A knob takes over its parameter for the current step only once
-  // it has physically MOVED since the step was selected; until then the step
-  // holds its stored value. The move test is a small threshold on the raw read
-  // so pot noise doesn't trip it.
-  float k1 = smoothKnob(knobSmooth[0], pod.knob1.Value(), knobPrimed);
-  float k2 = smoothKnob(knobSmooth[1], pod.knob2.Value(), knobPrimed);
+  // --- knobs: GLOBAL mode -> duration + global drift; step mode -> that step's
+  // position + per-step drift. PICKUP everywhere (a knob takes over only after
+  // it moves since arriving on a slot). All decision logic is host-tested
+  // (controls_core.h). seq.duration is written by PanelEditor via &seq.duration.
+  float r1 = pod.knob1.Value(), r2 = pod.knob2.Value();   // raw (move detect)
+  float k1 = smoothKnob(knobSmooth[0], r1, knobPrimed);   // smoothed (value)
+  float k2 = smoothKnob(knobSmooth[1], r2, knobPrimed);
   knobPrimed = true;
-  // StepEditor applies pickup, writes the selected step's position/drift, and
-  // folds per-step + global drift into seq.drift[] for every step. All the
-  // decision logic is here and host-tested (controls_core.h).
-  stepEd.update(seq, k1, k2, globalDrift);
+  panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
+#ifdef PROFILE
+  dbgR1 = r1; dbgR2 = r2; dbgK1 = k1; dbgK2 = k2;   // for the KNOB profiler line
+#endif
 
   // --- led2: encoder page color; brightness = crossfade active (fade > 0) ---
-  // (pageColor/stepColor are host-tested pure lookups in controls_core.h.)
   Rgb c2 = pageColor(encPage, (seq.fade > 0.0f) ? 0.6f : 0.15f);
   pod.led2.Set(c2.r, c2.g, c2.b);
 
-  // --- led1: selected step, ROYGBIVW (steps 1..8) ---
-  Rgb c1 = stepColor(stepEd.selected());
-  pod.led1.Set(c1.r, c1.g, c1.b);
+  // --- led1: OFF in GLOBAL mode; ROYGBIVW for the selected step otherwise ---
+  if (panel.inGlobal()) {
+    pod.led1.Set(0.0f, 0.0f, 0.0f);
+  } else {
+    Rgb c1 = stepColor(panel.step());
+    pod.led1.Set(c1.r, c1.g, c1.b);
+  }
 
   pod.UpdateLeds();
 }
@@ -337,20 +328,48 @@ int main(void) {
       profLastPrint = now;
       uint32_t isr = profIsrUs;
       profIsrUs = 0;
-      // SETTINGS line: full state, integers (nano-newlib printf can't do floats
-      // reliably). Globals: stretch*100, dur_ms, gdrift_m=globalDrift*1000,
-      // fade_m=fade*1000, page. Selected step: sel (0..7), its pos*1000 and
-      // per-step drift*1000.
+      // SETTINGS line: globals + which step is selected. Integers *1000 (or
+      // *100 for stretch) since nano-newlib printf can't do floats reliably.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d page=%d sel=%d pos_m=%d sdrift_m=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(globalDrift * 1000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
           (int)encPage,
-          stepEd.selected(),
-          (int)(seq.position[stepEd.selected()] * 1000.0f + 0.5f),
-          (int)(stepEd.perStepDrift(stepEd.selected()) * 1000.0f + 0.5f));
+          panel.slot());   // 0 = GLOBAL, 1..8 = step
+      // KNOB line: raw + smoothed knob reads (*1000) and whether pickup has
+      // engaged on the current slot (k1L/k2L = 1 once the pot has moved past
+      // threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
+      // the move; if k1L=1 but the value doesn't change, the write is the bug.
+      pod.seed.PrintLine(
+          "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d b1=%d b2=%d",
+          (int)(dbgR1 * 1000.0f + 0.5f), (int)(dbgR2 * 1000.0f + 0.5f),
+          (int)(dbgK1 * 1000.0f + 0.5f), (int)(dbgK2 * 1000.0f + 0.5f),
+          (int)panel.k1Live(), (int)panel.k2Live(),
+          (int)pod.button1.Pressed(), (int)pod.button2.Pressed());
+      // POS line: all 8 step positions (*1000). Homing every knob should make
+      // these equal; if they differ, that's why steps sound different.
+      pod.seed.PrintLine(
+          "POS %d %d %d %d %d %d %d %d",
+          (int)(seq.position[0] * 1000.0f + 0.5f), (int)(seq.position[1] * 1000.0f + 0.5f),
+          (int)(seq.position[2] * 1000.0f + 0.5f), (int)(seq.position[3] * 1000.0f + 0.5f),
+          (int)(seq.position[4] * 1000.0f + 0.5f), (int)(seq.position[5] * 1000.0f + 0.5f),
+          (int)(seq.position[6] * 1000.0f + 0.5f), (int)(seq.position[7] * 1000.0f + 0.5f));
+      // DRF line: per-step drift shadow (what the knob set), then the EFFECTIVE
+      // drift the DSP reads (perStep + global). If effective differs from shadow
+      // uniformly, that's global drift; if the shadow itself varies, that's the
+      // per-step knob.
+      pod.seed.PrintLine(
+          "DRF s %d %d %d %d %d %d %d %d | eff %d %d %d %d %d %d %d %d",
+          (int)(panel.perStepDrift(0)*1000+0.5f), (int)(panel.perStepDrift(1)*1000+0.5f),
+          (int)(panel.perStepDrift(2)*1000+0.5f), (int)(panel.perStepDrift(3)*1000+0.5f),
+          (int)(panel.perStepDrift(4)*1000+0.5f), (int)(panel.perStepDrift(5)*1000+0.5f),
+          (int)(panel.perStepDrift(6)*1000+0.5f), (int)(panel.perStepDrift(7)*1000+0.5f),
+          (int)(seq.drift[0]*1000+0.5f), (int)(seq.drift[1]*1000+0.5f),
+          (int)(seq.drift[2]*1000+0.5f), (int)(seq.drift[3]*1000+0.5f),
+          (int)(seq.drift[4]*1000+0.5f), (int)(seq.drift[5]*1000+0.5f),
+          (int)(seq.drift[6]*1000+0.5f), (int)(seq.drift[7]*1000+0.5f));
       // HEALTH line: CPU and dropout accounting for this second.
       pod.seed.PrintLine(
           "HLTH act=%d units=%u svc_us=%u avg_us=%u isr_us=%u du=%u",

@@ -131,6 +131,23 @@ static void fill_stub_source() {
 enum EncoderPage { PAGE_STRETCH = 0, PAGE_FADE = 1 };
 static EncoderPage encPage = PAGE_STRETCH;
 
+// Stretch is a fixed, musically-spaced DETENT TABLE rather than a continuous
+// range: PaulStretch factors are not perceptually linear, so what matters is the
+// regime (scan / drift / freeze), not the exact number. Fine 1..10, then coarser
+// as character stops changing: by 2 to 20, by 5 to 50, by 10 to 100, by 25 to
+// 300, by 100 to 1000. The encoder moves an INDEX into this table.
+static const float STRETCH_STOPS[] = {
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+  12, 14, 16, 18, 20,
+  25, 30, 35, 40, 45, 50,
+  60, 70, 80, 90, 100,
+  125, 150, 175, 200, 225, 250, 275, 300,
+  400, 500, 600, 700, 800, 900, 1000,
+};
+static const int STRETCH_NSTOPS =
+    (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 41
+static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
+
 // Knob smoothing: a one-pole on the raw ADC read, so a noisy pot does not
 // dither the parameter. ~pot-speed, same idea as the original .ino.
 static float knobSmooth[2] = {0.0f, 0.0f};
@@ -156,28 +173,21 @@ static void processControls() {
   int32_t inc = pod.encoder.Increment();
   if (inc != 0) {
     if (encPage == PAGE_STRETCH) {
-      // Two regimes by turn speed, measured from the GAP between detents --
-      // libDaisy's Encoder::Increment() only ever returns +-1, so speed can't
-      // come from the step magnitude; it comes from how fast detents arrive.
-      // SLOW (detents far apart): LINEAR trim, fixed +-0.5x additive step, easy
-      // to land an exact value. FAST (detents close together, a spin): LOG,
-      // multiply by a fixed ratio per detent so a flick crosses 1x..500x in
-      // about two turns from anywhere. Threshold: <= 40 ms since the last detent
-      // = fast (a spin is many detents/sec; a deliberate click is slower).
-      const float STRETCH_MAX = 500.0f;
+      // Move an INDEX into STRETCH_STOPS. Two regimes by turn speed (from the
+      // detent GAP -- Encoder::Increment() only ever returns +-1, so speed
+      // can't come from step magnitude): SLOW click = 1 stop (land an exact
+      // value); FAST spin (<=40 ms since last detent) = several stops per
+      // detent so a quick full turn (~24 detents) crosses all 41 stops --
+      // "one turn to 1000x". STEPS_PER_FAST_DETENT ~= NSTOPS / 24.
       static uint32_t lastDetentMs = 0;
       uint32_t tnow = System::GetNow();
       uint32_t gap  = tnow - lastDetentMs;
       lastDetentMs  = tnow;
-      if (gap <= 40) {
-        const int   FAST_DETENTS = 24;                        // range in ~2 turns
-        const float perDetent = powf(STRETCH_MAX, 1.0f / FAST_DETENTS);
-        seq.stretch *= powf(perDetent, (float)inc);           // fast: log ratio
-      } else {
-        seq.stretch += 0.5f * (float)inc;                     // slow: linear trim
-      }
-      if (seq.stretch < 1.0f)         seq.stretch = 1.0f;
-      if (seq.stretch > STRETCH_MAX)  seq.stretch = STRETCH_MAX;
+      int step = (gap <= 40) ? 2 : 1;         // fast: 2 stops/detent, slow: 1
+      stretchIdx += inc * step;
+      if (stretchIdx < 0)                 stretchIdx = 0;
+      if (stretchIdx > STRETCH_NSTOPS - 1) stretchIdx = STRETCH_NSTOPS - 1;
+      seq.stretch = STRETCH_STOPS[stretchIdx];
     } else {
       // Crossfade length, 0..0.5 overlap fraction. Same speed model as stretch,
       // but the range is small and additive so both regimes are LINEAR, just
@@ -269,7 +279,7 @@ int main(void) {
   // Starting values; the knobs/encoder take over from here (see processControls).
   // The knobs snap to their physical positions on the first read, so duration and
   // drift are whatever the pots are set to within a few ms of boot.
-  seq.stretch  = 50.0f;
+  seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
   seq.duration = 1.0f;
   seq.xfade    = false;   // butt-joint until button2 turns crossfade on
   seq.fade     = 0.25f;   // default overlap once enabled

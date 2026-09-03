@@ -245,11 +245,21 @@ static void processControls() {
   if (panel.speed2() > dbgPk2) dbgPk2 = panel.speed2();
 #endif
 
-  // --- led2: encoder page color (RoYG over stretch/fade/frame/steps). Brightness
-  // carries a second signal: on the STEPS page it encodes the active step count
-  // (green, dim=few steps, bright=full sequence); on the others, crossfade-active.
-  float b2 = (encPage == PAGE_STEPS) ? stepBrightness(seq.activeSteps)
-                                     : ((seq.fade > 0.0f) ? 0.6f : 0.15f);
+  // --- led2: encoder page color (RoYG over stretch/fade/frame/steps, same
+  // ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
+  // encoded LEVEL, so a bright LED always means "this parameter is turned up":
+  //   stretch -> red    = stretch detent index
+  //   fade    -> orange = crossfade amount (0..0.5)
+  //   frame   -> yellow = frame-size index
+  //   steps   -> green  = active step count
+  float b2;
+  switch (encPage) {
+    case PAGE_STRETCH: b2 = stretchBrightness(stretchIdx, STRETCH_NSTOPS); break;
+    case PAGE_FADE:    b2 = fadeBrightness(seq.fade);                      break;
+    case PAGE_FRAME:   b2 = frameBrightness(frameIdx, FRAME_NSTOPS);       break;
+    case PAGE_STEPS:   b2 = stepBrightness(seq.activeSteps);               break;
+    default:           b2 = 0.15f;                                         break;
+  }
   Rgb c2 = pageColor(encPage, b2);
   pod.led2.Set(c2.r, c2.g, c2.b);
 

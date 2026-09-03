@@ -297,19 +297,27 @@ TEST_CASE("nextPage cycles stretch -> fade -> frame -> steps -> stretch") {
   REQUIRE(nextPage(PAGE_STEPS)   == PAGE_STRETCH);   // wraps (4 pages)
 }
 
-TEST_CASE("pageColor: RoYG over the four pages, brightness folded in") {
-  // stretch = red, fade = orange, frame = yellow, steps = green (click order).
+TEST_CASE("pageColor: RoYG over the four pages, shared palette, brightness scales") {
+  // led2 draws the same ROYGBIVW hues as led1 (pages 0..3 = red/orange/yellow/
+  // green), scaled by brightness. Orange and yellow must be DISTINGUISHABLE
+  // (the bug: hand-rolled colors made pages 2 and 3 read alike).
   Rgb red = pageColor(PAGE_STRETCH, 0.6f);
   REQUIRE(red.r == Approx(0.6f)); REQUIRE(red.g == Approx(0.0f)); REQUIRE(red.b == Approx(0.0f));
   Rgb orange = pageColor(PAGE_FADE, 0.6f);
-  REQUIRE(orange.r == Approx(0.6f)); REQUIRE(orange.b == Approx(0.0f));
-  REQUIRE(orange.g > 0.0f); REQUIRE(orange.g < orange.r);   // some green, less than red
   Rgb yellow = pageColor(PAGE_FRAME, 0.6f);
-  REQUIRE(yellow.r == Approx(yellow.g)); REQUIRE(yellow.b == Approx(0.0f)); REQUIRE(yellow.r > 0.0f);
+  // orange = red-dominant with partial green; yellow = equal red+green. The
+  // green channel is what separates them, and it must differ clearly.
+  REQUIRE(orange.g < yellow.g);                 // orange has less green than yellow
+  REQUIRE(yellow.r == Approx(yellow.g));        // yellow is equal R+G
+  REQUIRE(orange.g < orange.r);                 // orange is red-dominant
+  REQUIRE(fabsf(orange.g - yellow.g) > 0.1f);   // clearly distinguishable, not alike
   Rgb green = pageColor(PAGE_STEPS, 0.6f);
   REQUIRE(green.g == Approx(0.6f)); REQUIRE(green.r == Approx(0.0f)); REQUIRE(green.b == Approx(0.0f));
-  // brightness actually scales
+  // brightness actually scales the hue
   REQUIRE(pageColor(PAGE_STRETCH, 0.15f).r == Approx(0.15f));
+  // led1 and led2 share the palette: page hue == step hue at equal brightness.
+  Rgb s0 = stepColor(0, 0.6f);
+  REQUIRE(red.r == Approx(s0.r)); REQUIRE(red.g == Approx(s0.g)); REQUIRE(red.b == Approx(s0.b));
 }
 
 TEST_CASE("stepBrightness: green intensity tracks the active step count (#149)") {
@@ -324,6 +332,46 @@ TEST_CASE("stepBrightness: green intensity tracks the active step count (#149)")
   // paired with pageColor, the STEPS LED is pure green at that brightness
   Rgb c = pageColor(PAGE_STEPS, stepBrightness(SS_STEPS));
   REQUIRE(c.g == Approx(1.0f)); REQUIRE(c.r == Approx(0.0f)); REQUIRE(c.b == Approx(0.0f));
+}
+
+TEST_CASE("stretchBrightness: red intensity tracks the stretch detent index") {
+  // low index = dim floor, top index = full, monotonic between.
+  REQUIRE(stretchBrightness(0, 56) == Approx(0.15f));     // floor
+  REQUIRE(stretchBrightness(55, 56) == Approx(1.0f));     // full (last of 56)
+  REQUIRE(stretchBrightness(40, 56) > stretchBrightness(10, 56));
+  // clamped, and a degenerate 1-stop table reads full.
+  REQUIRE(stretchBrightness(-3, 56) == Approx(0.15f));
+  REQUIRE(stretchBrightness(999, 56) == Approx(1.0f));
+  REQUIRE(stretchBrightness(0, 1) == Approx(1.0f));
+  // paired with pageColor, the STRETCH LED is pure red at that brightness
+  Rgb c = pageColor(PAGE_STRETCH, stretchBrightness(55, 56));
+  REQUIRE(c.r == Approx(1.0f)); REQUIRE(c.g == Approx(0.0f)); REQUIRE(c.b == Approx(0.0f));
+}
+
+TEST_CASE("levelBrightness: normalized level -> [floor, 1], clamped") {
+  REQUIRE(levelBrightness(0.0f) == Approx(0.15f));    // floor
+  REQUIRE(levelBrightness(1.0f) == Approx(1.0f));     // full
+  REQUIRE(levelBrightness(0.5f) == Approx(0.15f + 0.85f * 0.5f));
+  REQUIRE(levelBrightness(-1.0f) == Approx(0.15f));   // clamp lo
+  REQUIRE(levelBrightness(2.0f) == Approx(1.0f));     // clamp hi
+}
+
+TEST_CASE("every page's led2 brightness tracks its own encoded level") {
+  // fade: 0 (butt-joint) = floor, 0.5 (max overlap) = full, monotonic.
+  REQUIRE(fadeBrightness(0.0f) == Approx(0.15f));
+  REQUIRE(fadeBrightness(0.5f) == Approx(1.0f));
+  REQUIRE(fadeBrightness(0.25f) > fadeBrightness(0.1f));
+  // frame: index into the stops table, same shape as stretch.
+  REQUIRE(frameBrightness(0, 5) == Approx(0.15f));    // smallest frame = dim
+  REQUIRE(frameBrightness(4, 5) == Approx(1.0f));     // largest (SS_W) = full
+  REQUIRE(frameBrightness(3, 5) > frameBrightness(1, 5));
+  // Each page's hue is correct AND its brightness is proportional, not on/off.
+  Rgb orangeMid = pageColor(PAGE_FADE, fadeBrightness(0.25f));
+  Rgb orangeLo  = pageColor(PAGE_FADE, fadeBrightness(0.0f));
+  REQUIRE(orangeMid.r > orangeLo.r);                  // brighter at more fade
+  Rgb yellowHi = pageColor(PAGE_FRAME, frameBrightness(4, 5));
+  REQUIRE(yellowHi.r == Approx(yellowHi.g));          // still yellow (equal R+G)
+  REQUIRE(yellowHi.r == Approx(1.0f));                // full at the top index
 }
 
 TEST_CASE("stepColor: 8 distinct colors, index clamped") {

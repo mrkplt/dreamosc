@@ -143,46 +143,79 @@ inline EncoderPage nextPage(EncoderPage p) {
   return (EncoderPage)((p + 1) % PAGE_COUNT);
 }
 
-// LED2 color for the encoder page: hue = page (RoYG over the four pages, in
-// click order), brightness `b` folded in so the caller can encode a second
-// signal via brightness. On PAGE_STEPS the brightness encodes the active step
-// count (see stepBrightness); on the others it encodes crossfade-active.
-inline Rgb pageColor(EncoderPage page, float b) {
-  switch (page) {
-    case PAGE_STRETCH:  return {b,        0.0f,      0.0f};   // red
-    case PAGE_FADE:     return {b,        b * 0.35f, 0.0f};   // orange
-    case PAGE_FRAME:    return {b * 0.5f, b * 0.5f,  0.0f};   // yellow
-    case PAGE_STEPS:    return {0.0f,     b,         0.0f};   // green
-    default:            return {0.0f,     0.0f,      0.0f};
-  }
-}
-
-// Brightness for the PAGE_STEPS LED: green whose INTENSITY tracks the active
-// step count -- fewer steps dim, the full sequence bright -- so the count reads
-// at a glance without a separate display. Maps count in [1, SS_STEPS] to a
-// [floorB, 1.0] brightness (a small floor so 1 step is still visibly lit).
-inline float stepBrightness(int activeSteps, float floorB = 0.15f) {
-  int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
-  float t = (float)(n - 1) / (float)(SS_STEPS - 1);   // 0 at 1 step, 1 at SS_STEPS
-  return floorB + (1.0f - floorB) * t;
-}
-
-// LED1 color for the selected step, ROYGBIVW over the 8 steps. `i` is clamped
-// to [0, SS_STEPS-1].
-inline Rgb stepColor(int i) {
+// ROYGBIVW hue at unit intensity (each entry's peak channel = 1.0), the ONE
+// palette both LEDs share. led1 (step select) and led2 (encoder page) draw from
+// the same eight hues so a color means the same thing on both and orange/yellow
+// stay distinguishable (hand-rolled page colors made 2 and 3 read alike). `i` is
+// clamped to [0, SS_STEPS-1]. Multiply by a brightness to get a displayable Rgb.
+inline Rgb hueROYGBIVW(int i) {
   static const Rgb table[SS_STEPS] = {
-    {0.6f, 0.0f,  0.0f},   // 1 red
-    {0.6f, 0.25f, 0.0f},   // 2 orange
-    {0.5f, 0.5f,  0.0f},   // 3 yellow
-    {0.0f, 0.6f,  0.0f},   // 4 green
-    {0.0f, 0.0f,  0.6f},   // 5 blue
-    {0.25f,0.0f,  0.6f},   // 6 indigo
-    {0.5f, 0.0f,  0.6f},   // 7 violet
-    {0.5f, 0.5f,  0.5f},   // 8 white
+    {1.0f,  0.0f,  0.0f},   // 1 red
+    {1.0f,  0.45f, 0.0f},   // 2 orange
+    {1.0f,  1.0f,  0.0f},   // 3 yellow
+    {0.0f,  1.0f,  0.0f},   // 4 green
+    {0.0f,  0.0f,  1.0f},   // 5 blue
+    {0.4f,  0.0f,  1.0f},   // 6 indigo
+    {0.7f,  0.0f,  1.0f},   // 7 violet
+    {1.0f,  1.0f,  1.0f},   // 8 white
   };
   if (i < 0) i = 0;
   if (i > SS_STEPS - 1) i = SS_STEPS - 1;
   return table[i];
+}
+
+// LED2 color for the encoder page: the page's ROYGBIVW hue (RoYG over the four
+// pages, in click order -- SAME palette as led1) scaled by brightness `b`. Hue
+// = which parameter; `b` = that parameter's LEVEL (every page tracks its own
+// encoded level -- stretch/fade/frame/steps brightness via the *Brightness
+// helpers below). So a bright LED always means "this parameter is turned up".
+inline Rgb pageColor(EncoderPage page, float b) {
+  Rgb h = hueROYGBIVW((int)page);   // pages 0..3 map to red/orange/yellow/green
+  return {h.r * b, h.g * b, h.b * b};
+}
+
+// led2 brightness convention: EVERY page's LED intensity tracks that page's
+// encoded LEVEL, so brightness is always "how far up this parameter is" and the
+// hue is just which parameter. Map a normalized level `t` (0..1) to a displayable
+// [floorB, 1.0] brightness -- a small floor so the bottom of the range is still
+// visibly lit rather than off. All the per-page helpers below feed this.
+inline float levelBrightness(float t, float floorB = 0.15f) {
+  if (t < 0.0f) t = 0.0f;
+  if (t > 1.0f) t = 1.0f;
+  return floorB + (1.0f - floorB) * t;
+}
+
+// PAGE_STEPS green intensity = active step count, count in [1, SS_STEPS].
+inline float stepBrightness(int activeSteps, float floorB = 0.15f) {
+  int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
+  return levelBrightness((float)(n - 1) / (float)(SS_STEPS - 1), floorB);
+}
+
+// PAGE_STRETCH red intensity = stretch detent index, idx in [0, count-1].
+inline float stretchBrightness(int idx, int count, float floorB = 0.15f) {
+  if (count < 2) return 1.0f;
+  int i = idx < 0 ? 0 : (idx > count - 1 ? count - 1 : idx);
+  return levelBrightness((float)i / (float)(count - 1), floorB);
+}
+
+// PAGE_FADE orange intensity = crossfade amount over its full range [0, fadeMax]
+// (default 0.5 = the overlap ceiling). fade 0 (butt-joint) sits at the dim floor.
+inline float fadeBrightness(float fade, float fadeMax = 0.5f, float floorB = 0.15f) {
+  return levelBrightness(fadeMax > 0.0f ? fade / fadeMax : 0.0f, floorB);
+}
+
+// PAGE_FRAME yellow intensity = frame-size index, idx in [0, count-1] (same
+// shape as stretch: the encoder indexes a small stops table).
+inline float frameBrightness(int idx, int count, float floorB = 0.15f) {
+  return stretchBrightness(idx, count, floorB);   // identical index->level mapping
+}
+
+// LED1 color for the selected step, ROYGBIVW over the 8 steps, at a fixed
+// display brightness. Draws from the shared hueROYGBIVW palette. `i` is clamped
+// to [0, SS_STEPS-1].
+inline Rgb stepColor(int i, float b = 0.6f) {
+  Rgb h = hueROYGBIVW(i);
+  return {h.r * b, h.g * b, h.b * b};
 }
 
 // Two-knob panel editor with a mode + PICKUP everywhere.

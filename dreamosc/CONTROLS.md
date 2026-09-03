@@ -50,20 +50,22 @@ Two implementation facts that were hard-won bugs:
 ## Encoder
 
 Turn drives the current page; click cycles the page. led2 = page hue (**RoYG**
-over the four pages, in click order), brightness carries a second signal per page
-(see the table).
+over the four pages, in click order) drawn from the **same ROYGBIVW palette as
+led1** (`hueROYGBIVW`, so a color means the same on both LEDs and orange/yellow
+stay distinct). **Brightness on EVERY page tracks that page's encoded level** —
+a bright LED always means "this parameter is turned up".
 
-| Page | led2 | encoder turn |
-|------|------|--------------|
-| **stretch** | red | index a detent table `STRETCH_STOPS` (1×..10000×) |
-| **fade** | orange | crossfade overlap 0..0.5 (additive) |
-| **frame** | yellow | index `FRAME_STOPS` {256,512,1024,2048,4096} → `seq.setFrame()` |
-| **steps** | green | active step count 1..8 → `seq.setSteps()` (one step/detent) |
+| Page | led2 hue | encoder turn | brightness = |
+|------|----------|--------------|--------------|
+| **stretch** | red | index `STRETCH_STOPS` (1×..10000×) | stretch index (low dim → max bright) |
+| **fade** | orange | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
+| **frame** | yellow | index `FRAME_STOPS` {256,512,1024,2048,4096} → `seq.setFrame()` | frame index (small dim → large bright) |
+| **steps** | green | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
 
-- **led2 brightness:** on stretch/fade/frame, brightness = crossfade active
-  (`fade > 0`). On the **steps** page, brightness = the **active step count** —
-  green dims for a short sequence, brightens toward full for all 8 steps
-  (`stepBrightness`), so the count reads at a glance without the OLED.
+- All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
+  bottom of a range is still lit, never off): `stretchBrightness`,
+  `fadeBrightness`, `frameBrightness`, `stepBrightness`. The level reads at a
+  glance without the OLED.
 
 - **Stretch is a detent table**, not continuous: PaulStretch factors aren't
   perceptually linear, so what matters is the regime (scan/drift/freeze). Fine

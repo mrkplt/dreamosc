@@ -121,7 +121,7 @@ static void fill_stub_source() {
 //   knob2          -> drift      0 .. 25 % (all steps share one value for now)
 //   encoder turn   -> stretch (page 0) or crossfade length (page 1)
 //   encoder click  -> toggle which parameter the encoder drives
-//   button2        -> crossfade on/off (butt-joint vs equal-power overlap)
+//   button2        -> (free — crossfade on/off removed; fade=0 IS butt-joint)
 //   led1           -> underrun indicator (latches red if a voice ring starves)
 //   led2           -> page indicator (blue = stretch page, green = fade page)
 //                     dim when crossfade OFF, bright when ON
@@ -143,9 +143,15 @@ static const float STRETCH_STOPS[] = {
   60, 70, 80, 90, 100,
   125, 150, 175, 200, 225, 250, 275, 300,
   400, 500, 600, 700, 800, 900, 1000,
+  // Above 1000x is transient-squelch territory: 1000x still lets a sharp hit
+  // (a cymbal) punch through as a transient; ~10000x freezes it into sustained
+  // wash. By 500s through the low thousands (where the freeze character still
+  // changes), then by 1000s to 10000x.
+  1500, 2000, 2500, 3000,
+  4000, 5000, 6000, 7000, 8000, 9000, 10000,
 };
 static const int STRETCH_NSTOPS =
-    (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 41
+    (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 56
 static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
 
 // Knob smoothing: a one-pole on the raw ADC read, so a noisy pot does not
@@ -166,8 +172,6 @@ static void processControls() {
   if (pod.encoder.RisingEdge())
     encPage = (encPage == PAGE_STRETCH) ? PAGE_FADE : PAGE_STRETCH;
 
-  // --- button2: crossfade on/off ---
-  if (pod.button2.RisingEdge()) seq.xfade = !seq.xfade;
 
   // --- encoder turn: drives the current page's parameter ---
   int32_t inc = pod.encoder.Increment();
@@ -183,7 +187,9 @@ static void processControls() {
       uint32_t tnow = System::GetNow();
       uint32_t gap  = tnow - lastDetentMs;
       lastDetentMs  = tnow;
-      int step = (gap <= 40) ? 2 : 1;         // fast: 2 stops/detent, slow: 1
+      int step = (gap <= 40) ? 3 : 1;         // fast: 3 stops/detent, slow: 1
+                                              // (56 stops / ~24 detents = one
+                                              // full turn spans the range)
       stretchIdx += inc * step;
       if (stretchIdx < 0)                 stretchIdx = 0;
       if (stretchIdx > STRETCH_NSTOPS - 1) stretchIdx = STRETCH_NSTOPS - 1;
@@ -213,8 +219,11 @@ static void processControls() {
   float d = 0.25f * k2;                        // 0 .. 25 % of the stretch
   for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = d;
 
-  // --- led2: page (hue) + crossfade state (brightness) ---
-  float b = seq.xfade ? 0.6f : 0.12f;         // bright = crossfade on
+  // --- led2: page (hue) + crossfade active (brightness) ---
+  // Brightness now tracks fade > 0 (crossfading) vs fade == 0 (butt-joint) --
+  // the same at-a-glance signal the removed xfade toggle gave, derived from the
+  // one remaining control.
+  float b = (seq.fade > 0.0f) ? 0.6f : 0.12f;                 // bright = crossfade
   if (encPage == PAGE_STRETCH) pod.led2.Set(0.0f, 0.0f, b);   // blue = stretch
   else                         pod.led2.Set(0.0f, b, 0.0f);   // green = fade
 
@@ -281,8 +290,7 @@ int main(void) {
   // drift are whatever the pots are set to within a few ms of boot.
   seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
   seq.duration = 1.0f;
-  seq.xfade    = false;   // butt-joint until button2 turns crossfade on
-  seq.fade     = 0.25f;   // default overlap once enabled
+  seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
 
   pod.StartAdc();
   pod.StartAudio(AudioCallback);
@@ -325,14 +333,14 @@ int main(void) {
       // SETTINGS line: the full instrument state. Floats are unreliable through
       // the nano-newlib printf, so values print as integers (milli- or scaled
       // suffixes): stretch_c = stretch*100, dur_ms, drift_m = drift*1000,
-      // fade_m = fade*1000, xf = crossfade on/off, page = encoder page.
+      // fade_m = fade*1000 (0 = butt-joint), page = encoder page.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d drift_m=%d fade_m=%d xf=%d page=%d",
+          "SET stretch_c=%d dur_ms=%d drift_m=%d fade_m=%d page=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(seq.drift[0] * 1000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
-          (int)seq.xfade, (int)encPage);
+          (int)encPage);
       // HEALTH line: CPU and dropout accounting for this second.
       pod.seed.PrintLine(
           "HLTH act=%d units=%u svc_us=%u avg_us=%u isr_us=%u du=%u",

@@ -33,7 +33,6 @@ void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
   seq.stretch  = stretch;
   seq.duration = duration;
   seq.fade     = fade;
-  seq.xfade    = fade > 0.0f;
   for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = drift;
 }
 
@@ -397,26 +396,26 @@ TEST_CASE("drift perturbs position within bounds and stays reproducible") {
   for (float v : a) REQUIRE(std::isfinite(v));
 }
 
-TEST_CASE("crossfade disabled ignores fade; enabled clamps overlap to 0.5") {
+TEST_CASE("fade 0 is butt-joint; fade clamps to [0, 0.5]") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   uint32_t len = ((uint32_t)(2.0f * 48000 / SS_H + 0.5f)) * SS_H;
 
-  // xfade off: any fade value is ignored, interval = full duration (butt-joint).
-  Sequencer off; off.init(&src, 48000, [] {
-    static std::vector<float> p(SS_POOL_FLOATS); return p.data(); }());
-  off.duration = 2.0f; off.fade = 0.4f; off.xfade = false;
+  // fade 0: butt-joint -> interval = full duration (no on/off toggle exists;
+  // fade 0 IS the butt-joint case).
+  Sequencer off; make_seq(off, &src, 48000, 50.0f, 2.0f, /*fade=*/0.0f);
   REQUIRE(off.intervalSamples() == len);
 
-  // xfade on, fade out of range high -> clamped to 0.5.
+  // fade out of range high -> clamped to 0.5 (interval never below half a
+  // duration, the two-head ceiling).
   Sequencer hi; make_seq(hi, &src, 48000, 50.0f, 2.0f, /*fade=*/5.0f);
   Sequencer half; make_seq(half, &src, 48000, 50.0f, 2.0f, /*fade=*/0.5f);
   REQUIRE(hi.intervalSamples() == half.intervalSamples());
   REQUIRE(half.intervalSamples() == (uint32_t)(len * 0.5f));
 
-  // xfade on, fade negative -> clamped to 0 (butt-joint).
+  // fade negative -> clamped to 0 (butt-joint).
   Sequencer lo; make_seq(lo, &src, 48000, 50.0f, 2.0f, /*fade=*/0.0f);
-  lo.fade = -1.0f; lo.xfade = true;
+  lo.fade = -1.0f;
   REQUIRE(lo.intervalSamples() == len);
 }

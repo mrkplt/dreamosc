@@ -397,12 +397,13 @@ class Sequencer {
   float duration = 4.0f;      // step duration, seconds
   // Crossfade between consecutive heads. Heads are SEQUENTIAL (one at a time);
   // fade sets how much each head overlaps the next, as a fraction of the step
-  // duration, 0..0.5. 0 (or xfade off) = butt-joint, hard cut. 0.5 = maximum
-  // overlap: [mix][no clean middle][mix], still only TWO heads at once — the
-  // ceiling that keeps this off the 8-head CPU cliff the old `spread` model hit
-  // at its zero end. The overlap is an equal-power (constant-loudness) fade.
-  bool  xfade = false;        // crossfade enable (Pod button 2)
-  float fade  = 0.0f;         // 0..0.5 overlap fraction (encoder page 1)
+  // duration, 0..0.5. **fade 0 = butt-joint, hard cut** (there is no separate
+  // on/off toggle — a toggle was byte-identical to fade 0, so it was redundant
+  // and removed). 0.5 = maximum overlap: [mix][no clean middle][mix], still
+  // only TWO heads at once — the ceiling that keeps this off the 8-head CPU
+  // cliff the old `spread` model hit at its zero end. Equal-power (constant-
+  // loudness) fade.
+  float fade  = 0.0f;         // 0..0.5 overlap fraction (encoder fade page)
 
   // pool: SS_MAX_VOICES * SS_VOICE_FLOATS floats of scratch for the voices'
   // old_/ring_ buffers, carved up here. Supplied by the caller so it can live in
@@ -434,11 +435,10 @@ class Sequencer {
     return (hops < 1 ? 1 : hops) * SS_H;
   }
 
-  // Effective overlap fraction: 0 when crossfade is off, else fade clamped to
-  // [0, 0.5]. 0.5 is the hard ceiling — beyond it a THIRD head would overlap,
-  // which is exactly the multi-head CPU pileup this model exists to avoid.
+  // Effective overlap fraction: fade clamped to [0, 0.5]. 0 = butt-joint. 0.5
+  // is the hard ceiling — beyond it a THIRD head would overlap, which is
+  // exactly the multi-head CPU pileup this model exists to avoid.
   float overlapFrac() const {
-    if (!xfade) return 0.0f;
     return fade < 0.0f ? 0.0f : (fade > 0.5f ? 0.5f : fade);
   }
 

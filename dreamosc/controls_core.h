@@ -22,7 +22,8 @@
 enum EncoderPage {
   PAGE_STRETCH  = 0,   // blue
   PAGE_FADE     = 1,   // green
-  PAGE_COUNT    = 2,
+  PAGE_FRAME    = 2,   // yellow (frame/window size, #136)
+  PAGE_COUNT    = 3,
 };
 
 struct Rgb { float r, g, b; };
@@ -94,6 +95,7 @@ inline Rgb pageColor(EncoderPage page, float b) {
   switch (page) {
     case PAGE_STRETCH:  return {0.0f, 0.0f, b};        // blue
     case PAGE_FADE:     return {0.0f, b,    0.0f};      // green
+    case PAGE_FRAME:    return {b,    b,    0.0f};      // yellow
     default:            return {0.0f, 0.0f, 0.0f};
   }
 }

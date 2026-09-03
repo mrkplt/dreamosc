@@ -255,9 +255,10 @@ TEST_CASE("smoothKnob: first read jumps, then eases") {
 
 // --- page + LED color -------------------------------------------------------
 
-TEST_CASE("nextPage cycles stretch <-> fade") {
+TEST_CASE("nextPage cycles stretch -> fade -> frame -> stretch") {
   REQUIRE(nextPage(PAGE_STRETCH) == PAGE_FADE);
-  REQUIRE(nextPage(PAGE_FADE)    == PAGE_STRETCH);   // wraps (2 pages now)
+  REQUIRE(nextPage(PAGE_FADE)    == PAGE_FRAME);
+  REQUIRE(nextPage(PAGE_FRAME)   == PAGE_STRETCH);   // wraps (3 pages)
 }
 
 TEST_CASE("pageColor: distinct hue per page, brightness folded in") {
@@ -265,6 +266,8 @@ TEST_CASE("pageColor: distinct hue per page, brightness folded in") {
   REQUIRE(blue.b == Approx(0.6f)); REQUIRE(blue.r == Approx(0.0f));
   Rgb green = pageColor(PAGE_FADE, 0.6f);
   REQUIRE(green.g == Approx(0.6f)); REQUIRE(green.b == Approx(0.0f));
+  Rgb yellow = pageColor(PAGE_FRAME, 0.6f);
+  REQUIRE(yellow.r == Approx(0.6f)); REQUIRE(yellow.g == Approx(0.6f)); REQUIRE(yellow.b == Approx(0.0f));
   // brightness actually scales
   REQUIRE(pageColor(PAGE_STRETCH, 0.15f).b == Approx(0.15f));
 }

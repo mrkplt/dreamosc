@@ -85,34 +85,55 @@ using stmlib::RotationPhasor;
 // single set of work buffers serves all of them.
 // ---------------------------------------------------------------------------
 
+// The ShyFFT is sized to the MAX window (SS_W is the compile-time ceiling).
+// ShyFFT provides runtime-length overloads Direct/Inverse(in, out, passes) that
+// run a SHORTER transform in the same buffers -- so ONE instance covers every
+// window size <= SS_W. `passes` is log2(size), NOT the sample count (a real
+// gotcha: pass 11 for a 2048-pt transform, not 2048).
 typedef ShyFFT<float, SS_W, RotationPhasor> SSFFT;
+
+// Integer log2 of a power of two.
+inline int ssLog2(int n) { int p = 0; while ((1 << p) < n) p++; return p; }
 
 struct StretchTables {
   SSFFT fft;
-  float window[SS_W];        // (1 - x^2)^1.25, Nasca's original curve (analysis)
+  float window[SS_W];        // (1 - x^2)^1.25, Nasca's curve, over activeW points
   float sinLut[1024];
-  float synthGain;           // PaulXStretch synthesis output gain
+  float synthGain;           // PaulXStretch synthesis output gain (per active W)
+  // Active analysis window, runtime-adjustable (#136). SS_W is the buffer max;
+  // activeW is the window actually used, <= SS_W, power of two. The DSP reads
+  // these, never the SS_W/SS_H macros, so frame size is a live control.
+  int   activeW = SS_W;
+  int   activeH = SS_W / 2;
+  int   activePasses = 0;    // log2(activeW), the arg ShyFFT's runtime path wants
 
   void init() {
     fft.Init();
-    // Nasca's original PaulStretch analysis window. A rectangular window (the
-    // PaulXStretch *default*, which is selectable there for a reason) measured
-    // lower amplitude wobble but leaked 0.6% of output energy out of band vs
-    // 0.0% here — broadband junk, audible as scratchiness. Spectral purity wins;
-    // the lever for wobble is frame size (see #136), not the window.
-    for (int i = 0; i < SS_W; i++) {
-      float x = -1.0f + 2.0f * i / (SS_W - 1);
-      window[i] = powf(1.0f - x * x, 1.25f);
-    }
     for (int i = 0; i < 1024; i++)
       sinLut[i] = sinf(2.0f * (float)M_PI * i / 1024.0f);
-    // ShyFFT Direct+Inverse multiplies by SS_W (measured on host), so 1/SS_W
-    // undoes the transform scaling. The analysis window attenuates the input by
-    // its mean, so dividing by mean(window) restores unity-ish gain through the
-    // whole pipeline (verified by the unit-gain test).
+    setWindow(SS_W);         // build the window + gain for the default size
+  }
+
+  // Set the active analysis window to `w` (power of two, 64..SS_W). Recomputes
+  // Nasca's (1-x^2)^1.25 window over w points and the matching synthGain. Cheap
+  // -- called only on a frame-size control change. A rectangular window leaked
+  // 0.6% out-of-band energy (audibly scratchy); Nasca's is spectrally clean.
+  void setWindow(int w) {
+    if (w < 64) w = 64;
+    if (w > SS_W) w = SS_W;
+    activeW = w;
+    activeH = w / 2;
+    activePasses = ssLog2(w);
+    for (int i = 0; i < w; i++) {
+      float x = -1.0f + 2.0f * i / (w - 1);
+      window[i] = powf(1.0f - x * x, 1.25f);
+    }
+    // ShyFFT Direct+Inverse multiplies by w; 1/w undoes it. The window
+    // attenuates the input by its mean, so dividing by mean(window) restores
+    // unity-ish gain through the pipeline (the unit-gain test checks this).
     float wsum = 0.0f;
-    for (int i = 0; i < SS_W; i++) wsum += window[i];
-    synthGain = 1.0f / ((wsum / SS_W) * (float)SS_W);
+    for (int i = 0; i < w; i++) wsum += window[i];
+    synthGain = 1.0f / ((wsum / (float)w) * (float)w);
   }
 
   inline float sinAt(uint32_t idx) const { return sinLut[idx & 1023]; }
@@ -191,6 +212,11 @@ class Voice {
     srcPos_ = (double)position * (double)src->len;
     len_ = lenSamples;
     overlap_ = overlap;        // equal-power fade length (0 = butt-joint)
+    // Snapshot the active window for this voice's whole life -- geometry can't
+    // change mid-voice (old_ holds a frame of this size; the seam blends it).
+    w_ = gTab.activeW;
+    h_ = gTab.activeH;
+    passes_ = gTab.activePasses;
     out_ = 0;
     produced_ = 0;
     onsetDelay_ = onsetDelay;
@@ -203,7 +229,7 @@ class Voice {
     if (rng_ == 0) rng_ = 0x9E3779B9u;
     // old_ starts silent: the first emitted block therefore ramps in through the
     // raised cosine, which IS the head's natural rise (no pre-roll).
-    memset(old_, 0, SS_W * sizeof(float));
+    memset(old_, 0, w_ * sizeof(float));
     // Release-store LAST: every plain field above must be visible to the ISR
     // before it can observe active_ == true. Without the barrier the ISR could
     // see a half-initialized voice (ARM reorders plain stores).
@@ -220,14 +246,14 @@ class Voice {
     // Keep the ring as full as it can go (leaving room for one more hop);
     // letting it drain to empty between refills lets the callback catch the
     // producer and starve.
-    if (fill() > SS_RING - SS_H) return false;
+    if (fill() > SS_RING - h_) return false;
     if (produced_ < len_) {              // body: render a frame, emit a hop
       renderFrame();
       emitHop();
       return true;
     }
-    if (produced_ < len_ + SS_H) {       // natural tail: the last frame fades
-      memset(gWork, 0, sizeof(float) * SS_W);   // out against silence
+    if (produced_ < len_ + h_) {         // natural tail: the last frame fades
+      memset(gWork, 0, sizeof(float) * w_);   // out against silence
       emitHop();
       return true;
     }
@@ -286,7 +312,7 @@ class Voice {
         env = gTab.sinAtF(256.0f + 256.0f * (float)k / (float)overlap_); // out
       }
     } else {
-      span = len_ + SS_H;                       // butt-joint keeps the tail
+      span = len_ + h_;                         // butt-joint keeps the tail
     }
     if (++out_ >= span) active_.store(false, std::memory_order_release);
     return raw * env;
@@ -306,35 +332,38 @@ class Voice {
   }
 
   void renderFrame() {
+    // This voice's window is snapshotted at start() (w_/h_/passes_): frame
+    // geometry can't change mid-voice, since old_ holds a frame of this size
+    // and emitHop blends against it. A frame-size control change takes effect
+    // on the NEXT voice fire (like duration/position).
     int32_t base = (int32_t)srcPos_;
-    for (int i = 0; i < SS_W; i++)
+    for (int i = 0; i < w_; i++)
       gWork[i] = src_->at(base + i) * gTab.window[i];
 
-    gTab.fft.Direct(gWork, gSpec);
+    gTab.fft.Direct(gWork, gSpec, passes_);    // runtime-length: passes = log2(w_)
 
-    // Split layout: real part in gSpec[0..W/2), imaginary in gSpec[W/2..W).
-    // gSpec[0] is DC and gSpec[W/2] is Nyquist, both of which get zeroed, the
-    // same convention Nimbus uses.
+    // Split layout: real in gSpec[0..w/2), imaginary in gSpec[w/2..w). gSpec[0]
+    // is DC and gSpec[w/2] is Nyquist, both zeroed (Nimbus convention).
     float* re = &gSpec[0];
-    float* im = &gSpec[SS_W / 2];
-    for (int k = 1; k < SS_W / 2; k++) {
+    float* im = &gSpec[w_ / 2];
+    for (int k = 1; k < w_ / 2; k++) {
       float mag = sqrtf(re[k] * re[k] + im[k] * im[k]);
       uint32_t a = rand32() >> 22;              // 0..1023
       re[k] = mag * gTab.cosAt(a);              // keep magnitude, redraw phase
       im[k] = mag * gTab.sinAt(a);
     }
     gSpec[0] = 0.0f;                            // DC
-    gSpec[SS_W / 2] = 0.0f;                     // Nyquist
+    gSpec[w_ / 2] = 0.0f;                       // Nyquist
 
     // Full periodic IFFT waveform — NO synthesis window, no overlap-add. The
     // canonical PaulXStretch synthesis (essej/paulxstretch Stretch.cpp) plays
     // whole frames back-to-back via emitHop()'s raised-cosine handoff instead.
-    gTab.fft.Inverse(gSpec, gWork);
+    gTab.fft.Inverse(gSpec, gWork, passes_);
 
     // Advance by the LIVE stretch (see start()); clamp so a control at or below
     // zero cannot divide by zero or run the head backwards.
     float st = (stretch_ && *stretch_ > 0.01f) ? *stretch_ : 0.01f;
-    srcPos_ += (double)SS_H / (double)st;
+    srcPos_ += (double)h_ / (double)st;
   }
 
   // Canonical PaulXStretch output block (one hop). The block blends the current
@@ -349,20 +378,20 @@ class Voice {
   void emitHop() {
     const float h = 0.853553390593f;
     uint32_t w = wr_.load(std::memory_order_relaxed);
-    for (int i = 0; i < SS_H; i++) {
-      // a = 0.5 + 0.5*cos(pi*i/SS_H): fraction of 2*pi is i/(2*SS_H).
-      float a = 0.5f + 0.5f * gTab.cosAtF(1024.0f * i / (2.0f * SS_H));
-      float mixed = gWork[SS_H + i] * (1.0f - a) + old_[i] * a;
-      // corr = h - (1-h)*cos(2*pi*i/SS_H): 1/sqrt2 at the (single-frame) edges,
+    for (int i = 0; i < h_; i++) {
+      // a = 0.5 + 0.5*cos(pi*i/h_): fraction of 2*pi is i/(2*h_).
+      float a = 0.5f + 0.5f * gTab.cosAtF(1024.0f * i / (2.0f * h_));
+      float mixed = gWork[h_ + i] * (1.0f - a) + old_[i] * a;
+      // corr = h - (1-h)*cos(2*pi*i/h_): 1/sqrt2 at the (single-frame) edges,
       // 1.0 at the (mixed) middle.
-      float corr = h - (1.0f - h) * gTab.cosAtF(1024.0f * i / (float)SS_H);
+      float corr = h - (1.0f - h) * gTab.cosAtF(1024.0f * i / (float)h_);
       ring_[(w + i) & (SS_RING - 1)] = mixed * corr * gTab.synthGain;
     }
     // Release-store publishes the hop: all ring_ writes above are guaranteed
     // visible to the ISR before it can observe the advanced wr_.
-    wr_.store(w + SS_H, std::memory_order_release);
-    produced_ += SS_H;
-    memcpy(old_, gWork, SS_W * sizeof(float));   // current frame becomes "old"
+    wr_.store(w + h_, std::memory_order_release);
+    produced_ += h_;
+    memcpy(old_, gWork, w_ * sizeof(float));   // current frame becomes "old"
   }
 
   const Source* src_ = nullptr;
@@ -371,6 +400,9 @@ class Voice {
   uint32_t len_ = 0, out_ = 0, produced_ = 0, rng_ = 1;
   uint32_t onsetDelay_ = 0;   // samples silent-and-filling before audible
   uint32_t overlap_ = 0;      // equal-power crossfade length in samples
+  // Window geometry snapshotted at start() (see #136): fixed for this voice's
+  // life. w_ = active window, h_ = w_/2 (hop), passes_ = log2(w_) for ShyFFT.
+  int w_ = SS_W, h_ = SS_W / 2, passes_ = 0;
   // Buffers live in SDRAM, supplied via setBuffers(); see the note there.
   // NOTE: pointers, not arrays -- sizeof() on these is a pointer size, so always
   // spell out the element count when memset/memcpy-ing them.
@@ -405,6 +437,20 @@ class Sequencer {
   // loudness) fade.
   float fade  = 0.0f;         // 0..0.5 overlap fraction (encoder fade page)
 
+  // Frame/window size in samples (#136): a sound-CHARACTER control -- small =
+  // grainy/articulated, large = glassy/frozen PaulStretch. Power of two, 64..
+  // SS_W. Applied to gTab (the shared FFT/window) via setFrame(); new voices
+  // snapshot it at start(), so a change takes effect on the next fire. Default
+  // = SS_W (the buffer max), so untouched behavior is identical to before.
+  int frameSize = SS_W;
+
+  // Push frameSize into the shared tables (recomputes window + gain for w).
+  // Call from the control layer when the frame-size control moves. Cheap.
+  void setFrame(int w) {
+    frameSize = w;
+    gTab.setWindow(w);
+  }
+
   // pool: SS_MAX_VOICES * SS_VOICE_FLOATS floats of scratch for the voices'
   // old_/ring_ buffers, carved up here. Supplied by the caller so it can live in
   // SDRAM (plain data only — see Voice::setBuffers).
@@ -426,13 +472,15 @@ class Sequencer {
     armClock_ = SS_LOOKAHEAD;
   }
 
-  // Step duration in samples, quantized to the hop grid (multiples of SS_H).
-  // The quantization is what keeps a head's natural tail exactly overlapping
-  // the next head's natural rise at spread 1 — the seam only reconstructs the
-  // interior OLA sum when the two land on the same grid.
+  // Step duration in samples, quantized to the ACTIVE hop grid (multiples of
+  // gTab.activeH). The quantization keeps a head's natural tail exactly
+  // overlapping the next head's natural rise at fade 0 -- the seam only
+  // reconstructs the interior OLA sum when the two land on the same grid. Uses
+  // the active hop so it stays aligned as frame size changes (#136).
   uint32_t lenSamples() const {
-    uint32_t hops = (uint32_t)(duration * sr_ / SS_H + 0.5f);
-    return (hops < 1 ? 1 : hops) * SS_H;
+    int hop = gTab.activeH;
+    uint32_t hops = (uint32_t)(duration * sr_ / hop + 0.5f);
+    return (hops < 1 ? 1 : hops) * hop;
   }
 
   // Effective overlap fraction: fade clamped to [0, 0.5]. 0 = butt-joint. 0.5
@@ -455,7 +503,7 @@ class Sequencer {
   // How long one full pass of all SS_STEPS heads takes: the last head starts at
   // (SS_STEPS-1)*interval; its audible span is its body plus a one-hop tail.
   uint32_t patternSamples() const {
-    return (SS_STEPS - 1) * intervalSamples() + lenSamples() + SS_H;
+    return (SS_STEPS - 1) * intervalSamples() + lenSamples() + gTab.activeH;
   }
 
   // Audio callback. One sample of the whole sequence.

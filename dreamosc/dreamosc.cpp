@@ -124,7 +124,7 @@ static void fill_stub_source() {
 //   GLOBAL mode (led1 OFF):  knob1 -> duration (0.25..60s), knob2 -> global drift
 //   step mode  (led1 ROYGBIVW): knob1 -> that step's position, knob2 -> its drift
 //   encoder turn   -> stretch (page 0) or crossfade length (page 1)
-//   encoder click  -> toggle encoder page (stretch <-> fade)
+//   encoder click  -> cycle encoder page: stretch(blue) / fade(green) / frame(yellow)
 //   led2           -> encoder page color; brightness = crossfade active (fade>0)
 //
 // PICKUP (soft takeover) EVERYWHERE: landing on GLOBAL or a step does NOT snap
@@ -171,6 +171,14 @@ static const int STRETCH_NSTOPS =
     (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 56
 static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
 
+// Frame/window size stops (#136): powers of two up to SS_W (the compile-time
+// buffer max). Smaller = grainier/more articulated, larger = glassy/frozen.
+// Encoder page PAGE_FRAME indexes this; the value goes to seq.setFrame().
+static const int FRAME_STOPS[] = { 256, 512, 1024, 2048, 4096 };
+static const int FRAME_NSTOPS =
+    (int)(sizeof(FRAME_STOPS) / sizeof(FRAME_STOPS[0]));
+static int frameIdx = FRAME_NSTOPS - 1;   // start at SS_W (4096), the default
+
 // Knob smoothing state (the smoothing math is smoothKnob() in controls_core.h).
 static float knobSmooth[2] = {0.0f, 0.0f};
 static bool  knobPrimed    = false;
@@ -202,6 +210,9 @@ static void processControls() {
     if (encPage == PAGE_STRETCH) {
       stretchIdx = stepIndex(stretchIdx, inc, fast ? 3 : 1, STRETCH_NSTOPS);
       seq.stretch = STRETCH_STOPS[stretchIdx];
+    } else if (encPage == PAGE_FRAME) {
+      frameIdx = stepIndex(frameIdx, inc, 1, FRAME_NSTOPS);   // 1 stop/detent
+      seq.setFrame(FRAME_STOPS[frameIdx]);                    // recompute window
     } else {   // PAGE_FADE
       seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
     }
@@ -331,11 +342,12 @@ int main(void) {
       // SETTINGS line: globals + which step is selected. Integers *1000 (or
       // *100 for stretch) since nano-newlib printf can't do floats reliably.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d frame=%d page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(globalDrift * 1000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
+          seq.frameSize,
           (int)encPage,
           panel.slot());   // 0 = GLOBAL, 1..8 = step
       // KNOB line: raw + smoothed knob reads (*1000) and whether pickup has

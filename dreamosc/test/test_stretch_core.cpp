@@ -419,3 +419,51 @@ TEST_CASE("fade 0 is butt-joint; fade clamps to [0, 0.5]") {
   lo.fade = -1.0f;
   REQUIRE(lo.intervalSamples() == len);
 }
+
+TEST_CASE("setWindow: window + gain recompute for each frame size") {
+  gTab.init();
+  // Every supported window round-trips through setWindow with finite gain and a
+  // correctly-sized window (log2 matches). SS_W is the buffer max.
+  for (int w = 64; w <= SS_W; w <<= 1) {
+    gTab.setWindow(w);
+    REQUIRE(gTab.activeW == w);
+    REQUIRE(gTab.activeH == w / 2);
+    REQUIRE((1 << gTab.activePasses) == w);          // passes = log2(w)
+    REQUIRE(std::isfinite(gTab.synthGain));
+    REQUIRE(gTab.synthGain > 0.0f);
+    // window is a raised (1-x^2)^1.25 curve: 0 at the edges, 1 at the center.
+    REQUIRE(gTab.window[0] == Approx(0.0f).margin(1e-3));
+    REQUIRE(gTab.window[w / 2] == Approx(1.0f).margin(1e-2));
+  }
+  gTab.setWindow(SS_W);   // restore default for other tests
+}
+
+TEST_CASE("renders cleanly at every frame size") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  for (int w = 512; w <= SS_W; w <<= 1) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
+    seq.setFrame(w);
+    REQUIRE(seq.frameSize == w);
+    auto out = render(seq, 2);
+    REQUIRE(out.size() > 0);
+    bool audible = false;
+    for (float v : out) {
+      REQUIRE(std::isfinite(v));
+      REQUIRE(std::abs(v) <= 1.5f);
+      if (std::abs(v) > 1e-3f) audible = true;
+    }
+    REQUIRE(audible);   // real output at this window, not silence
+  }
+  gTab.setWindow(SS_W);
+}
+
+TEST_CASE("frame size is clamped to [64, SS_W]") {
+  gTab.init();
+  gTab.setWindow(1);       // below min
+  REQUIRE(gTab.activeW == 64);
+  gTab.setWindow(1 << 20); // above max
+  REQUIRE(gTab.activeW == SS_W);
+  gTab.setWindow(SS_W);
+}

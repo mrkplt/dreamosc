@@ -47,11 +47,30 @@ volatile uint32_t gUnderruns = 0;
 #ifdef PROFILE
 // `make PROFILE=1`: per-second CPU accounting over USB serial. Read it with
 //   screen /dev/tty.usbmodem<tab> 115200
-// Fields: act (active voices), units (service() calls that did work), svc_us
-// (us of main-loop DSP that second), avg_us (per unit), isr_us (us in the audio
-// callback that second), du (underruns that second), fade_m (fade*1000),
-// xf (crossfade on/off), page (0 stretch / 1 fade).
+// HLTH fields: act (active voices), units (service() calls that did work),
+// svc_us (main-loop DSP us that second), avg_us (per unit), max_us (WORST single
+// service call -- the burst that avg_us hides; watch this at SS_W 16384), isr_us
+// (audio-callback us that second), du (underruns that second), stk (deepest stack
+// use seen, bytes -- a hang at 16384 with du=0 points here, not at CPU).
 static volatile uint32_t profIsrUs = 0;
+
+// Deepest stack use observed (bytes below _estack). The stack grows down from
+// _estack (top of DTCM); sampling MSP each main-loop pass and keeping the minimum
+// SP gives a high-water mark. This catches the pre-mortem's "hang, not underrun"
+// case: freeing DTCM (94% -> 44%) helped, but a deep 16384-path local could still
+// collide with the heap/statics below -- and that shows as a crash, not a number,
+// unless we watch it. _estack is provided by the linker (dreamosc.lds).
+extern "C" uint32_t _estack;
+static uint32_t profMinSp = 0xFFFFFFFFu;   // lowest SP ever seen (deepest stack)
+static inline void profSampleStack() {
+  uint32_t sp = __get_MSP();
+  if (sp < profMinSp) profMinSp = sp;
+}
+// Bytes from _estack down to the deepest SP = max stack depth used so far.
+static inline uint32_t profStackUsed() {
+  uint32_t top = (uint32_t)&_estack;
+  return (profMinSp == 0xFFFFFFFFu) ? 0 : (top - profMinSp);
+}
 // Last knob reads (raw + smoothed) for the KNOB diagnostic line.
 static float dbgR1 = 0, dbgR2 = 0, dbgK1 = 0, dbgK2 = 0;
 // Peak per-poll knob speed since the last profiler print (instantaneous speed is
@@ -378,15 +397,23 @@ int main(void) {
   uint32_t lastControlMs = System::GetNow();
 #ifdef PROFILE
   uint32_t profBusyUs = 0, profUnits = 0, profLastUnder = 0;
+  // Peak single service() duration this window. avg_us AVERAGES the FFT cost, but
+  // an underrun comes from the WORST single frame (a big-window FFT colliding with
+  // a control poll / LED update in one pass), which the average hides. This is the
+  // burst the pre-mortem flagged -- watch max_us, not just avg_us, at SS_W 16384.
+  uint32_t profMaxUs = 0;
   uint32_t profLastPrint = System::GetNow();
 #endif
   while (1) {
 #ifdef PROFILE
     uint32_t s0 = System::GetUs();
     if (seq.service()) {
-      profBusyUs += System::GetUs() - s0;
+      uint32_t d = System::GetUs() - s0;
+      profBusyUs += d;
+      if (d > profMaxUs) profMaxUs = d;
       profUnits++;
     }
+    profSampleStack();   // stack high-water mark (deepest SP seen)
 #else
     seq.service();
 #endif
@@ -452,14 +479,20 @@ int main(void) {
           (int)(seq.drift[2]*1000+0.5f), (int)(seq.drift[3]*1000+0.5f),
           (int)(seq.drift[4]*1000+0.5f), (int)(seq.drift[5]*1000+0.5f),
           (int)(seq.drift[6]*1000+0.5f), (int)(seq.drift[7]*1000+0.5f));
-      // HEALTH line: CPU and dropout accounting for this second.
+      // HEALTH line: CPU and dropout accounting for this second. max_us = worst
+      // single service() call (the burst avg_us hides -- underruns come from the
+      // tail, not the mean). stk = deepest stack use seen (bytes below _estack);
+      // a hang at 16384 with du=0 points here. Both target the pre-mortem's
+      // "invisible at avg_us" failure modes at the big window.
       pod.seed.PrintLine(
-          "HLTH act=%d units=%u svc_us=%u avg_us=%u isr_us=%u du=%u",
+          "HLTH act=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u stk=%u",
           seq.activeVoices(), (unsigned)profUnits, (unsigned)profBusyUs,
-          (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)isr,
-          (unsigned)(gUnderruns - profLastUnder));
+          (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)profMaxUs,
+          (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),
+          (unsigned)profStackUsed());
       profLastUnder = gUnderruns;
       profBusyUs = profUnits = 0;
+      profMaxUs = 0;   // reset the per-window peak (stk is a running high-water)
     }
 #endif
   }

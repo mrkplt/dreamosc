@@ -116,6 +116,18 @@ polyphony.
     [mix ¼][clean ½ → 0][mix ¼]; **50% is the hard ceiling because beyond it a
     THIRD head would overlap** — the whole point is that AT MOST TWO heads ever
     sound at once. (There is no separate on/off toggle: fade 0 IS butt-joint.)
+- **A hard cut here is a SPECTRAL transition, NOT an amplitude click** — a key
+  property of the phase-randomized PaulStretch synthesis. Each frame's phases are
+  redrawn randomly, so the material on either side of a cut is uncorrelated
+  noise-like sound at roughly the same amplitude. Cutting a head mid-flight (a
+  butt-joint, or truncating a voice — see Fizzy #152) changes the SPECTRUM
+  abruptly but does NOT step the amplitude, so it does not click the way splicing
+  a tonal/correlated signal would. This is *why* fade 0 is acceptable as a
+  butt-joint, and why smoothing between heads is purely the `fade` function's job
+  (spectral smoothing when you want it), not a click-avoidance requirement. Don't
+  reason about seams/truncation as if they need anti-click fades — they don't; the
+  amplitude is already continuous. (Interior discontinuities *within* a head are a
+  different matter and are guarded by the click-detector test.)
 - **Frame size (`SS_W`) is a sound-CHARACTER axis** (Fizzy #136), a live control:
   small window = grainy/articulated, large = glassy/frozen. `SS_W` is the
   compile-time buffer MAX; the active window is runtime-adjustable (one ShyFFT

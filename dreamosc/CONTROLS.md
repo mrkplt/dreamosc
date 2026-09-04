@@ -63,7 +63,7 @@ also the color index, so click order = RoYG).
 | **stretch** | red | index `STRETCH_STOPS` (1×..10000×) | stretch index (low dim → max bright) |
 | **steps** | orange | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
 | **fade** | yellow | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
-| **window** (frame) | green | index `FRAME_STOPS` {4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**) | knob position (CCW dim → CW bright) |
+| **window** (frame) | green | index `FRAME_STOPS` {16384,8192,4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**; **default 4096**, mid-table) | knob position (CCW dim → CW bright) |
 
 - All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
   bottom of a range is still lit, never off): `stretchBrightness`,
@@ -77,8 +77,13 @@ also the color index, so click order = RoYG).
 - **Fade** = crossfade seam overlap. 0 = butt-joint (hard cut). There is no
   separate on/off toggle — fade 0 IS the butt-joint case (a toggle was byte-
   identical to it and was removed, freeing button 2 for the mode navigation).
-- **Frame size** is a SOUND-CHARACTER control (Fizzy #136): small = grainy/
-  articulated, large = glassy/frozen. Takes effect on the next voice fire.
+- **Frame size** is a SOUND-CHARACTER control (Fizzy #136): the window is the
+  chunk of source FFT'd to extract the spectrum, so it sets frequency resolution.
+  Small (256) = grainy/articulated, and on tonal material an audible per-hop
+  WOBBLE (coarse bins beat fast). Large (up to 16384 ≈ 0.34 s) = glassy/frozen
+  and turns that wobble into PaulXStretch's slow characteristic SHIMMER (fine
+  bins). Default 4096; grow it (CCW) for shimmer, shrink it (CW) for grain. Takes
+  effect on the next voice fire.
 - **Step count** (Fizzy #149): how many of the 8 steps the sequence walks, 1..8.
   Fewer steps = a shorter, faster-repeating pattern (a real compositional
   control). The `position[]`/`drift[]` arrays stay sized to 8; only steps below

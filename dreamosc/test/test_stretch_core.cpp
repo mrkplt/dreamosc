@@ -271,22 +271,27 @@ TEST_CASE("pattern length: heads sequential, overlapping by the crossfade") {
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   const float sr = 48000, dur = 4.0f;
-  const uint32_t len = ((uint32_t)(dur * sr / SS_H + 0.5f)) * SS_H;
+  // Quantize with the RUNTIME hop (gTab.activeH = default window / 2), NOT the
+  // SS_H macro (SS_W/2 = the buffer-MAX hop). Those differ now that SS_W (buffer
+  // max) != the default window; the sequencer quantizes to activeH, so the test
+  // must too.
+  const uint32_t hop = (uint32_t)gTab.activeH;
+  const uint32_t len = ((uint32_t)(dur * sr / hop + 0.5f)) * hop;
 
   SECTION("no crossfade = butt-joint = end-to-end (SS_STEPS durations)") {
     Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.0f);
     // interval = full duration, so the pattern is SS_STEPS durations + tail.
-    REQUIRE(seq.patternSamples() == SS_STEPS * len + SS_H);
+    REQUIRE(seq.patternSamples() == SS_STEPS * len + hop);
   }
   SECTION("fade 0.25 = heads overlap a quarter duration") {
     Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.25f);
     uint32_t interval = (uint32_t)(len * 0.75f);   // (1 - overlap)
-    REQUIRE(seq.patternSamples() == (SS_STEPS - 1) * interval + len + SS_H);
+    REQUIRE(seq.patternSamples() == (SS_STEPS - 1) * interval + len + hop);
   }
   SECTION("fade 0.5 (max) = heads overlap half a duration") {
     Sequencer seq; make_seq(seq, &src, sr, 50.0f, dur, /*fade=*/0.5f);
     uint32_t interval = (uint32_t)(len * 0.5f);
-    REQUIRE(seq.patternSamples() == (SS_STEPS - 1) * interval + len + SS_H);
+    REQUIRE(seq.patternSamples() == (SS_STEPS - 1) * interval + len + hop);
   }
 }
 
@@ -309,7 +314,8 @@ TEST_CASE("pattern length shrinks with the active step count (#149)") {
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   const float sr = 48000, dur = 4.0f;
-  const uint32_t len = ((uint32_t)(dur * sr / SS_H + 0.5f)) * SS_H;
+  const uint32_t hop = (uint32_t)gTab.activeH;   // runtime hop, not the SS_H macro
+  const uint32_t len = ((uint32_t)(dur * sr / hop + 0.5f)) * hop;
 
   // Butt-joint (interval = full duration): a K-step pattern is K durations + the
   // one-hop tail, so the pattern length is directly proportional to activeSteps.
@@ -318,11 +324,11 @@ TEST_CASE("pattern length shrinks with the active step count (#149)") {
   REQUIRE(interval == len);
   for (int k = 1; k <= SS_STEPS; k++) {
     seq.setSteps(k);
-    REQUIRE(seq.patternSamples() == (uint32_t)(k - 1) * interval + len + SS_H);
+    REQUIRE(seq.patternSamples() == (uint32_t)(k - 1) * interval + len + hop);
   }
   // A single step is just one duration + tail -- the shortest possible loop.
   seq.setSteps(1);
-  REQUIRE(seq.patternSamples() == len + SS_H);
+  REQUIRE(seq.patternSamples() == len + hop);
 }
 
 TEST_CASE("a K-step sequence renders and stays bounded (#149)") {
@@ -346,7 +352,8 @@ TEST_CASE("interval = (1 - overlap) * duration; overlap clamped to 0.5") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  uint32_t len = ((uint32_t)(4.0f * 48000 / SS_H + 0.5f)) * SS_H;
+  uint32_t hop = (uint32_t)gTab.activeH;   // runtime hop, not the SS_H macro
+  uint32_t len = ((uint32_t)(4.0f * 48000 / hop + 0.5f)) * hop;
 
   // fade off -> interval = full duration (butt-joint, one head at a time).
   Sequencer off; make_seq(off, &src, 48000, 50.0f, 4.0f, /*fade=*/0.0f);
@@ -452,7 +459,8 @@ TEST_CASE("fade 0 is butt-joint; fade clamps to [0, 0.5]") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  uint32_t len = ((uint32_t)(2.0f * 48000 / SS_H + 0.5f)) * SS_H;
+  uint32_t hop = (uint32_t)gTab.activeH;   // runtime hop, not the SS_H macro
+  uint32_t len = ((uint32_t)(2.0f * 48000 / hop + 0.5f)) * hop;
 
   // fade 0: butt-joint -> interval = full duration (no on/off toggle exists;
   // fade 0 IS the butt-joint case).

@@ -27,9 +27,27 @@ using stmlib::RotationPhasor;
 // ---------------------------------------------------------------------------
 
 #ifndef SS_W
-#define SS_W 4096            // analysis window, must be a power of two
+// Analysis window MAX (must be a power of two). This is the chunk of source that
+// gets FFT'd to extract the spectrum, so it sets frequency resolution: bigger =
+// narrower bins = the phase randomization beats more slowly = the slow shimmer
+// PaulXStretch has, instead of an audible per-hop wobble on tonal material.
+// 16384 (~0.34 s at 48 kHz, ~2.9 Hz bins) reaches PaulXStretch's ~0.25 s regime
+// (#136). The RUNTIME window is <= this (frame-size control); default is 4096,
+// so untouched behavior is unchanged and larger windows are opt-in via the
+// window page. Per-voice buffers scale with SS_W (see SS_VOICE_FLOATS), so this
+// is also a memory + FFT-cost knob -- verify avg_us on the bench (make PROFILE=1).
+#define SS_W 16384
 #endif
-#define SS_H (SS_W / 2)      // output hop, always half the window
+// Default RUNTIME window (must be a power of two, <= SS_W). SS_W is only the
+// buffer MAX; the instrument boots at this size and the frame-size control moves
+// off it. This is SEPARATE from SS_W on purpose: the host tests and the firmware
+// must agree on the boot window, and when SS_W == default was true they were
+// coupled by accident. Keep this in sync with FRAME_DEFAULT_IDX in dreamosc.cpp
+// (a static_assert there guards it). 4096 = the settled default character.
+#ifndef SS_W_DEFAULT
+#define SS_W_DEFAULT 4096
+#endif
+#define SS_H (SS_W / 2)      // output hop, always half the window (MAX geometry)
 // Per-voice lookahead FIFO, power of two. Must be several hops deep so the main
 // loop can stay well ahead of the audio callback; at exactly SS_W (2 hops) the
 // ring could drain to empty between refills and momentarily starve the callback.
@@ -105,16 +123,18 @@ struct StretchTables {
   float synthGain;           // PaulXStretch synthesis output gain (per active W)
   // Active analysis window, runtime-adjustable (#136). SS_W is the buffer max;
   // activeW is the window actually used, <= SS_W, power of two. The DSP reads
-  // these, never the SS_W/SS_H macros, so frame size is a live control.
-  int   activeW = SS_W;
-  int   activeH = SS_W / 2;
+  // these, never the SS_W/SS_H macros, so frame size is a live control. Defaults
+  // to SS_W_DEFAULT (the boot window), NOT SS_W (the buffer max) -- host and
+  // firmware must boot at the same window.
+  int   activeW = SS_W_DEFAULT;
+  int   activeH = SS_W_DEFAULT / 2;
   int   activePasses = 0;    // log2(activeW), the arg ShyFFT's runtime path wants
 
   void init() {
     fft.Init();
     for (int i = 0; i < 1024; i++)
       sinLut[i] = sinf(2.0f * (float)M_PI * i / 1024.0f);
-    setWindow(SS_W);         // build the window + gain for the default size
+    setWindow(SS_W_DEFAULT);  // build the window + gain for the default size
   }
 
   // Set the active analysis window to `w` (power of two, 64..SS_W). Recomputes
@@ -456,8 +476,9 @@ class Sequencer {
   // grainy/articulated, large = glassy/frozen PaulStretch. Power of two, 64..
   // SS_W. Applied to gTab (the shared FFT/window) via setFrame(); new voices
   // snapshot it at start(), so a change takes effect on the next fire. Default
-  // = SS_W (the buffer max), so untouched behavior is identical to before.
-  int frameSize = SS_W;
+  // = SS_W_DEFAULT (the boot window), NOT SS_W (the buffer max) -- host and
+  // firmware boot at the same window.
+  int frameSize = SS_W_DEFAULT;
 
   // Push frameSize into the shared tables (recomputes window + gain for w).
   // Call from the control layer when the frame-size control moves. Cheap.

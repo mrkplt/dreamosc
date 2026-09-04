@@ -16,8 +16,15 @@ using namespace daisy;
 
 // --- the globals stretch_core.h externs ------------------------------------
 StretchTables gTab;
-float         gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
-float         gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
+// FFT scratch. At SS_W 16384 these are 64 KB each; together with gTab.window they
+// overflow the 128 KB DTCM the default .bss lives in. They are PLAIN float arrays
+// (no constructor), so DSY_SDRAM_BSS is safe (the "no constructed objects in
+// SDRAM" rule is about ctors/zeroing, not plain data). SDRAM is slower per
+// access and the per-frame FFT hits these hard -- verify avg_us on the bench
+// (make PROFILE=1) at the largest window; that CPU headroom is the open risk of
+// the big-window change.
+float DSY_SDRAM_BSS gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
+float DSY_SDRAM_BSS gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
 
 // #129 diagnostic: incremented in Voice::next() when a head's ring is empty
 // (starved). led1 latches red if this ever moves — tells us on-device whether
@@ -177,14 +184,23 @@ static const int STRETCH_NSTOPS =
 static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
 
 // Frame/window size stops (#136): powers of two up to SS_W (the compile-time
-// buffer max). Smaller = grainier/more articulated, larger = glassy/frozen.
-// Encoder page PAGE_FRAME indexes this; the value goes to seq.setFrame().
-// LARGEST FIRST (idx 0 = SS_W, the default): a clockwise detent (inc +1) walks
-// toward SMALLER windows, so turning right shrinks the frame.
-static const int FRAME_STOPS[] = { 4096, 2048, 1024, 512, 256 };
-static const int FRAME_NSTOPS =
+// buffer max, now 16384 ~ 0.34 s -- PaulXStretch's shimmer regime). Smaller =
+// grainier/more articulated/wobbly on tonal material; larger = glassy/frozen
+// shimmer. Encoder page PAGE_FRAME indexes this; the value goes to seq.setFrame().
+// LARGEST FIRST (idx 0 = SS_W): a clockwise detent (inc +1) walks toward SMALLER
+// windows, so turning right shrinks the frame. The DEFAULT is 4096 (not the max,
+// FRAME_DEFAULT_IDX), so CW from default shrinks and CCW grows toward the big
+// shimmer windows.
+static constexpr int FRAME_STOPS[] = { 16384, 8192, 4096, 2048, 1024, 512, 256 };
+static constexpr int FRAME_NSTOPS =
     (int)(sizeof(FRAME_STOPS) / sizeof(FRAME_STOPS[0]));
-static int frameIdx = 0;   // start at SS_W (4096), the default (largest window)
+static constexpr int FRAME_DEFAULT_IDX = 2;  // 4096, the default window (not max)
+static int frameIdx = FRAME_DEFAULT_IDX;
+// The window the firmware boots at MUST equal the core's default (SS_W_DEFAULT),
+// or host tests and the device would run different windows -- the exact drift
+// that silently ran the whole host suite at 16384 once SS_W != default.
+static_assert(FRAME_STOPS[FRAME_DEFAULT_IDX] == SS_W_DEFAULT,
+              "FRAME_DEFAULT_IDX must select the core's SS_W_DEFAULT window");
 
 // Knob smoothing state (the smoothing math is smoothKnob() in controls_core.h).
 static float knobSmooth[2] = {0.0f, 0.0f};
@@ -330,6 +346,10 @@ int main(void) {
   seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
+  // SS_W is now the 16384 MAX, but the default window is 4096 (FRAME_DEFAULT_IDX)
+  // -- set it explicitly so gTab + seq start at 4096, not the max. The window
+  // page grows it toward the shimmer regime or shrinks it from here.
+  seq.setFrame(FRAME_STOPS[frameIdx]);
 
   pod.StartAdc();
   pod.StartAudio(AudioCallback);

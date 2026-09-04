@@ -352,17 +352,26 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   "is this working?" by ear or by theory wasted whole sessions; a value on the
   serial line settles it in one glance. No new parameter is done until it's
   visible in `make PROFILE=1`.
-- **Memory.** `SS_W = 4096` is the compile-time buffer MAX (the runtime window is
-  ≤ this — frame-size control). Per Voice: `old_[SS_W]` + `ring_[2*SS_W]` +
-  `win_[SS_W]` = 64 KB (`win_` is the voice's own snapshot of the analysis window
-  curve, so a live frame-size change can't corrupt a sounding voice — the
-  fast-scroll noise bug);
-  `SS_MAX_VOICES = 2*SS_STEPS = 16` slots (a voice's tail outlives the re-fire
-  period, so slots must exceed SS_STEPS or steps drop) → the voice pool (~1 MB)
-  lives in **SDRAM** (`headPool`, a plain float array `init()` carves + memsets),
-  as does the **source buffer (~1.9 MB)**. The `Sequencer` OBJECT stays in
-  internal SRAM (~19% full). The crossfade model caps CONCURRENT sounding heads at
-  2, so CPU is comfortable even though 16 slots exist.
+- **Memory.** `SS_W = 16384` is the compile-time buffer MAX (~0.34 s at 48 kHz,
+  PaulXStretch's shimmer regime, #136); the runtime window is ≤ this (frame-size
+  control) and **defaults to 4096** (`FRAME_DEFAULT_IDX`). Per Voice: `old_[SS_W]`
+  + `ring_[2*SS_W]` + `win_[SS_W]` = 256 KB (`win_` is the voice's own snapshot of
+  the analysis window curve, so a live frame-size change can't corrupt a sounding
+  voice — the fast-scroll noise bug); `SS_MAX_VOICES = 2*SS_STEPS = 16` slots (a
+  voice's tail outlives the re-fire period, so slots must exceed SS_STEPS or steps
+  drop) → the voice pool (~4 MB) lives in **SDRAM** (a plain float array `init()`
+  carves + memsets), as does the **source buffer (~1.9 MB)**.
+  - **The FFT scratch (`gWork`, `gSpec`, 64 KB each at SS_W 16384) also lives in
+    SDRAM** (`DSY_SDRAM_BSS`): with `gTab.window[SS_W]` they overflow the 128 KB
+    DTCM the default `.bss` uses. They are plain arrays (no ctor), so SDRAM is
+    safe. SDRAM is slower and the FFT hits them per frame — **the big-window CPU
+    risk lives here; confirm `avg_us`/`du` on the bench** (`make PROFILE=1`).
+  - The `Sequencer` OBJECT + `gTab` stay in internal RAM. **DTCM is ~94% full**
+    at SS_W 16384 (`gTab.window` is 64 KB there) — little headroom left for new
+    DTCM/`.bss` globals; put big new buffers in SDRAM. The crossfade model caps
+    CONCURRENT sounding heads at 2, so CPU should stay in budget even with 16
+    slots — but that is now a bench-verified claim at the largest window, not a
+    given.
 - **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
   is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
   NEITHER their constructor run NOR their storage zeroed — they boot with garbage

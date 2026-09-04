@@ -491,9 +491,11 @@ TEST_CASE("setWindow: window + gain recompute for each frame size") {
     REQUIRE((1 << gTab.activePasses) == w);          // passes = log2(w)
     REQUIRE(std::isfinite(gTab.synthGain));
     REQUIRE(gTab.synthGain > 0.0f);
-    // window is a raised (1-x^2)^1.25 curve: 0 at the edges, 1 at the center.
-    REQUIRE(gTab.window[0] == Approx(0.0f).margin(1e-3));
-    REQUIRE(gTab.window[w / 2] == Approx(1.0f).margin(1e-2));
+    // gWindow is a raised (1-x^2)^1.25 curve: 0 at the edges, 1 at the center.
+    // (Split out of StretchTables into a global so the device can place it in
+    // AXI SRAM; setWindow builds it.)
+    REQUIRE(gWindow[0] == Approx(0.0f).margin(1e-3));
+    REQUIRE(gWindow[w / 2] == Approx(1.0f).margin(1e-2));
   }
   gTab.setWindow(SS_W);   // restore default for other tests
 }
@@ -522,7 +524,7 @@ TEST_CASE("renders cleanly at every frame size") {
 TEST_CASE("changing frame size mid-render does not corrupt a sounding voice") {
   // Regression: voices snapshot the frame SIZE at start() but used to read the
   // shared window curve + synthGain LIVE. A setFrame() while a voice was mid-
-  // render rebuilt gTab.window/synthGain for a NEW size, so the sounding voice
+  // render rebuilt gWindow/synthGain for a NEW size, so the sounding voice
   // multiplied its w_-sample frame by a curve/gain built for a different size --
   // a volume jump + broadband noise on every fast frame-size scroll (heard on
   // the bench). The fix snapshots the window curve + gain per voice at start().
@@ -542,7 +544,7 @@ TEST_CASE("changing frame size mid-render does not corrupt a sounding voice") {
     // Change the frame size aggressively mid-flight (every ~1/64 of the pattern),
     // exactly the fast-scroll case that exposed the bug. A voice that snapshots
     // its window at start() renders self-consistently through all of these; a
-    // voice reading the shared window LIVE would index gTab.window[] past the
+    // voice reading the shared window LIVE would index gWindow[] past the
     // just-rebuilt (smaller) size and scale by a mismatched gain.
     if (n % (total / 64 + 1) == 0) { seq.setFrame(sizes[si % 6]); si++; }
     for (int g = 0; g < 64 && seq.service(); g++) {}

@@ -36,16 +36,34 @@ ifdef PROFILE
 C_DEFS += -DPROFILE
 endif
 
+# Linker script: OURS, not libDaisy's. dreamosc.lds began as a copy of
+# libDaisy/core/STM32H750IB_sram.lds (a starter template -- linker scripts are
+# project-owned on STM32) and adds an .axisram_bss section. Set LDSCRIPT before
+# the include below: libDaisy's core Makefile uses `LDSCRIPT ?=`, so this wins.
+# (If APP_TYPE ever changes off BOOT_SRAM, re-base this from the matching stock
+# .lds.)
+LDSCRIPT = dreamosc.lds
+
 # Core location, and generic Makefile.
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile
 
-.PHONY: vendor vendor-check
+.PHONY: vendor vendor-check deps deps-check
 vendor:
 	$(VENDOR_DIR)/fetch.sh
 
 vendor-check:
 	$(VENDOR_DIR)/fetch.sh --check
+
+# Pinned build dependencies (whole repos: libDaisy, DaisySP). deps/manifest.txt
+# records the exact SHA; `make deps` clones/checks-them-out, `make deps-check`
+# gates that the working clones haven't drifted (used by test/run.sh).
+DEPS_DIR = ../deps
+deps:
+	$(DEPS_DIR)/setup.sh
+
+deps-check:
+	$(DEPS_DIR)/setup.sh --check
 
 # Fetch vendored sources automatically if missing, so a fresh clone builds
 # without a separate manual step.

@@ -14,6 +14,7 @@
 inline StretchTables gTab;
 inline float         gWork[SS_W];
 inline float         gSpec[SS_W];
+inline float         gWindow[SS_W];   // analysis window curve (AXI SRAM on device)
 inline volatile uint32_t gUnderruns = 0;   // diagnostic counter (see Voice::next)
 
 namespace testutil {

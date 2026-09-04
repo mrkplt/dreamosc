@@ -14,17 +14,30 @@
 
 using namespace daisy;
 
+// Place a plain (no-constructor) global in the AXI SRAM (D1, fast + L1-cacheable)
+// via our own linker script's .axisram_bss section (dreamosc.lds). This is the
+// region ST designates for large hot working sets that outgrow DTCM -- see
+// hardware_spec.md. NOLOAD, so it is runtime-zeroed by our own memset, NOT the
+// C runtime; only plain data, never constructed C++ objects.
+#define AXISRAM_DATA __attribute__((section(".axisram_bss")))
+
 // --- the globals stretch_core.h externs ------------------------------------
 StretchTables gTab;
-// FFT scratch. At SS_W 16384 these are 64 KB each; together with gTab.window they
-// overflow the 128 KB DTCM the default .bss lives in. They are PLAIN float arrays
-// (no constructor), so DSY_SDRAM_BSS is safe (the "no constructed objects in
-// SDRAM" rule is about ctors/zeroing, not plain data). SDRAM is slower per
-// access and the per-frame FFT hits these hard -- verify avg_us on the bench
-// (make PROFILE=1) at the largest window; that CPU headroom is the open risk of
-// the big-window change.
-float DSY_SDRAM_BSS gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
-float DSY_SDRAM_BSS gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
+// FFT scratch. At SS_W 16384 these are 64 KB each -- too big for DTCM alongside
+// gWindow. They are PLAIN float arrays hit HARD by the per-frame FFT, so they
+// go in AXI SRAM (fast + cacheable), NOT external SDRAM: the AXI region is what ST
+// intends for exactly this (large fast working set). ShyFFT zero-fills them each
+// pass, so NOLOAD is fine. (Earlier they were in DSY_SDRAM_BSS as a stopgap when
+// the stock linker script had no AXI-SRAM section; owning dreamosc.lds fixed that.)
+float AXISRAM_DATA gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
+float AXISRAM_DATA gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
+// The analysis window curve (64 KB at SS_W 16384). A plain global (extern'd by
+// stretch_core.h) so it can live in AXI SRAM instead of crowding DTCM inside the
+// gTab object -- it was the single 64 KB member pinning DTCM at 94%. StretchTables
+// builds it in setWindow(); voices snapshot from it. NOLOAD, so setWindow's own
+// writes are the only init it needs (never read before a setWindow, which init()
+// calls at boot).
+float AXISRAM_DATA gWindow[SS_W];
 
 // #129 diagnostic: incremented in Voice::next() when a head's ring is empty
 // (starved). led1 latches red if this ever moves — tells us on-device whether

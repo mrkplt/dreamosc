@@ -8,6 +8,23 @@ phase-randomized sound from a named point in the stretch and fades into the next
 Read `archive/stretchsequencerspec.md` for the full design. It is the source of
 truth for behavior.
 
+## Build it right — no shortcuts
+
+**Invasive is fine if it's performant. We build good code; we do not take
+shortcuts.** When the correct change is a wider refactor — restructuring a struct,
+owning a linker script, splitting a global out to place it in the right memory —
+do the wider refactor rather than a quick hack that leaves the codebase worse.
+Prefer correctness and clarity over the smallest diff.
+
+Two corollaries this project keeps proving:
+- **Safe by construction, not by luck.** Don't rely on "the current callers
+  happen to write before they read" or ".bss zeros it for us." Make the invariant
+  hold by the code's structure, and say *why* it holds.
+- **A build that links + host-tests green is NOT a proven win.** A performance or
+  sound change is a hypothesis until the bench confirms it (see the tag
+  discipline). State what's correct-by-design vs what still needs measuring;
+  never claim a speedup you haven't measured.
+
 ## Surface bugs — do NOT silently fix them
 
 **This is an audio instrument, and every change can alter the character of the
@@ -127,14 +144,33 @@ polyphony.
 The DSP core (`stretch_core.h`, `shy_fft.h`) has no platform dependencies and is
 shared verbatim between host and device.
 
-## Dependencies (cloned, gitignored — re-fetch if missing)
+## Dependencies (cloned, gitignored, but PINNED)
+
+libDaisy and DaisySP are whole repos we build against, cloned beside the project
+and gitignored. They are **pinned to exact SHAs in `deps/manifest.txt`** — a fresh
+clone or a stray `git pull` inside them would otherwise change the toolchain
+(drivers, HAL, linker template) under us silently. `deps/setup.sh` clones/checks
+them out to the pinned SHAs; `make deps-check` gates that the working clones
+haven't drifted.
 
 ```
 cd ~/src/dreamosc
-git clone --recursive https://github.com/electro-smith/libDaisy.git
-git clone --recursive https://github.com/electro-smith/DaisySP.git
-make -C libDaisy && make -C DaisySP        # build the static libs once
+make -C dreamosc deps                       # clone + checkout libDaisy/DaisySP at pinned SHAs
+make -C libDaisy && make -C DaisySP         # build the static libs once
+make -C dreamosc deps-check                 # verify the clones are at the pins (build gate)
 ```
+
+To take a newer upstream: bump the SHA in `deps/manifest.txt`, `make deps`,
+rebuild the libs, re-verify on hardware. A libDaisy bump is a real change, not a
+refresh. (This is the REPO-level analogue of `vendor/manifest.txt`, which pins
+individual third-party FILES like `shy_fft.h`.)
+
+**The linker script is OURS, not libDaisy's.** `dreamosc/dreamosc.lds` began as a
+copy of libDaisy's default `core/STM32H750IB_sram.lds` (a starter template —
+linker scripts are project-owned on STM32) and the Makefile points `LDSCRIPT` at
+it. We edit it freely (e.g. the `.axisram_bss` section that puts hot buffers in
+AXI SRAM); we do NOT re-pull libDaisy's copy. If `APP_TYPE` ever moves off
+`BOOT_SRAM`, re-base `dreamosc.lds` from the matching stock `.lds`.
 
 ## Layout
 
@@ -352,6 +388,11 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   "is this working?" by ear or by theory wasted whole sessions; a value on the
   serial line settles it in one glance. No new parameter is done until it's
   visible in `make PROFILE=1`.
+- **Hardware ground truth → `dreamosc/hardware_spec.md`.** The real, unchanging
+  specs (STM32H750 clock/cache/RAM regions and what each region is *designed*
+  for, the Daisy's 64 MB SDRAM / 8 MB QSPI / codec, board-revision caveats) live
+  there with citations. Read it before reasoning about memory placement or CPU
+  budget — the correctness of where we put buffers is judged against that doc.
 - **Memory.** `SS_W = 16384` is the compile-time buffer MAX (~0.34 s at 48 kHz,
   PaulXStretch's shimmer regime, #136); the runtime window is ≤ this (frame-size
   control) and **defaults to 4096** (`FRAME_DEFAULT_IDX`). Per Voice: `old_[SS_W]`
@@ -361,17 +402,28 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   voice's tail outlives the re-fire period, so slots must exceed SS_STEPS or steps
   drop) → the voice pool (~4 MB) lives in **SDRAM** (a plain float array `init()`
   carves + memsets), as does the **source buffer (~1.9 MB)**.
-  - **The FFT scratch (`gWork`, `gSpec`, 64 KB each at SS_W 16384) also lives in
-    SDRAM** (`DSY_SDRAM_BSS`): with `gTab.window[SS_W]` they overflow the 128 KB
-    DTCM the default `.bss` uses. They are plain arrays (no ctor), so SDRAM is
-    safe. SDRAM is slower and the FFT hits them per frame — **the big-window CPU
-    risk lives here; confirm `avg_us`/`du` on the bench** (`make PROFILE=1`).
-  - The `Sequencer` OBJECT + `gTab` stay in internal RAM. **DTCM is ~94% full**
-    at SS_W 16384 (`gTab.window` is 64 KB there) — little headroom left for new
-    DTCM/`.bss` globals; put big new buffers in SDRAM. The crossfade model caps
-    CONCURRENT sounding heads at 2, so CPU should stay in budget even with 16
-    slots — but that is now a bench-verified claim at the largest window, not a
-    given.
+  - **The three hot FFT buffers — `gWork`, `gSpec`, and `gWindow` (64 KB each at
+    SS_W 16384) — live in AXI SRAM** (`AXISRAM_DATA` → the `.axisram_bss` section
+    in our `dreamosc.lds`). AXI SRAM (D1, 480 KB, ~59% used) is fast +
+    L1-cacheable — the region ST designates for large hot working sets that
+    outgrow DTCM (see `hardware_spec.md`). The per-frame FFT hits these hard, so
+    they belong in the fast tier, NOT external SDRAM. (They were briefly in
+    `DSY_SDRAM_BSS` as a stopgap when we still used libDaisy's stock linker
+    script, which had no AXI-SRAM bss section; owning `dreamosc.lds` fixed that.)
+    `gWindow` was split out of the `StretchTables` object into a plain global
+    exactly so it could be placed here — the invasive-but-correct move, not a
+    hack. **Safe by construction:** every access is bounded by `activeW`/`w_`
+    (audited), and `setWindow()`/the FFT always write before any read, so NOLOAD
+    (no `.bss` zeroing) is fine — nothing relies on zero-init.
+    **NOTE:** this placement is *correct per ST's guidance*, but the speedup over
+    SDRAM is NOT yet measured — confirm it on the bench (`avg_us` at 16384, AXI
+    vs the old SDRAM build) before claiming a win.
+  - The `Sequencer` OBJECT + `gTab` stay in internal RAM. Moving `gWindow` out
+    dropped **DTCM from ~94% to ~44%** — healthy headroom restored; `gTab` now
+    holds only the FFT twiddles + sinLut, not the 64 KB window LUT. The crossfade
+    model caps CONCURRENT sounding heads at 2, so CPU should stay in budget even
+    with 16 slots — but that is a bench-verified claim at the largest window, not
+    a given: confirm `avg_us`/`du` under `make PROFILE=1` at 16384.
 - **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
   is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
   NEITHER their constructor run NOR their storage zeroed — they boot with garbage

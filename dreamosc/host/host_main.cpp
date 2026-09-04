@@ -24,6 +24,7 @@
 StretchTables gTab;
 float         gWork[SS_W];
 float         gSpec[SS_W];
+float         gWindow[SS_W];
 volatile uint32_t gUnderruns = 0;   // diagnostic counter (see Voice::next)
 
 // --- minimal 16-bit PCM WAV I/O (mono/stereo), matching stretchseq.py -------

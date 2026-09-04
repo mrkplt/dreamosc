@@ -1,0 +1,21 @@
+# Pinned build DEPENDENCIES (whole cloned repos we compile against).
+#
+# These are distinct from vendor/manifest.txt: that pins individual third-party
+# FILES copied into our tree (shy_fft.h); this pins whole REPOS we clone beside
+# the project (libDaisy, DaisySP) and build static libs from. They are gitignored
+# (see /.gitignore) -- not committed -- so without a pin a fresh clone or a stray
+# `git pull` inside them silently changes the toolchain under us. deps/setup.sh
+# checks the working clones are at these SHAs (a build gate) and can check them
+# out.
+#
+# Format: <name> <repo-url> <sha> <dir>
+#
+# Rules:
+#   - Pin an exact SHA, never a branch -- reproducible + auditable.
+#   - To take a newer upstream: update the SHA here, run `make deps` (or
+#     deps/setup.sh), rebuild the libs, and re-verify on hardware. libDaisy is
+#     load-bearing (drivers, linker template, HAL); a bump is a real change.
+#   - The comment after each line is the `git describe` at pin time, for humans.
+
+libdaisy https://github.com/electro-smith/libDaisy.git cc146d5065dd8286078a662e2830bf820c37a612 libDaisy   # v8.1.0-15-gcc146d50
+daisysp  https://github.com/electro-smith/DaisySP.git  599511b740f8f3a9b8db72a0642aa45b8a23c3a3 DaisySP    # V1.0.0-25-g599511b

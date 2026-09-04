@@ -68,7 +68,7 @@ using stmlib::RotationPhasor;
 #define SS_MAX_VOICES (2 * SS_STEPS)
 // Per-voice scratch: old_ (SS_W) + ring_ (SS_RING) + win_ (SS_W). win_ is this
 // voice's OWN snapshot of the analysis window curve, copied at start() so a live
-// frame-size change (setWindow rebuilding the shared gTab.window) can never
+// frame-size change (setWindow rebuilding the shared gWindow) can never
 // corrupt a sounding voice's render -- the fast-scroll volume-jump / white-noise
 // bug. The caller allocates SS_POOL_FLOATS floats and passes them to
 // Sequencer::init(); at SS_W 4096 that is SS_MAX_VOICES * 64 KB, in SDRAM.
@@ -116,9 +116,16 @@ typedef ShyFFT<float, SS_W, RotationPhasor> SSFFT;
 // Integer log2 of a power of two.
 inline int ssLog2(int n) { int p = 0; while ((1 << p) < n) p++; return p; }
 
+// The Nasca (1-x^2)^1.25 analysis window curve, over activeW points. A separate
+// GLOBAL rather than a StretchTables member so the device can place it in AXI
+// SRAM (fast + cacheable) via AXISRAM_DATA -- 64 KB at SS_W 16384, too big to
+// keep crowding DTCM. StretchTables (a constructed object) stays in DTCM; only
+// this plain array moves. Defined by the platform (dreamosc.cpp / test_support.h)
+// alongside gWork/gSpec.
+extern float gWindow[SS_W];
+
 struct StretchTables {
   SSFFT fft;
-  float window[SS_W];        // (1 - x^2)^1.25, Nasca's curve, over activeW points
   float sinLut[1024];
   float synthGain;           // PaulXStretch synthesis output gain (per active W)
   // Active analysis window, runtime-adjustable (#136). SS_W is the buffer max;
@@ -149,13 +156,13 @@ struct StretchTables {
     activePasses = ssLog2(w);
     for (int i = 0; i < w; i++) {
       float x = -1.0f + 2.0f * i / (w - 1);
-      window[i] = powf(1.0f - x * x, 1.25f);
+      gWindow[i] = powf(1.0f - x * x, 1.25f);
     }
     // ShyFFT Direct+Inverse multiplies by w; 1/w undoes it. The window
     // attenuates the input by its mean, so dividing by mean(window) restores
     // unity-ish gain through the pipeline (the unit-gain test checks this).
     float wsum = 0.0f;
-    for (int i = 0; i < w; i++) wsum += window[i];
+    for (int i = 0; i < w; i++) wsum += gWindow[i];
     synthGain = 1.0f / ((wsum / (float)w) * (float)w);
   }
 
@@ -175,6 +182,8 @@ struct StretchTables {
 extern StretchTables gTab;
 extern float gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
 extern float gSpec[SS_W];   // split spectrum: real in [0,W/2), imag in [W/2,W)
+// gWindow declared above StretchTables (setWindow builds it); defined by the
+// platform alongside gWork/gSpec, placed in AXI SRAM on device.
 
 // ---------------------------------------------------------------------------
 // The source. A plain buffer plus its length; reads wrap, so every position is
@@ -243,11 +252,11 @@ class Voice {
     passes_ = gTab.activePasses;
     // Snapshot the window CURVE and synthGain too, not just the size. renderFrame
     // and emitHop must read THIS voice's frozen copy: a live setWindow() (frame-
-    // size control) rebuilds the shared gTab.window/synthGain for a new size, and
+    // size control) rebuilds the shared gWindow/synthGain for a new size, and
     // if a sounding voice read them live it would multiply its w_-sample frame by
     // a curve/gain built for a different size -- a volume jump + broadband noise
     // on every fast frame-size scroll (measured on the bench).
-    memcpy(win_, gTab.window, w_ * sizeof(float));
+    memcpy(win_, gWindow, w_ * sizeof(float));
     synthGain_ = gTab.synthGain;
     out_ = 0;
     produced_ = 0;

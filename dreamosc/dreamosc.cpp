@@ -1,11 +1,12 @@
 // dreamosc.cpp - Daisy Pod firmware for the Stretch Sequencer.
 //
-// Defines the globals stretch_core.h externs, initializes the FFT tables, runs
-// Sequencer::next() in the audio callback and Sequencer::service() in the main
-// loop. #155 (persistent-head): the Sequencer is a robotic read clock over 8
-// persistent per-step synthesis heads; each head keeps its own demand-cushion
-// ring full from the main loop. The head buffer pool (SS_POOL_FLOATS) lives in
-// SDRAM; the Sequencer OBJECT (heads' atomics) stays in internal SRAM.
+// Defines the globals stretch_core.h externs, initializes the tables, runs
+// Sequencer::render() in the audio callback and Sequencer::service() in the
+// main loop. Frame model: the ISR blends straight out of each head's frame
+// buffers and rotates them at hop boundaries; the main loop renders staged
+// frames earliest-deadline-first. The head pool (SS_POOL_FLOATS) and the
+// immutable window/blend tables live in SDRAM; the Sequencer OBJECT (atomics)
+// stays in internal SRAM.
 
 #include "daisy_pod.h"
 #include "stretch_core.h"
@@ -22,36 +23,45 @@ using namespace daisy;
 
 // --- the globals stretch_core.h externs ------------------------------------
 StretchTables gTab;
-// FFT scratch. At SS_W 16384 these are 64 KB each -- too big for DTCM alongside
-// gWindow. They are PLAIN float arrays hit HARD by the per-frame FFT, so they
+// FFT scratch. At SS_W 16384 these are 64 KB each -- too big for DTCM. They
+// are PLAIN float arrays hit HARD by the per-frame FFT, so they
 // go in AXI SRAM (fast + cacheable), NOT external SDRAM: the AXI region is what ST
 // intends for exactly this (large fast working set). ShyFFT zero-fills them each
 // pass, so NOLOAD is fine. (Earlier they were in DSY_SDRAM_BSS as a stopgap when
 // the stock linker script had no AXI-SRAM section; owning dreamosc.lds fixed that.)
 float AXISRAM_DATA gWork[SS_W];   // windowed frame; ShyFFT::Direct destroys its input
 float AXISRAM_DATA gSpec[SS_W];   // split spectrum: real [0,W/2), imag [W/2,W)
-// The analysis window curve (64 KB at SS_W 16384). A plain global (extern'd by
-// stretch_core.h) so it can live in AXI SRAM instead of crowding DTCM inside the
-// gTab object -- it was the single 64 KB member pinning DTCM at 94%. StretchTables
-// builds it in setWindow(); voices snapshot from it. NOLOAD, so setWindow's own
-// writes are the only init it needs (never read before a setWindow, which init()
-// calls at boot).
-float AXISRAM_DATA gWindow[SS_W];
+// Immutable tables: the seven analysis windows (~127 KB) and the per-hop blend
+// and AM-correction curves (~64 KB each). Written once by gTab.init() after
+// SDRAM is powered, read sequentially (cached) by renders and the ISR, and
+// never rewritten -- so a live frame-size change cannot race a render. Plain
+// arrays in NOLOAD SDRAM, never constructed objects (CLAUDE.md #129).
+float DSY_SDRAM_BSS gWindows[SS_WIN_FLOATS];
+float DSY_SDRAM_BSS gBlendA[SS_HOP_FLOATS];
+float DSY_SDRAM_BSS gBlendC[SS_HOP_FLOATS];
 
-// #129 diagnostic: incremented in Voice::next() when a head's ring is empty
-// (starved). led1 latches red if this ever moves — tells us on-device whether
-// the boundary artifact is a buffer underrun vs. a DSP/splice issue.
+// Frame HOLDS: a head reached its hop boundary with no staged frame and
+// repeated its current frame (spectrally the same, never silent). The one
+// number that says the producer fell behind. Printed as `du` in PROFILE.
 volatile uint32_t gUnderruns = 0;
 
 #ifdef PROFILE
 // `make PROFILE=1`: per-second CPU accounting over USB serial. Read it with
 //   screen /dev/tty.usbmodem<tab> 115200
-// HLTH fields: act (active voices), units (service() calls that did work),
-// svc_us (main-loop DSP us that second), avg_us (per unit), max_us (WORST single
-// service call -- the burst that avg_us hides; watch this at SS_W 16384), isr_us
-// (audio-callback us that second), du (underruns that second), stk (deepest stack
-// use seen, bytes -- a hang at 16384 with du=0 points here, not at CPU).
-static volatile uint32_t profIsrUs = 0;
+// HLTH fields: act (gated step heads), rng (ringing heads), arm (armed heads),
+// units (service() calls that rendered), svc_us (main-loop DSP us that second),
+// avg_us (per unit), max_us (WORST single render), isr_us (audio-callback us
+// that second), du (frame holds that second), late (samples a seam waited for
+// its incoming head), rfr (control-driven re-renders), slack (min samples to
+// deadline at render start, signed), cost (per-size render cost estimate in
+// samples, 16384 down to 256), stk (deepest stack use seen, bytes).
+//
+// Timing is done in raw TIM2 ticks (System::GetTick) and converted per delta,
+// because System::GetUs() wraps every 2^32/200e6 = 21.5 s and a delta across
+// the wrap reads ~4.27e9 (the "32-bit wrap" in the old OPEN_ISSUES.md).
+static volatile uint32_t profIsrTicks = 0;
+static uint32_t profTicksPerUs = 1;
+static inline uint32_t profUs(uint32_t ticks) { return ticks / profTicksPerUs; }
 
 // Deepest stack use observed (bytes below _estack). The stack grows down from
 // _estack (top of DTCM); sampling MSP each main-loop pass and keeping the minimum
@@ -95,14 +105,13 @@ static float DSY_SDRAM_BSS sourceBuf[SOURCE_LEN];
 // their big buffers (the pool below) go to SDRAM.
 static Sequencer seq;
 
-// Per-head working buffers (4 frame buffers + ring + window snapshot per head)
-// live in SDRAM: far too big for the 512 KB internal SRAM. At SS_W 16384 that is
-// SS_STEPS * (4*16384 + 1024 + 16384) floats ~= 2.5 MB. A plain array, NOT an
-// object -- .sdram_bss is NOLOAD and SDRAM is unpowered at static-init time, so
+// Per-head frame buffers (SS_FRAME_BUFS per head, each SS_W floats) live in
+// SDRAM: SS_HEADS * 6 * 16384 floats ~= 3.9 MB. A plain array, NOT an object --
+// .sdram_bss is NOLOAD and SDRAM is unpowered at static-init time, so
 // constructors never run and storage is not zeroed there. Sequencer::init()
-// carves this up and hands each Head a slice (Head::init memsets its ring/window
-// so NOLOAD garbage never reaches the output); the Head objects themselves stay
-// in SRAM where C++ works normally.
+// carves this up and hands each Head a slice; a frame buffer is always fully
+// written by a render before the ISR can reference it, so NOLOAD garbage never
+// reaches the output. The Head objects themselves stay in SRAM.
 static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
@@ -216,10 +225,12 @@ static const int STRETCH_NSTOPS =
     (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 56
 static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
 
-// Frame/window size stops (#136): powers of two up to SS_W (the compile-time
-// buffer max, now 16384 ~ 0.34 s -- PaulXStretch's shimmer regime). Smaller =
-// grainier/more articulated/wobbly on tonal material; larger = glassy/frozen
-// shimmer. Encoder page PAGE_FRAME indexes this; the value goes to seq.setFrame().
+// Frame/window size stops (#136): powers of two from SS_W (16384 ~ 0.34 s,
+// PaulXStretch's shimmer regime) down to SS_W_MIN. Smaller = grainier/more
+// articulated/wobbly on tonal material; larger = glassy/frozen shimmer. Encoder
+// page PAGE_FRAME indexes this; the value goes to seq.setFrame(), which is LIVE:
+// every sounding head re-renders a pre-roll pair at the new size for its next
+// hop boundary.
 // LARGEST FIRST (idx 0 = SS_W): a clockwise detent (inc +1) walks toward SMALLER
 // windows, so turning right shrinks the frame. The DEFAULT is 4096 (not the max,
 // FRAME_DEFAULT_IDX), so CW from default shrinks and CCW grows toward the big
@@ -234,6 +245,15 @@ static int frameIdx = FRAME_DEFAULT_IDX;
 // that silently ran the whole host suite at 16384 once SS_W != default.
 static_assert(FRAME_STOPS[FRAME_DEFAULT_IDX] == SS_W_DEFAULT,
               "FRAME_DEFAULT_IDX must select the core's SS_W_DEFAULT window");
+static_assert(FRAME_NSTOPS == SS_NSIZES && FRAME_STOPS[FRAME_NSTOPS - 1] == SS_W_MIN,
+              "FRAME_STOPS must cover exactly the core's table sizes");
+
+// Audio block size. The hop (>= 128 samples, 2048 at the default window) sets
+// the control-to-ear floor, so a tiny block buys nothing; 32 (0.67 ms) keeps
+// ISR entry overhead and jitter low and gives the main loop longer uninterrupted
+// runs for its FFTs.
+static constexpr size_t AUDIO_BLOCK = 32;
+static float monoBlock[AUDIO_BLOCK];
 
 // Knob smoothing state (the smoothing math is smoothKnob() in controls_core.h).
 static float knobSmooth[2] = {0.0f, 0.0f};
@@ -349,27 +369,35 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
   }
 #else
 #ifdef PROFILE
-  uint32_t t0 = System::GetUs();
+  uint32_t t0 = System::GetTick();
 #endif
-  for (size_t i = 0; i < size; i += 2) {
-    float s     = seq.next();
-    out[i]      = s;   // left
-    out[i + 1]  = s;   // right
+  // size is the INTERLEAVED sample count (2 * block). Render the block mono
+  // in one call (per-block constants hoisted inside), then duplicate to L/R.
+  size_t n = size / 2;
+  if (n > AUDIO_BLOCK) n = AUDIO_BLOCK;
+  seq.render(monoBlock, (int)n);
+  for (size_t i = 0; i < n; i++) {
+    out[2 * i]     = monoBlock[i];   // left
+    out[2 * i + 1] = monoBlock[i];   // right
   }
 #ifdef PROFILE
-  profIsrUs += System::GetUs() - t0;
+  profIsrTicks += System::GetTick() - t0;
 #endif
 #endif
 }
 
 int main(void) {
-  pod.Init();
-  pod.SetAudioBlockSize(4);
+  // boost = true: 480 MHz. libDaisy's default config is 400 MHz; every earlier
+  // max_us on record was taken at 400. Clock is cheap; latency is not.
+  pod.Init(true);
+  pod.SetAudioBlockSize(AUDIO_BLOCK);
 #ifdef PROFILE
   pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
+  profTicksPerUs = System::GetTickFreq() / 1000000u;
+  if (profTicksPerUs == 0) profTicksPerUs = 1;
 #endif
 
-  gTab.init();                       // ShyFFT tables + window; takes a moment
+  gTab.init();                       // ShyFFT + window/blend tables (SDRAM is up)
   src.data = sourceBuf;
   src.len  = SOURCE_LEN;
   // TEMPORARY (#132 testing): real material from QSPI so the controls can be
@@ -386,39 +414,35 @@ int main(void) {
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
   seq.ringout  = 0.0f;    // ring-out OFF by default (clean sequential instrument)
-  // SS_W is now the 16384 MAX, but the default window is 4096 (FRAME_DEFAULT_IDX)
-  // -- set it explicitly so gTab + seq start at 4096, not the max. The window
-  // page grows it toward the shimmer regime or shrinks it from here.
+  // Default window 4096 (FRAME_DEFAULT_IDX), not the 16384 max. The window page
+  // grows it toward the shimmer regime or shrinks it from here, live.
   seq.setFrame(FRAME_STOPS[frameIdx]);
 
   pod.StartAdc();
   pod.StartAudio(AudioCallback);
 
-  // Main loop: keep every voice's FIFO ahead of the audio callback, and read the
+  // Main loop: render staged frames (earliest deadline first) and read the
   // panel. Controls are polled here rather than in the audio ISR -- debouncing
   // and smoothing do not belong in an interrupt.
   // Controls poll on a WALL-CLOCK 1 ms tick, NOT every-Nth-service(): a single
-  // service() call is a full FFT (~2.4 ms at low stretch), so gating controls on
-  // a service count polled the encoder only ~6x/sec -- it missed most detents of
-  // a real spin and never saw the multi-detent bursts the fast-log branch needs.
-  // System::GetNow() is milliseconds; poll every 1 ms so a fast spin registers.
+  // service() call is one or two full FFTs, so gating controls on a service
+  // count polled the encoder only a few times a second and dropped detents.
   uint32_t lastControlMs = System::GetNow();
 #ifdef PROFILE
-  uint32_t profBusyUs = 0, profUnits = 0, profLastUnder = 0;
-  // Peak single service() duration this window. avg_us AVERAGES the FFT cost, but
-  // an underrun comes from the WORST single frame (a big-window FFT colliding with
-  // a control poll / LED update in one pass), which the average hides. This is the
-  // burst the pre-mortem flagged -- watch max_us, not just avg_us, at SS_W 16384.
-  uint32_t profMaxUs = 0;
+  uint32_t profBusyTicks = 0, profUnits = 0, profLastUnder = 0;
+  uint32_t profLastLate = 0, profLastRefresh = 0;
+  // Peak single service() duration this window: an under-fed head comes from
+  // the WORST single render, which the average hides. Watch max_us at 16384.
+  uint32_t profMaxTicks = 0;
   uint32_t profLastPrint = System::GetNow();
 #endif
   while (1) {
 #ifdef PROFILE
-    uint32_t s0 = System::GetUs();
+    uint32_t s0 = System::GetTick();
     if (seq.service()) {
-      uint32_t d = System::GetUs() - s0;
-      profBusyUs += d;
-      if (d > profMaxUs) profMaxUs = d;
+      uint32_t d = System::GetTick() - s0;   // wrap-safe in raw ticks
+      profBusyTicks += d;
+      if (d > profMaxTicks) profMaxTicks = d;
       profUnits++;
     }
     profSampleStack();   // stack high-water mark (deepest SP seen)
@@ -435,29 +459,27 @@ int main(void) {
     uint32_t now = System::GetNow();
     if (now - profLastPrint >= 1000) {
       profLastPrint = now;
-      uint32_t isr = profIsrUs;
-      profIsrUs = 0;
+      uint32_t isr = profUs(profIsrTicks);
+      profIsrTicks = 0;
       // SETTINGS line: globals + which step is selected. Integers *1000 (or
       // *100 for stretch) since nano-newlib printf can't do floats reliably.
       // gdrift_cc: global drift in units of 0.01% (hundredths of a percent) ->
       // full scale 0..300 == 0..3% drift, so the fine 0.03% grid is visible.
-      // #155: duration is now LIVE and UNQUANTIZED (no hop grid), so dur_ms IS the
-      // step length -- the old qlen_ms/intv_ms (quantized length + interval) are
-      // gone. fill/ftgt = per-head cushion depth in samples: the demand cushion is
-      // the knob-to-ear / pre-warm lead, so this is THE number to size on the
-      // bench (see the HLTH fill_min).
+      // dur_ms IS the step length (live, unquantized). hop = the sounding
+      // head's current hop in samples (frame size as actually applied), step =
+      // the step it is playing, blk = audio block.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d rel_ms=%d frame=%d steps=%d fill=%u ftgt=%u ring=%u page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d rel_ms=%d frame=%d hop=%d step=%d steps=%d blk=%u page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(globalDrift * 10000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
           (int)(seq.ringout * 1000.0f + 0.5f),   // ring-out length (ms)
-          seq.frameSize,
+          seq.frameSize,                         // requested (live control)
+          seq.curHop(),                          // applied on the sounding head
+          seq.curStep(),
           seq.activeSteps,   // active step count (#149)
-          (unsigned)seq.curFill(),      // live cushion of the sounding head
-          (unsigned)gTab.fillTarget(),  // frame-proportional top-up target
-          (unsigned)SS_RING,
+          (unsigned)AUDIO_BLOCK,
           (int)encPage,
           panel.slot());   // 0 = GLOBAL, 1..N = step
       // KNOB line: raw + smoothed knob reads (*1000) and whether pickup has
@@ -500,26 +522,35 @@ int main(void) {
           (int)(seq.drift[2]*10000+0.5f), (int)(seq.drift[3]*10000+0.5f),
           (int)(seq.drift[4]*10000+0.5f), (int)(seq.drift[5]*10000+0.5f),
           (int)(seq.drift[6]*10000+0.5f), (int)(seq.drift[7]*10000+0.5f));
-      // HEALTH line: CPU and dropout accounting for this second. act = gated
-      // (sounding) STEP heads; rmn = active ring-out remnants (#155). Total
-      // renderers (act-ish + pre-warm + rmn) are capped at SS_RENDER_CAP = 6 by
-      // ditch-oldest -- watch rmn on a fast march to see the cap hold. fmin =
-      // cushion LOW-WATER across all heads this second
-      // (samples): how close the demand cushion came to starving -- the number
-      // that says how far the fill target (now frame-proportional) can shrink. max_us = worst single
-      // service() call (the burst avg_us hides). stk = deepest stack use (bytes
-      // below _estack); a hang at 16384 with du=0 points here.
+      // HEALTH line: CPU and supply accounting for this second. act = gated
+      // step heads (sounding + incoming); rng = ringing heads; arm = armed
+      // (pre-warmed) heads. Gated heads are capped at SS_RENDER_CAP by ditching
+      // the ringing head with the least left. du = frame HOLDS (a head repeated
+      // a frame: the producer fell behind); late = samples a seam waited for an
+      // incoming head that was not ready (the step ran long, never silent);
+      // rfr = re-renders driven by control changes; slack = min samples to
+      // deadline at render start this second (negative = a render started past
+      // its boundary); cost = per-size render cost estimates in samples,
+      // 16384..256. max_us = worst single render. stk = deepest stack use.
+      uint32_t busyUs = profUs(profBusyTicks);
+      uint32_t late = seq.lateSamples(), rfr = seq.refreshes();
       pod.seed.PrintLine(
-          "HLTH act=%d rmn=%d units=%u svc_us=%u avg_us=%u max_us=%u fmin=%u isr_us=%u du=%u stk=%u",
-          seq.activeVoices(), seq.activeRemnants(),
-          (unsigned)profUnits, (unsigned)profBusyUs,
-          (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)profMaxUs,
-          (unsigned)seq.takeMinFill(),
+          "HLTH act=%d rng=%d arm=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u slack=%d cost=%u/%u/%u/%u/%u/%u/%u stk=%u",
+          seq.activeVoices(), seq.activeRemnants(), seq.armedHeads(),
+          (unsigned)profUnits, (unsigned)busyUs,
+          (unsigned)(profUnits ? busyUs / profUnits : 0), (unsigned)profUs(profMaxTicks),
           (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),
+          (unsigned)(late - profLastLate), (unsigned)(rfr - profLastRefresh),
+          (int)seq.takeMinSlack(),
+          (unsigned)seq.costSamples(0), (unsigned)seq.costSamples(1),
+          (unsigned)seq.costSamples(2), (unsigned)seq.costSamples(3),
+          (unsigned)seq.costSamples(4), (unsigned)seq.costSamples(5),
+          (unsigned)seq.costSamples(6),
           (unsigned)profStackUsed());
       profLastUnder = gUnderruns;
-      profBusyUs = profUnits = 0;
-      profMaxUs = 0;   // reset the per-window peak (stk is a running high-water)
+      profLastLate = late; profLastRefresh = rfr;
+      profBusyTicks = profUnits = 0;
+      profMaxTicks = 0;   // reset the per-window peak (stk is a running high-water)
     }
 #endif
   }

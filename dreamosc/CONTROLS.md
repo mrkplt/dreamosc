@@ -88,8 +88,14 @@ index is also the color index, so click order = ROYGB).
   WOBBLE (coarse bins beat fast). Large (up to 16384 ≈ 0.34 s) = glassy/frozen
   and turns that wobble into PaulXStretch's slow characteristic SHIMMER (fine
   bins). Default 4096; grow it (CCW) for shimmer, shrink it (CW) for grain. It is
-  now a LIVE per-head control (#155): a change reaches a sounding head in cushion
-  time, not on the next fire.
+  a LIVE control: every sounding head re-renders a pre-roll pair at the new size
+  and switches at its next hop boundary (at most one hop, plus the pair's render
+  time at 16384). The profiler's `hop` shows what the sounding head is actually
+  playing.
+- **Position and stretch are live too.** A staged frame is re-rendered when the
+  controls it was made with change (if there is slack before its deadline), so a
+  turn reaches the ear within about one hop plus the blend. Position moves the
+  SOUNDING head, not just the next visit.
 - **Duration is now LIVE and UNQUANTIZED** (#155). The step dwell is exactly
   `round(duration·sr)` samples, independent of frame size — so frame size no
   longer bends step timing (the old model quantized the dwell to the analysis-hop
@@ -98,14 +104,13 @@ index is also the color index, so click order = ROYGB).
 - **Ring-out** (Fizzy #155, #152): how long a step keeps sounding *after* the
   read head has moved on. **0 = OFF** — the clean sequential instrument (a
   departing step stops the instant the next begins; byte-identical to no
-  ring-out). Turn it up (0..16 s) and a departing step's life is handed to a
-  **remnant** that keeps rendering at **full volume** for that long, then stops
-  with a raw cut (spectral, not amplitude — no fade, like every seam). This is
-  the "enjoyable lingering tail" from #152 made a deliberate, budgeted feature:
-  a long ring-out over a fast march stacks overlapping tails, but total concurrent
-  rendering is **hard-capped at 6** (`SS_RENDER_CAP`) by **ditching the oldest**
-  remnant (the one furthest through its ring-out — least tail left to lose).
-  Watch `rmn`/`act` in `make PROFILE=1` to see the cap hold.
+  ring-out). Turn it up (0..16 s) and the departing head simply is not freed:
+  it keeps rendering at **full volume** for that long, then stops with a raw cut
+  (spectral, not amplitude — no fade, like every seam). This is the "enjoyable
+  lingering tail" from #152 made a deliberate, budgeted feature: a long ring-out
+  over a fast march stacks overlapping tails, but gated heads are **hard-capped
+  at 6** (`SS_RENDER_CAP`) by **ditching the ringing head with the least left**.
+  Watch `rng`/`act` in `make PROFILE=1` to see the cap hold.
 - **Step count** (Fizzy #149): how many of the 8 steps the sequence walks, 1..8.
   Fewer steps = a shorter, faster-repeating pattern (a real compositional
   control). The `position[]`/`drift[]` arrays stay sized to 8; only steps below
@@ -123,8 +128,9 @@ Fast = coarse step, slow = fine.
 ### Control polling
 
 Controls poll on a **1 ms wall-clock tick** (`System::GetNow()`), NOT every-Nth-
-`service()`: a `service()` call is a full FFT (~2.4 ms), so a service-count gate
-polled the encoder only ~6×/s and dropped most detents.
+`service()`: a `service()` call is one or two full FFTs (milliseconds at 4096,
+tens of ms at 16384), so a service-count gate polled the encoder only a few
+times a second and dropped most detents. Audio block is 32 samples.
 
 ## Where the logic lives
 

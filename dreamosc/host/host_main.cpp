@@ -24,8 +24,10 @@
 StretchTables gTab;
 float         gWork[SS_W];
 float         gSpec[SS_W];
-float         gWindow[SS_W];
-volatile uint32_t gUnderruns = 0;   // diagnostic counter (see Voice::next)
+float         gWindows[SS_WIN_FLOATS];
+float         gBlendA[SS_HOP_FLOATS];
+float         gBlendC[SS_HOP_FLOATS];
+volatile uint32_t gUnderruns = 0;   // frame holds (see Head::tick)
 
 // --- minimal 16-bit PCM WAV I/O (mono/stereo), matching stretchseq.py -------
 
@@ -169,8 +171,8 @@ int main(int argc, char** argv) {
   out.reserve(total);
   for (uint32_t n = 0; n < total; n++) {
     // Drain service() each sample, same discipline as the device main loop
-    // (which spins service() continuously). Pre-roll is deferred into service()
-    // now, so a freshly-triggered head is filled here before next() reads it.
+    // (which spins service() continuously): every staged frame is rendered
+    // before the callback could need it.
     for (int g = 0; g < 64 && seq.service(); g++) {}
     out.push_back(seq.next());
   }

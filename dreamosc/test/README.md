@@ -24,17 +24,20 @@ python3 -m venv ../host/.venv && ../host/.venv/bin/pip install numpy
 **1. Unit tests — `test_stretch_core.cpp` (Catch2).**
 Properties of a tuned/randomized algorithm, not exact sample values:
 determinism (same config → identical output), no `NaN`/`Inf`, output bounded,
-the corrected spread model (`interval = duration * spread`, pattern length
-`(SS_STEPS-1)·dur·spread + dur`), constant-loudness invariant (level roughly flat
-across spread), spread clamped to `[0,1]`, and renders across 44.1/48/96 kHz.
-Catch2 is vendored as `catch_amalgamated.hpp` (v2.13.10, single header — no build
-step, no package manager).
+seam continuity at every frame size (the "silence between pieces" guard),
+pre-roll level, no startup or single-step hole, constant loudness across fade,
+live-control latency (frame size, position, stretch reach the sounding head
+within a hop or two), scheduling under a cost-modelled producer
+(`render_costed`: each render charges its modelled cost; holds are counted and
+must never become silence), ring-out cap and expiry, drift, and renders across
+44.1/48/96 kHz. Catch2 is vendored as `catch_amalgamated.hpp` (v2.13.10, single
+header — no build step, no package manager).
 
-**2. Golden regression — `../host/regression.py`.**
-The C++ core vs the Python reference (`stretchseq.py`). Not bit-equality — the two
-use different RNGs, so phases differ by design. Asserts length, RMS level, and
-spectral-envelope shape within documented tolerances across a spread sweep. This
-is the guard that the C++ port still matches the reference behavior.
+**2. Two drivers in `test_support.h`.** `render()` drains `service()` between
+every sample (an infinitely fast producer: sees baked content, never
+scheduling). `render_costed()` gives the producer a time budget and charges
+each render `cost(w)`; plug in the bench's per-size cost to reproduce device
+scheduling on the host. The former Python golden regression is retired.
 
 ## Adding a test
 

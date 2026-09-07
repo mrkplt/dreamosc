@@ -14,7 +14,10 @@ datasheet-stated, it says so.
 
 - **Core:** single Arm Cortex-M7, 32-bit, with FPU (IEEE-754 **single AND
   double** precision) and the full DSP instruction set + MPU.
-- **Clock:** up to **480 MHz** (the Daisy runs it at 480 MHz).
+- **Clock:** up to **480 MHz**. libDaisy runs it at **400 MHz by default**
+  (`System::Config::Defaults()`); `DaisyPod::Init(true)` selects `Boost()` =
+  480 MHz. dreamosc uses boost. (This was wrong here for a long time: the
+  firmware ran at 400 while the docs said 480.)
 - **Performance:** **2424 CoreMark / 1027 DMIPS** from flash at 0-wait-state,
   thanks to the L1 cache.
 - **L1 cache:** **16 KB I-cache + 16 KB D-cache.** This is the key to why

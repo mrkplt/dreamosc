@@ -1,17 +1,14 @@
 // Unit tests for the platform-free DSP core (stretch_core.h).
 //
 // These assert the properties that matter for a tuned/randomized algorithm --
-// determinism, invariants, bounds, and the control-interaction math -- rather
-// than exact sample values. Idioms follow embedded/audio-DSP practice: test on
-// the host, guard NaN/Inf and signal bounds, check level/energy invariants, and
-// sweep sample rate + fade.
+// determinism, invariants, bounds, seam continuity, live-control latency, and
+// the scheduling behaviour under a cost-modelled producer -- rather than exact
+// sample values. Tolerances are set from measurement with a written reason.
 //
-// #155 (persistent-head): the sequencer is now a robotic READ clock (dwell =
-// round(duration*sr), NO hop quantization) that owns the seam crossfade; each
-// head is a persistent per-step writer. Tests that asserted the old hop-
-// quantized lenSamples()/intervalSamples()/patternSamples() model are rewritten
-// against the live-duration model, with a written reason on each. The click-
-// detector and constant-loudness GUARDS are preserved unchanged in intent.
+// Frame model: a head is (old, cur) frames + a phase; the ISR blends them and
+// rotates at hop boundaries from a staged queue the main loop fills. Heads come
+// from a pool, are armed a whole dwell ahead, and go live with a pre-roll pair
+// so a raw cut is amplitude-continuous. An under-fed head repeats its frame.
 
 #define CATCH_CONFIG_MAIN
 #include "catch_amalgamated.hpp"
@@ -22,14 +19,13 @@
 
 using testutil::make_source;
 using testutil::render;
-using testutil::render_rate_limited;
+using testutil::render_costed;
 using testutil::rms;
+using testutil::rms_range;
+using testutil::first_audible;
 
 namespace {
 
-// Configure a sequencer in place (Sequencer is non-copyable: its heads hold
-// atomics). `src` must outlive it -- it holds a Source*. `fade` is the crossfade
-// overlap fraction (0..0.5); fade 0 = raw cut (heads sequential, one at a time).
 void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
               float duration, float fade = 0.0f, float drift = 0.0f,
               uint32_t seed = 0x12345678u) {
@@ -41,80 +37,100 @@ void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
   for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = drift;
 }
 
+// Drive for `total` samples with a drained producer, calling `hook(n)` before
+// each sample (to poke controls mid-run). Returns the output.
+template <typename F>
+std::vector<float> drive(Sequencer& seq, uint32_t total, F hook) {
+  std::vector<float> out; out.reserve(total);
+  for (uint32_t n = 0; n < total; n++) {
+    hook(n);
+    for (int g = 0; g < 64 && seq.service(); g++) {}
+    out.push_back(seq.next());
+  }
+  return out;
+}
+
+// Longest run of 5 ms windows whose RMS is below `thresh`, after `from`.
+int silent_windows(const std::vector<float>& out, size_t from, double thresh = 1e-4) {
+  const size_t W = 240;
+  int worst = 0, run = 0;
+  for (size_t s = from; s + W <= out.size(); s += W) {
+    if (rms_range(out, s, W) < thresh) { run++; if (run > worst) worst = run; }
+    else run = 0;
+  }
+  return worst;
+}
+
 }  // namespace
 
-// --- seamPhase: the pure seam-decision logic, tested directly ---------------
+// --- seamGeom: pure seam geometry ------------------------------------------
 
-TEST_CASE("seamPhase: fade 0 is a raw cut (onset == end == duration)") {
-  // With no crossfade, the incoming head goes live exactly as the outgoing head
-  // ends: goLive and end fire the same sample, and there is no overlap window.
-  uint32_t dur = 48000;
-  SeamDecision at_end = seamPhase(dur, dur, 0.0f, 1024);
-  REQUIRE(at_end.goLive);
-  REQUIRE(at_end.end);
-  REQUIRE(at_end.fadeLen == 0);
-  // Before the end, neither goLive nor end.
-  SeamDecision mid = seamPhase(dur / 2, dur, 0.0f, 1024);
-  REQUIRE_FALSE(mid.goLive);
-  REQUIRE_FALSE(mid.end);
+TEST_CASE("seamGeom: fade 0 is a raw cut (onset == duration, no overlap)") {
+  SeamGeom g = seamGeom(48000, 0.0f);
+  REQUIRE(g.onset == 48000);
+  REQUIRE(g.fadeLen == 0);
 }
 
-TEST_CASE("seamPhase: fade > 0 opens the seam fade*duration before the end") {
-  uint32_t dur = 48000;
-  float fade = 0.25f;
-  uint32_t fadeLen = (uint32_t)(dur * fade);       // 12000
-  uint32_t onset = dur - fadeLen;                  // 36000
-  SeamDecision go = seamPhase(onset, dur, fade, 1024);
-  REQUIRE(go.goLive);
-  REQUIRE_FALSE(go.end);
-  REQUIRE(go.fadeLen == fadeLen);
-  // End still fires at the full duration, so the two overlap for fadeLen samples.
-  SeamDecision e = seamPhase(dur, dur, fade, 1024);
-  REQUIRE(e.end);
+TEST_CASE("seamGeom: fade > 0 opens the seam fade*duration before the end") {
+  SeamGeom g = seamGeom(48000, 0.25f);
+  REQUIRE(g.fadeLen == 12000);
+  REQUIRE(g.onset == 36000);
 }
 
-TEST_CASE("seamPhase: pre-warm fires one lookahead before onset (clamped at 0)") {
-  uint32_t dur = 48000, look = 16384;
-  // Long dwell: prewarm point is onset - lookahead, comfortably positive.
-  uint32_t onset = dur;                            // fade 0
-  REQUIRE(seamPhase(onset - look, dur, 0.0f, look).prewarm);
-  REQUIRE_FALSE(seamPhase(onset - look - 1, dur, 0.0f, look).prewarm);
-  // Short dwell (dur < lookahead): prewarm clamps to elapsed 0.
-  uint32_t shortDur = 8000;
-  REQUIRE(seamPhase(0, shortDur, 0.0f, look).prewarm);
+TEST_CASE("seamGeom: fade clamps to [0, 0.5]") {
+  REQUIRE(seamGeom(48000, -1.0f).fadeLen == 0);
+  REQUIRE(seamGeom(48000, 5.0f).fadeLen == 24000);
 }
 
-TEST_CASE("seamPhase: fade clamps to [0, 0.5]") {
-  uint32_t dur = 48000;
-  REQUIRE(seamPhase(dur, dur, -1.0f, 1024).fadeLen == 0);          // clamp lo
-  REQUIRE(seamPhase(0, dur, 5.0f, 1024).fadeLen == (uint32_t)(dur * 0.5f));  // hi
+// --- tables -----------------------------------------------------------------
+
+TEST_CASE("tables: windows, gains and blend curves for every size") {
+  gTab.init();
+  for (int s = 0; s < SS_NSIZES; s++) {
+    int w = ssSizeW(s), h = w / 2;
+    REQUIRE(ssSizeIdx(w) == s);
+    REQUIRE(std::isfinite(gTab.synthGain[s]));
+    REQUIRE(gTab.synthGain[s] > 0.0f);
+    const float* win = &gWindows[ssWinOff(s)];
+    REQUIRE(win[0] == Approx(0.0f).margin(1e-3));
+    REQUIRE(win[w / 2] == Approx(1.0f).margin(1e-2));
+    const float* A = &gBlendA[ssHopOff(s)];
+    const float* C = &gBlendC[ssHopOff(s)];
+    REQUIRE(A[0] == Approx(1.0f));                 // hop start: 100% old
+    REQUIRE(A[h / 2] == Approx(0.5f).margin(1e-3)); // mid-hop: equal mix
+    // Canonical AM correction: attenuate the joint (a single frame, full
+    // level) to 1/sqrt2 so it matches the mid-hop equal-power mix, which is
+    // left at 1.0. The envelope comes out flat at 0.707 overall.
+    REQUIRE(C[0] == Approx(0.70711f).margin(1e-3));
+    REQUIRE(C[h / 2] == Approx(1.0f).margin(1e-3));
+  }
+  REQUIRE(ssWinOff(SS_NSIZES - 1) + SS_W_MIN == SS_WIN_FLOATS);
+  REQUIRE(ssHopOff(SS_NSIZES - 1) + SS_W_MIN / 2 == SS_HOP_FLOATS);
+}
+
+TEST_CASE("ssClampW: any request lands on a legal power of two") {
+  REQUIRE(ssClampW(1) == SS_W_MIN);
+  REQUIRE(ssClampW(1 << 20) == SS_W);
+  REQUIRE(ssClampW(3000) == 2048);
+  REQUIRE(ssClampW(4096) == 4096);
+}
+
+TEST_CASE("ssHash2 is deterministic and never zero") {
+  REQUIRE(ssHash2(1, 2) == ssHash2(1, 2));
+  REQUIRE(ssHash2(1, 2) != ssHash2(2, 1));
+  REQUIRE(ssHash2(0, 0) != 0);
 }
 
 // --- render-level invariants ------------------------------------------------
 
-TEST_CASE("tables initialize and synthGain is finite and positive") {
-  gTab.init();
-  REQUIRE(std::isfinite(gTab.synthGain));
-  REQUIRE(gTab.synthGain > 0.0f);
-}
-
-TEST_CASE("output contains no NaN or Inf") {
+TEST_CASE("output contains no NaN or Inf and stays within bounds") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.5f);
   auto out = render(seq);
   REQUIRE(out.size() > 0);
-  for (float v : out) REQUIRE(std::isfinite(v));
-}
-
-TEST_CASE("output stays within signal bounds") {
-  gTab.init();
-  auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.5f);
-  auto out = render(seq);
-  for (float v : out) REQUIRE(std::abs(v) <= 1.5f);  // generous; clip is downstream
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
 }
 
 TEST_CASE("deterministic: same config renders identically") {
@@ -126,51 +142,107 @@ TEST_CASE("deterministic: same config renders identically") {
   auto a = render(seqA);
   auto b = render(seqB);
   REQUIRE(a.size() == b.size());
-  for (size_t i = 0; i < a.size(); i++) REQUIRE(a[i] == Approx(b[i]));
+  for (size_t i = 0; i < a.size(); i++) REQUIRE(a[i] == b[i]);
 }
 
-TEST_CASE("a genuinely starved ring counts an underrun and stays silent") {
-  // gUnderruns / the ring-empty branch in Head::next() is reached when a GATED,
-  // already-sounding head outruns the worker. Force it: prime a head, then drain
-  // next() far past what a full cushion (SS_RING) can supply with zero service().
+TEST_CASE("startup: audible as soon as the first pre-roll pair is rendered") {
+  // With a drained producer the first head goes live on the second sample (the
+  // first tick arms it; the next service renders its pair). No lookahead wait.
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);   // long, isolated
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.0f);
+  auto out = render(seq);
+  REQUIRE(first_audible(out) <= 8);
+}
 
-  uint32_t before = gUnderruns;
-  // Prime: run service()+next() together long enough to pass the onset lookahead
-  // and fill the cushion, as a healthy main loop would.
-  for (uint32_t i = 0; i < SS_LOOKAHEAD + SS_RING; i++) {
-    seq.service();
-    float s = seq.next();
-    REQUIRE(std::isfinite(s));
+// --- seam continuity (the "silence between pieces" guard) -------------------
+
+TEST_CASE("raw cut is amplitude-continuous at every frame size (pre-roll)") {
+  // Measured before pre-roll: the first 5 ms after a cut sat 34 dB (4096) to
+  // 62 dB (16384) below steady state and recovered over one hop. The test
+  // material (a few spectral lines) makes 5 ms windows wander deeply at large
+  // windows (up to ~12 dB at 16384 against a hop-long reference), so the
+  // threshold is SELF-CALIBRATED: the deepest 5 ms window in the half-dwell
+  // BEFORE the cut (steady state, well past the previous seam) sets the floor,
+  // and no window in the hop AFTER the cut may sit more than 6 dB under it. A
+  // fade-in from silence fails this by 20+ dB at every size.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  for (int w = 512; w <= SS_W; w <<= 1) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
+    seq.setFrame(w);
+    uint32_t dur = seq.durSamples();
+    auto out = render(seq, 2);
+    size_t s0 = first_audible(out);
+    int hop = w / 2;
+    for (int k = 1; k <= 3; k++) {
+      size_t seam = s0 + (size_t)k * dur;
+      size_t before = dur / 2;
+      double ref = rms_range(out, seam - before, before);
+      REQUIRE(ref > 1e-3);
+      double floorDb = 0.0;
+      for (size_t s = seam - before; s + 240 <= seam; s += 240) {
+        double db = 20.0 * std::log10(std::max(rms_range(out, s, 240), 1e-9) / ref);
+        if (db < floorDb) floorDb = db;
+      }
+      for (size_t s = seam; s + 240 <= seam + (size_t)hop; s += 240) {
+        double db = 20.0 * std::log10(std::max(rms_range(out, s, 240), 1e-9) / ref);
+        INFO("w=" << w << " seam " << k << " offset " << (s - seam) << " dB " << db
+             << " (floor before the cut " << floorDb << ")");
+        REQUIRE(db > floorDb - 6.0);
+      }
+    }
   }
-  // Now starve it: pure next(), no service(), for more than any cushion depth.
-  for (uint32_t i = 0; i < SS_RING * 4; i++) {
-    float s = seq.next();
-    REQUIRE(std::isfinite(s));
+}
+
+TEST_CASE("a head's first hop is at steady-state level (per-head pre-roll)") {
+  // Cleaner than the seam test: the first hop after startup vs the fifth hop.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  for (int w : {1024, 4096, 16384}) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+    seq.setFrame(w);
+    auto out = render(seq);
+    size_t s0 = first_audible(out);
+    int hop = w / 2;
+    double first = rms_range(out, s0, hop), fifth = rms_range(out, s0 + 4 * hop, hop);
+    double db = 20.0 * std::log10(first / fifth);
+    INFO("w=" << w << " first hop vs fifth: " << db << " dB");
+    REQUIRE(std::abs(db) < 6.0);
   }
-  REQUIRE(gUnderruns > before);
+}
+
+TEST_CASE("single active step: no hole between dwells") {
+  // The degenerate 1-step case used to re-arm the sounding head in place, with a
+  // lookahead of silence per dwell. A pool head per visit closes it.
+  gTab.init();
+  auto srcbuf = make_source(2.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
+  seq.setSteps(1);
+  auto out = render(seq, 4);
+  size_t s0 = first_audible(out);
+  REQUIRE(silent_windows(out, s0) == 0);
+  REQUIRE(rms(out) > 0.01);
 }
 
 TEST_CASE("no local discontinuity in head interiors (click detector)") {
-  // A click is a jump large RELATIVE TO ITS LOCAL CONTEXT. Head SEAMS are
-  // excluded: heads are steady-state and the splice of uncorrelated phase-
-  // randomized material at a raw-cut seam is accepted (spectral, not transient --
-  // design owner's call, #155). This GUARD (preserved from the old suite) checks
-  // the INTERIOR: nothing inside a head may step discontinuously. Seams now land
-  // at SS_LOOKAHEAD + k*durSamples (unquantized duration).
+  // Seams are excluded (a raw-cut splice of uncorrelated material is spectral,
+  // not a transient -- design ruling). Nothing INSIDE a head may step.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.0f);
-  uint32_t dur = (uint32_t)(1.0f * 48000 + 0.5f);
+  uint32_t dur = seq.durSamples();
   auto out = render(seq, 2);
+  size_t s0 = first_audible(out);
 
   auto near_seam = [&](size_t i) {
     for (uint32_t k = 0; k <= 2 * SS_STEPS + 2; k++) {
-      int64_t seam = (int64_t)SS_LOOKAHEAD + (int64_t)k * dur;
+      int64_t seam = (int64_t)s0 + (int64_t)k * dur;
       if ((int64_t)i > seam - 1024 && (int64_t)i < seam + 1024) return true;
     }
     return false;
@@ -183,8 +255,7 @@ TEST_CASE("no local discontinuity in head interiors (click detector)") {
     float d = std::abs(out[i] - out[i - 1]);
     if (d < 5e-3f) continue;
     float local = 0.0f;
-    for (int k = -W; k < W; k++)
-      local += std::abs(out[i + k] - out[i + k - 1]);
+    for (int k = -W; k < W; k++) local += std::abs(out[i + k] - out[i + k - 1]);
     local /= (2 * W);
     if (d > 8.0f * local) {
       if (clicks < 5)
@@ -197,52 +268,35 @@ TEST_CASE("no local discontinuity in head interiors (click detector)") {
 }
 
 TEST_CASE("level held roughly flat across crossfade (constant-loudness)") {
-  // Equal-power crossfade should hold RMS roughly flat from raw cut through the
-  // maximum overlap -- the seams sum to constant power, not silence-dips or
-  // level-swells. GUARD preserved from the old suite.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-
   double prev = -1.0;
   for (float fade : {0.0f, 0.15f, 0.3f, 0.5f}) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, fade);
     double r = rms(render(seq));
     REQUIRE(r > 0.0);
-    if (prev > 0.0) {
-      double db = 20.0 * std::log10(r / prev);
-      REQUIRE(std::abs(db) < 3.0);   // crossfade must not swing level wildly
-    }
+    if (prev > 0.0) REQUIRE(std::abs(20.0 * std::log10(r / prev)) < 3.0);
     prev = r;
   }
 }
 
-TEST_CASE("no per-step volume dips at max fade (end-to-end without dips)") {
-  // fade 0.5: heads overlap half a duration under an equal-power crossfade, so
-  // the seam is power-flat and the sustain is level (no per-step swell). Short-
-  // window RMS across the interior must stay within the noise-like material's own
-  // wander, not swing like a full-step envelope would. GUARD preserved.
+TEST_CASE("no per-step volume dips at max fade") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.5f);
   auto out = render(seq, 2);
-
   const uint32_t w = 2400;
   uint32_t begin = 48000, end = (uint32_t)out.size() - 48000;
   float lo = 1e9f, hi = 0.0f;
   for (uint32_t s = begin; s + w < end; s += w / 2) {
-    double acc = 0.0;
-    for (uint32_t i = s; i < s + w; i++) acc += (double)out[i] * out[i];
-    float r = (float)std::sqrt(acc / w);
-    lo = std::min(lo, r);
-    hi = std::max(hi, r);
+    float r = (float)rms_range(out, s, w);
+    lo = std::min(lo, r); hi = std::max(hi, r);
   }
-  INFO("windowed RMS min " << lo << " max " << hi << " ratio "
-       << 20.0 * std::log10(hi / std::max(lo, 1e-9f)) << " dB");
-  // A single continuous head shows ~8.7 dB of natural windowed-RMS wander (noise-
-  // like material); the full-step sine envelope this guards against measured
-  // 30.6 dB. 12 dB separates them with margin.
+  INFO("windowed RMS ratio " << 20.0 * std::log10(hi / std::max(lo, 1e-9f)) << " dB");
+  // A continuous head shows ~8.7 dB of windowed-RMS wander; a full-step sine
+  // envelope measured 30.6 dB. 12 dB separates them.
   REQUIRE(20.0 * std::log10(hi / std::max(lo, 1e-9f)) < 12.0);
 }
 
@@ -258,111 +312,234 @@ TEST_CASE("renders at multiple sample rates without blowing up") {
   }
 }
 
-TEST_CASE("max crossfade renders audibly and bounded (<=3 heads render, <=2 gated)") {
-  // At fade 0.5 consecutive heads overlap by half a duration, so two heads are
-  // gated through each seam (a third is pre-warming, not yet gated) -- the
-  // concurrency ceiling #155 is built around. Confirm audible, finite, bounded.
-  gTab.init();
-  auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.5f);
-  auto out = render(seq, 2);
-  REQUIRE(out.size() > 0);
-
-  bool any_audible = false;
-  for (float v : out) if (std::abs(v) > 1e-3f) { any_audible = true; break; }
-  REQUIRE(any_audible);
-  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.5f); }
-}
-
-// --- the robotic clock: live duration, fast-march, degrade -----------------
+// --- the robotic clock -------------------------------------------------------
 
 TEST_CASE("duration is live and unquantized (frame size does not bend timing)") {
-  // #155: durSamples() = round(duration*sr), independent of frame size. The old
-  // model quantized to the active hop, so a 16384 window snapped a 0.25 s step to
-  // 0.17 s. Now the step length is the same at any frame size.
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
-
   uint32_t at4096 = seq.durSamples();
   seq.setFrame(16384);
-  uint32_t at16384 = seq.durSamples();
-  REQUIRE(at4096 == at16384);                 // frame size no longer bends it
-  REQUIRE(at4096 == (uint32_t)(0.25f * 48000 + 0.5f));   // exact, unquantized
+  REQUIRE(seq.durSamples() == at4096);
+  REQUIRE(at4096 == (uint32_t)(0.25f * 48000 + 0.5f));
 }
 
-TEST_CASE("duration crank-down mid-dwell fast-marches without permanent silence") {
-  // The marquee #155 behavior: a minute-long dwell with the duration knob live.
-  // Crank duration DOWN mid-dwell and the sequence must advance (fast-march), not
-  // stay frozen for the rest of the old 60 s dwell, and must SELF-HEAL to audible
-  // output (a one-time cold-arrival gap on the crank is accepted for stage 1, but
-  // it must not go permanently silent or emit non-finite samples / double-fire).
+TEST_CASE("duration crank-down mid-dwell fast-marches with no silence") {
+  // A minute-long dwell, duration cranked to 0.25 s a third of a second in. The
+  // next head is armed a whole dwell ahead, so the march starts immediately and
+  // there is no cold-arrival gap at all.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 60.0f, 0.0f);
-
-  std::vector<float> out;
-  const uint32_t total = 48000 * 3;
-  for (uint32_t n = 0; n < total; n++) {
-    for (int g = 0; g < 64 && seq.service(); g++) {}
-    if (n == 14400) seq.duration = 0.25f;     // crank down mid-dwell (~0.3 s in)
-    float v = seq.next();
-    REQUIRE(std::isfinite(v));
-    out.push_back(v);
-  }
-  // After the crank + a generous settle, the sequence is audibly marching again
-  // (not stuck silent). Measure RMS of the last second.
-  double tail = rms(std::vector<float>(out.end() - 48000, out.end()));
-  INFO("tail rms after crank-down " << tail);
-  REQUIRE(tail > 0.01);                        // self-healed to real output
+  int stepsSeen = 0, last = -1;
+  auto out = drive(seq, 48000 * 3, [&](uint32_t n) {
+    if (n == 14400) seq.duration = 0.25f;
+    int s = seq.curStep();
+    if (s != last) { stepsSeen++; last = s; }
+  });
+  for (float v : out) REQUIRE(std::isfinite(v));
+  REQUIRE(stepsSeen > 8);                          // it marched
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+  REQUIRE(seq.lateSamples() <= 8);                 // only the startup pair
 }
 
-TEST_CASE("steady short-duration march stays fed (cushion keeps up)") {
-  // A steady fast-march (0.25 s dwell) pre-warms each next head at dwell start and
-  // must keep its cushion fed -- so after warmup the output is essentially never
-  // silent. This is the stage-1 pre-warm path working under a fast walk.
+TEST_CASE("steady short-duration march stays fed") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
-
-  std::vector<float> out;
-  const uint32_t total = 48000 * 3;
-  for (uint32_t n = 0; n < total; n++) {
-    for (int g = 0; g < 64 && seq.service(); g++) {}
-    out.push_back(seq.next());
-  }
-  int silent = 0, counted = 0;
-  for (uint32_t n = 48000; n < total; n++) {   // after 1 s warmup
-    counted++;
-    if (std::abs(out[n]) < 1e-5f) silent++;
-  }
-  INFO("silence fraction after warmup " << (100.0 * silent / counted) << "%");
-  REQUIRE(silent < counted / 20);              // < 5% silent: cushion keeps up
+  auto out = render(seq, 3);
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+  REQUIRE(seq.holds() == 0);
 }
 
-TEST_CASE("activeSteps == 1 re-arms the single head each dwell (#149 degrade)") {
-  // With one active step, next_ == cur_: pre-warm is skipped (it would reset the
-  // ring the ISR is reading) and the head hard re-arms at end. It must still
-  // produce finite, bounded, audible output across several dwells.
+TEST_CASE("shrinking activeSteps under an armed head re-arms on a valid step") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.2f, 0.0f);
+  bool bad = false;
+  auto out = drive(seq, 48000 * 2, [&](uint32_t n) {
+    if (n == 48000 / 2) seq.setSteps(2);
+    if (n > 48000 / 2 + 48000 / 5 && seq.curStep() >= 2) bad = true;
+  });
+  for (float v : out) REQUIRE(std::isfinite(v));
+  REQUIRE_FALSE(bad);
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+}
+
+// --- live controls reach the sounding head ---------------------------------
+
+TEST_CASE("live frame size reaches the sounding head within one hop") {
+  // 4096 -> 1024: the refresh pair is cheap against the remaining hop, so it
+  // replaces the pending frame and applies at the very next boundary.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+  uint32_t when = 48000, seen = 0;
+  auto out = drive(seq, 48000 * 2, [&](uint32_t n) {
+    if (n == when) seq.setFrame(1024);
+    if (n > when && seen == 0 && seq.curHop() == 512) seen = n;
+  });
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
+  REQUIRE(seen > 0);
+  INFO("applied after " << (seen - when) << " samples");
+  REQUIRE(seen - when <= 2048 + 64);               // one old-size hop, plus slack
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+}
+
+TEST_CASE("live frame size up to 16384 applies within two hops") {
+  // 4096 -> 16384: a 16384 pre-roll pair is modelled at ~36 ms, which can
+  // exceed what is left of the current 43 ms hop; the refresh is then refused
+  // (it would miss) and the pair lands one boundary later. Two hops max.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+  uint32_t when = 48000, seen = 0;
+  auto out = drive(seq, 48000 * 2, [&](uint32_t n) {
+    if (n == when) seq.setFrame(16384);
+    if (n > when && seen == 0 && seq.curHop() == 8192) seen = n;
+  });
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
+  REQUIRE(seen > 0);
+  INFO("applied after " << (seen - when) << " samples");
+  REQUIRE(seen - when <= 2 * 2048 + 64);
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+}
+
+TEST_CASE("changing frame size repeatedly mid-render stays clean") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
+  seq.setFrame(SS_W);
+  const int sizes[] = {SS_W, 512, 2048, 256, 1024, SS_W};
+  int si = 0;
+  uint32_t total = seq.patternSamples();
+  auto out = drive(seq, total, [&](uint32_t n) {
+    if (n % (total / 64 + 1) == 0) { seq.setFrame(sizes[si % 6]); si++; }
+  });
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
+  REQUIRE(rms(out) > 0.0f);
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+}
+
+TEST_CASE("live position moves the sounding head (and is deterministic)") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  auto run = [&](bool move) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+    return drive(seq, 48000, [&](uint32_t n) { if (move && n == 24000) seq.position[0] = 0.7f; });
+  };
+  auto a = run(false), b = run(true), c = run(true);
+  for (size_t i = 0; i < 24000; i++) REQUIRE(a[i] == b[i]);     // identical before
+  size_t firstDiff = a.size();
+  for (size_t i = 24000; i < a.size(); i++) if (a[i] != b[i]) { firstDiff = i; break; }
+  INFO("first difference " << (firstDiff - 24000) << " samples after the move");
+  REQUIRE(firstDiff < 24000 + 2 * 2048);            // within two hops
+  for (size_t i = 0; i < b.size(); i++) REQUIRE(b[i] == c[i]);   // deterministic
+}
+
+TEST_CASE("live stretch reaches the sounding head within two hops") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  auto run = [&](bool move) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+    return drive(seq, 48000, [&](uint32_t n) { if (move && n == 24000) seq.stretch = 5.0f; });
+  };
+  auto a = run(false), b = run(true);
+  size_t firstDiff = a.size();
+  for (size_t i = 24000; i < a.size(); i++) if (a[i] != b[i]) { firstDiff = i; break; }
+  REQUIRE(firstDiff < 24000 + 2 * 2048);
+}
+
+// --- scheduling under a cost-modelled producer ------------------------------
+
+TEST_CASE("cost-modelled producer at bench cost keeps a fast ring-out march fed") {
+  // 0.0038 samples per (w log2 w) = ~18 ms per 16384 frame at 48 kHz, the bench
+  // number at the old clock. At 4096 with a 0.25 s march and 2 s ring-out up to
+  // six heads render at once; the EDF scheduler must keep them all fed.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
+  seq.ringout = 2.0f;
+  auto out = render_costed(seq, 48000 * 4, 0.0038);
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);
+  INFO("holds " << seq.holds() << " late " << seq.lateSamples());
+  REQUIRE(seq.holds() == 0);
+}
+
+TEST_CASE("a knob turn right after go-live is not starved by the armed pair (costed, 16384)") {
+  // At 16384 the next step's pre-roll pair (two renders, ~36 ms modelled) is
+  // pending right after every go-live. A position change on the SOUNDING head
+  // must still land at its first hop boundary: the far-future pair yields to
+  // a slack-valid refresh. Compare against an unchanged run.
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  auto run = [&](bool move) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+    seq.setFrame(16384);
+    std::vector<float> out; out.reserve(48000);
+    double budget = 0.0; const double cost = 0.0038 * 16384 * 14;
+    size_t live = 0;
+    for (uint32_t n = 0; n < 48000; n++) {
+      if (live == 0 && seq.curHop() > 0) live = n;
+      if (move && live > 0 && n == live + 100) seq.position[0] = 0.7f;
+      if (n % 32 == 0) {
+        budget += 32;
+        while (budget >= cost && seq.service()) budget -= cost;
+        if (budget > 4.0 * cost) budget = 4.0 * cost;
+      }
+      out.push_back(seq.next());
+    }
+    return std::make_pair(out, live);
+  };
+  auto a = run(false), b = run(true);
+  REQUIRE(a.second == b.second);
+  size_t live = a.second, firstDiff = a.first.size();
+  for (size_t i = live; i < a.first.size(); i++) if (a.first[i] != b.first[i]) { firstDiff = i; break; }
+  INFO("first difference " << (firstDiff - live) << " samples after go-live");
+  REQUIRE(firstDiff - live <= 8192 + 64);          // at the first boundary
+}
+
+TEST_CASE("an overloaded producer degrades to frame repeats, never silence") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
+  seq.ringout = 2.0f;
+  uint32_t before = gUnderruns;
+  auto out = render_costed(seq, 48000 * 3, 0.05);   // ~13x the bench cost
+  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
+  REQUIRE(gUnderruns > before);                    // holds happened
+  REQUIRE(silent_windows(out, first_audible(out)) == 0);   // but no silence
+}
+
+TEST_CASE("a starved head repeats its frame and counts holds") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
-  seq.setSteps(1);
-  auto out = render(seq, 3);
-  for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
-  REQUIRE(rms(out) > 0.0f);                     // it sounds
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+  for (uint32_t i = 0; i < 4096; i++) { for (int g = 0; g < 64 && seq.service(); g++) {} seq.next(); }
+  uint32_t before = gUnderruns;
+  std::vector<float> out;
+  for (uint32_t i = 0; i < 4096 * 3; i++) out.push_back(seq.next());   // no service
+  REQUIRE(gUnderruns > before);
+  for (float v : out) REQUIRE(std::isfinite(v));
+  REQUIRE(silent_windows(out, 0) == 0);
 }
 
-// --- ring-out remnants (#155 stage 2) --------------------------------------
+// --- ring-out ----------------------------------------------------------------
 
-// Drive the sequencer for `n` samples, fully draining service() each sample
-// (device main-loop discipline), returning the peak activeRemnants() seen and
-// the output. Helper local to the ring-out tests.
 namespace {
 struct RingoutRun { std::vector<float> out; int peakRemnants; int peakTotal; };
 RingoutRun driveRingout(Sequencer& seq, uint32_t n) {
@@ -379,222 +556,123 @@ RingoutRun driveRingout(Sequencer& seq, uint32_t n) {
 }
 }  // namespace
 
-TEST_CASE("ring-out: a departing head is adopted into a remnant and keeps sounding") {
-  // With ringout > 0, leaving a step spawns a remnant that renders at full volume
-  // for ~ringout seconds. Short dwells so several seams pass; assert remnants
-  // actually appear and the output stays finite/bounded.
+TEST_CASE("ring-out: a departing head keeps sounding") {
   gTab.init();
   auto srcbuf = make_source(4.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.3f, 0.0f);
-  seq.ringout = 1.0f;                          // 1 s tails
-
+  seq.ringout = 1.0f;
   auto r = driveRingout(seq, 48000 * 2);
   for (float v : r.out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
-  REQUIRE(r.peakRemnants >= 1);                // ring-out actually spawned tails
+  REQUIRE(r.peakRemnants >= 1);
 }
 
-TEST_CASE("ring-out: total concurrent renderers never exceed SS_RENDER_CAP") {
-  // The hard cap (Mark's ruling: 6 total; 9 would blow the chip). A fast march
-  // with a long ring-out would want many overlapping tails; ditch-oldest must
-  // hold the ceiling. peakTotal = gated step heads + active remnants.
+TEST_CASE("ring-out: gated heads never exceed SS_RENDER_CAP") {
   gTab.init();
   auto srcbuf = make_source(4.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.15f, 0.0f);   // fast march
-  seq.ringout = 8.0f;                          // long tails => wants many slots
-
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.15f, 0.0f);
+  seq.ringout = 8.0f;
   auto r = driveRingout(seq, 48000 * 3);
-  INFO("peak total renderers " << r.peakTotal);
-  REQUIRE(r.peakTotal <= SS_RENDER_CAP);       // ceiling held by ditch-oldest
-  REQUIRE(r.peakRemnants >= 1);                // and ring-out was actually active
+  INFO("peak gated " << r.peakTotal);
+  REQUIRE(r.peakTotal <= SS_RENDER_CAP);
+  REQUIRE(r.peakRemnants >= 1);
+  REQUIRE(seq.freeHeads() >= 1);                   // no pool leak
 }
 
-TEST_CASE("ring-out: a remnant stops after its render length (raw cut)") {
-  // A single tail must END, not ring forever. One active step, short dwell, a
-  // short ring-out: after the ring-out length past a hand-off the remnant count
-  // must return to 0 (the tail stopped).
+TEST_CASE("ring-out: a ringing head stops after its length") {
   gTab.init();
   auto srcbuf = make_source(4.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
   seq.setSteps(2);
-  seq.ringout = 0.5f;                           // half-second tails
-
-  // Run long enough that at least one remnant has spawned AND fully expired.
+  seq.ringout = 0.5f;
   bool sawRemnant = false, sawExpiry = false;
   for (uint32_t i = 0; i < 48000 * 4; i++) {
     for (int g = 0; g < 128 && seq.service(); g++) {}
     seq.next();
     int rem = seq.activeRemnants();
     if (rem > 0) sawRemnant = true;
-    if (sawRemnant && rem == 0) sawExpiry = true;   // a tail came and went
+    if (sawRemnant && rem == 0) sawExpiry = true;
   }
   REQUIRE(sawRemnant);
-  REQUIRE(sawExpiry);                            // remnants stop, don't ring forever
+  REQUIRE(sawExpiry);
 }
 
-TEST_CASE("ring-out == 0 is byte-identical to no remnants (clean instrument)") {
-  // Page 0 / off must leave the sequential instrument EXACTLY as it was: same
-  // samples as a run that never touches ringout. This is the regression guard
-  // that "ring-out off changes nothing".
+TEST_CASE("ring-out == 0 is byte-identical to the default") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-
-  Sequencer a; make_seq(a, &src, 48000, 50.0f, 0.4f, 0.0f);   // ringout defaults 0
+  Sequencer a; make_seq(a, &src, 48000, 50.0f, 0.4f, 0.0f);
   Sequencer b; make_seq(b, &src, 48000, 50.0f, 0.4f, 0.0f);
-  b.ringout = 0.0f;                             // explicitly off
-
-  auto oa = render(a, 3);
-  auto ob = render(b, 3);
+  b.ringout = 0.0f;
+  auto oa = render(a, 3), ob = render(b, 3);
   REQUIRE(oa.size() == ob.size());
-  for (size_t i = 0; i < oa.size(); i++) REQUIRE(oa[i] == ob[i]);   // bit-exact
+  for (size_t i = 0; i < oa.size(); i++) REQUIRE(oa[i] == ob[i]);
 }
 
-TEST_CASE("configurable step count: setSteps clamps to [1, SS_STEPS] (#149)") {
+// --- step count, sizes, drift ------------------------------------------------
+
+TEST_CASE("setSteps clamps to [1, SS_STEPS] (#149)") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f);
-
   REQUIRE(seq.activeSteps == SS_STEPS);
   seq.setSteps(3);  REQUIRE(seq.activeSteps == 3);
-  seq.setSteps(1);  REQUIRE(seq.activeSteps == 1);
   seq.setSteps(0);  REQUIRE(seq.activeSteps == 1);
   seq.setSteps(-4); REQUIRE(seq.activeSteps == 1);
   seq.setSteps(SS_STEPS + 5); REQUIRE(seq.activeSteps == SS_STEPS);
 }
 
-TEST_CASE("a K-step sequence renders and stays bounded (#149)") {
+TEST_CASE("a K-step sequence renders bounded and walks only K steps") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f);
   seq.setSteps(3);
-  auto out = render(seq, 3);
-  for (float s : out) {
-    REQUIRE(std::isfinite(s));
-    REQUIRE(s <= 1.0f);
-    REQUIRE(s >= -1.0f);
-  }
+  int maxStep = 0;
+  auto out = drive(seq, seq.patternSamples() * 3, [&](uint32_t) {
+    if (seq.curStep() > maxStep) maxStep = seq.curStep();
+  });
+  for (float s : out) { REQUIRE(std::isfinite(s)); REQUIRE(std::abs(s) <= 1.0f); }
   REQUIRE(rms(out) > 0.0f);
-}
-
-TEST_CASE("rate-limited worker degrades to silence, not garbage") {
-  // With a starved worker a head's cushion may be empty when the callback reads
-  // it. Correct degradation is CLEAN SILENCE (Head::next returns 0, counts an
-  // underrun) -- never a stale/garbage sample. Verify output stays bounded and
-  // finite under a throttled service budget.
-  gTab.init();
-  auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.0f);
-  auto out = render_rate_limited(seq, 2, /*block=*/48, /*fftsPerBlock=*/1);
-  for (float v : out) {
-    REQUIRE(std::isfinite(v));
-    REQUIRE(std::abs(v) <= 1.0f);
-  }
-}
-
-// --- frame size (#136) ------------------------------------------------------
-
-TEST_CASE("setWindow: window + gain recompute for each frame size") {
-  gTab.init();
-  for (int w = 64; w <= SS_W; w <<= 1) {
-    gTab.setWindow(w);
-    REQUIRE(gTab.activeW == w);
-    REQUIRE(gTab.activeH == w / 2);
-    REQUIRE((1 << gTab.activePasses) == w);
-    REQUIRE(std::isfinite(gTab.synthGain));
-    REQUIRE(gTab.synthGain > 0.0f);
-    REQUIRE(gWindow[0] == Approx(0.0f).margin(1e-3));
-    REQUIRE(gWindow[w / 2] == Approx(1.0f).margin(1e-2));
-  }
-  gTab.setWindow(SS_W_DEFAULT);
+  REQUIRE(maxStep == 2);
 }
 
 TEST_CASE("renders cleanly at every frame size") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  for (int w = 512; w <= SS_W; w <<= 1) {
+  for (int w = SS_W_MIN; w <= SS_W; w <<= 1) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
     seq.setFrame(w);
     REQUIRE(seq.frameSize == w);
     auto out = render(seq, 2);
-    REQUIRE(out.size() > 0);
     bool audible = false;
     for (float v : out) {
       REQUIRE(std::isfinite(v));
-      REQUIRE(std::abs(v) <= 1.5f);
+      REQUIRE(std::abs(v) <= 1.0f);
       if (std::abs(v) > 1e-3f) audible = true;
     }
     REQUIRE(audible);
   }
-  gTab.setWindow(SS_W_DEFAULT);
 }
-
-TEST_CASE("changing frame size mid-render does not corrupt a sounding head") {
-  // Regression: heads snapshot the window curve + gain + geometry per ARM, and
-  // bake synthGain into each rendered frame, so a live setFrame() while a head is
-  // filling cannot make it multiply a w-sample frame by a curve/gain built for a
-  // different size (the fast-scroll volume-jump / broadband-noise bug). Hammer
-  // setFrame across sizes WHILE rendering and require finite, bounded output.
-  gTab.init();
-  auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
-  seq.setFrame(SS_W);
-
-  const int sizes[] = {SS_W, 512, 2048, 256, 1024, SS_W};
-  std::vector<float> out;
-  const uint32_t total = seq.patternSamples();
-  int si = 0;
-  for (uint32_t n = 0; n < total; n++) {
-    if (n % (total / 64 + 1) == 0) { seq.setFrame(sizes[si % 6]); si++; }
-    for (int g = 0; g < 64 && seq.service(); g++) {}
-    float v = seq.next();
-    REQUIRE(std::isfinite(v));
-    REQUIRE(std::abs(v) <= 1.0f);
-    out.push_back(v);
-  }
-  REQUIRE(rms(out) > 0.0f);
-  gTab.setWindow(SS_W_DEFAULT);
-}
-
-TEST_CASE("frame size is clamped to [64, SS_W]") {
-  gTab.init();
-  gTab.setWindow(1);
-  REQUIRE(gTab.activeW == 64);
-  gTab.setWindow(1 << 20);
-  REQUIRE(gTab.activeW == SS_W);
-  gTab.setWindow(SS_W_DEFAULT);
-}
-
-// --- drift ------------------------------------------------------------------
 
 TEST_CASE("drift perturbs position within bounds and stays reproducible") {
-  // (1) drift > 0 with a fixed seed is still deterministic across two renders of
-  // the same config; (2) large drift measurably changes output vs zero drift;
-  // (3) drift stays clamped in [0,1] position space (no out-of-bounds read).
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-
-  Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 0.5f, 0.0f, /*drift=*/0.3f, 42u);
-  Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 0.5f, 0.0f, /*drift=*/0.3f, 42u);
-  auto a = render(seqA);
-  auto b = render(seqB);
+  Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 0.5f, 0.0f, 0.3f, 42u);
+  Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 0.5f, 0.0f, 0.3f, 42u);
+  auto a = render(seqA), b = render(seqB);
   REQUIRE(a.size() == b.size());
-  for (size_t i = 0; i < a.size(); i++) REQUIRE(a[i] == Approx(b[i]));
-
+  for (size_t i = 0; i < a.size(); i++) REQUIRE(a[i] == b[i]);
   Sequencer seqZero; make_seq(seqZero, &src, 48000, 50.0f, 0.5f, 0.0f, 0.0f, 42u);
   auto zero = render(seqZero);
   bool differs = false;
   for (size_t i = 0; i < std::min(a.size(), zero.size()); i++)
     if (a[i] != zero[i]) { differs = true; break; }
   REQUIRE(differs);
-
   for (float v : a) REQUIRE(std::isfinite(v));
 }

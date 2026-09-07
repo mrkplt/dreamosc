@@ -136,13 +136,46 @@ polyphony.
 - **This REPLACES the old `spread` model** (which let all 8 heads stack at
   spread 0 — a ~2.3× CPU overload on the H750 that caused constant dropouts,
   measured via `make PROFILE=1`). The crossfade design caps concurrency at two
-  heads, so `avg_us` stays in the comfortable ~49 µs / du=0 regime at every
-  setting. The origin of "spread" was always these seam crossfades; this restores
-  that intent and drops the fast-overlap extreme that never fit the chip.
-- `SS_MAX_VOICES` is the ceiling on how many overlapping traveling heads / fade
-  tails can render simultaneously (never more than two now). The spec's
-  "polyphonic voice allocator" phrasing describes that rendering machinery, not
-  chords. There is one source, one timeline, one sequence.
+  sounding heads (plus ring-out); the origin of "spread" was always these seam
+  crossfades.
+- **Ring-out** (`ringout` seconds, encoder page) lets a departing head keep
+  sounding at full volume after the next step begins, then stop with a raw cut.
+  Gated heads (sounding + incoming + ringing) are hard-capped at
+  `SS_RENDER_CAP`; the ringing head with the least left is ditched to admit a
+  new one. There is one source, one timeline, one sequence.
+
+### Frames are the unit (how a head is actually made)
+
+PaulXStretch's output is, per hop, a raised-cosine blend of the previous
+frame's first half against the current frame's second half, times the
+`0.853553…` AM-correction curve. So a sounding head IS two frames (`old`,
+`cur`) plus a phase, and the ISR blends straight out of the frame buffers.
+There is **no sample ring and no cushion**: the producer's only contract is
+"the next frame is staged before `phase` reaches the hop", a deadline that is
+known exactly (`h − phase`) and served earliest-deadline-first.
+
+- **Pre-roll.** A head goes live with BOTH frames rendered (the spec's
+  one-frame pre-roll), so its first sample is mid-stream at full level. That is
+  what makes a raw cut amplitude-continuous. Before this, every head faded in
+  from silence over its first hop (measured −34 dB at the cut at 4096, −62 dB
+  at 16384) — the "silence between pieces". The seam-continuity test guards it.
+- **Hold, never silence.** An under-fed head repeats its current frame at the
+  boundary (spectrally the same) and counts a hold (`du` in the profiler).
+- **Head pool, armed a whole dwell ahead.** The next step's head is allocated
+  and pre-rolled the moment the current step goes live. Go-live waits for the
+  incoming head to be ready (the step runs *late*, never silent). Ring-out is
+  just "do not free the departing head yet". Single-step mode and startup get a
+  fresh head each visit, so there is no re-arm hole.
+- **Live controls by speculative re-render.** Stretch, position and frame size
+  are read at every render; a staged frame is re-rendered when the controls it
+  was made with have changed and there is slack before its deadline (cost is
+  measured per size, in ISR samples). Latency is at most one hop plus the
+  blend; a frame-size change re-renders a pre-roll pair at the new size.
+- **Immutable tables.** All seven window curves and the per-hop blend curves
+  are built once at init and never rewritten, so a live size change cannot
+  race a render (the old per-head window snapshot is gone).
+- Per-frame phase seed = `hash(lifeSeed, frameIdx)`, so a re-render of the
+  same frame with the same controls is bit-identical regardless of scheduling.
 
 ## Toolchain (already installed on this machine)
 
@@ -188,7 +221,7 @@ AXI SRAM); we do NOT re-pull libDaisy's copy. If `APP_TYPE` ever moves off
 
 ```
 dreamosc/
-  stretch_core.h      DSP core: Source, Voice, Sequencer, StretchTables (portable)
+  stretch_core.h      DSP core: Source, Head, Sequencer, StretchTables (portable)
   controls_core.h     Control-surface logic: PanelEditor, encoder stepping, LED
                       colors (portable, host-tested — see CONTROLS.md)
   shy_fft.h           Emilie Gillet's embedded real FFT (MIT; vendored)
@@ -347,22 +380,26 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   the `0.853553…` = `(1+1/√2)/2` AM-correction curve (ported against the real
   `essej/paulxstretch` `Stretch.cpp`, not a summary of it). Within a head, block
   junctions are window-mediated overlap. BETWEEN heads the seam is the **`fade`
-  crossfade**: fade 0 keeps the natural one-hop tail (butt-joint); fade > 0
-  applies an equal-power (quarter-sine) fade so ≤2 heads sum to constant power
-  (a full-volume-tail bug that clicked at every crossfaded seam is fixed and
-  guarded by a test). Analysis window is Nasca's `(1-x²)^1.25`; a rectangular
-  window leaked 0.6% out-of-band energy and was audibly scratchy.
+  crossfade**: fade 0 is a raw cut (the incoming head arrives pre-rolled, at
+  full level, so the cut is spectral only); fade > 0 applies an equal-power
+  (quarter-sine) fade so ≤2 heads sum to constant power. Analysis window is
+  Nasca's `(1-x²)^1.25`; a rectangular window leaked 0.6% out-of-band energy
+  and was audibly scratchy.
 - **DSP + control cores: host-tested.** Run `dreamosc/test/run.sh` — vendored-
   source drift check plus Catch2 unit tests over `stretch_core.h` (determinism,
-  bounds, the crossfade/interval model, constant-loudness, drift, multi-
-  samplerate, click detection, per-frame-size rendering), `controls_core.h`
+  bounds, seam continuity at every size, pre-roll level, no startup/single-step
+  hole, constant-loudness, live-control latency, a cost-modelled producer for
+  scheduling, holds-never-silence, ring-out cap/expiry, drift, multi-samplerate,
+  click detection, per-frame-size rendering), `controls_core.h`
   (pickup, mode navigation, drift-fold, encoder stepping, LED colors), and
   `shy_fft.h` (round-trips). Gates on exit code; the count grows with behavior —
   read it from the run, don't hardcode it here. See `dreamosc/test/README.md`.
 - **Pod firmware: WORKING on hardware through `alpha2`** (crossfade model,
   detented stretch to 10000×, two-mode panel controls, PROFILE diagnostics).
-  `experimental` adds live frame size on top (host-tested, not yet heard on the
-  bench). See the tag discipline above and Fizzy for what's next.
+  The frame model (pre-roll, head pool, EDF rendering, live controls, 480 MHz,
+  block 32) is host-tested and links for the device but is NOT yet heard on
+  the bench — see `dreamosc/OPEN_ISSUES.md` for exactly what the bench owes.
+  See the tag discipline above and Fizzy for what's next.
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
   stereo->mono fold). Not yet run on hardware (no card yet — Fizzy #131). Source
@@ -386,8 +423,12 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
 - **`make PROFILE=1`** builds a diagnostic firmware that prints per-second lines
   over USB serial (`screen /dev/tty.usbmodem* 115200`): a `SET` line (full
   instrument state), `KNOB`/`POS`/`DRF` lines (per-step + control state), and an
-  `HLTH` line (active voices, service µs, per-render `avg_us`, ISR µs, underruns),
-  all as scaled integers (nano-newlib printf can't do floats). This is how the
+  `HLTH` line (gated/ringing/armed heads, service µs, per-render `avg_us` and
+  `max_us`, ISR µs, frame holds `du`, `late` samples, re-renders `rfr`, min
+  `slack` to deadline, per-size render `cost`, stack high-water), all as scaled
+  integers (nano-newlib printf can't do floats). Timing uses raw `GetTick()`
+  deltas: `System::GetUs()` wraps every 21.5 s and poisoned the old numbers
+  once per wrap. This is how the
   spread-0 CPU overload was measured, how the pickup and "steps go silent" bugs
   were diagnosed from the board instead of by conjecture, and how any control/DSP
   behavior is confirmed on-device. Gated behind `-DPROFILE`; costs nothing in
@@ -405,37 +446,30 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   for, the Daisy's 64 MB SDRAM / 8 MB QSPI / codec, board-revision caveats) live
   there with citations. Read it before reasoning about memory placement or CPU
   budget — the correctness of where we put buffers is judged against that doc.
+- **Clock.** `pod.Init(true)` — boost mode, **480 MHz**. libDaisy's default
+  (`pod.Init()`) is 400 MHz, which is what every `max_us` before the frame model
+  was measured at. Whether 480 is clean on the codec and QSPI paths is a bench
+  item (OPEN_ISSUES.md).
 - **Memory.** `SS_W = 16384` is the compile-time buffer MAX (~0.34 s at 48 kHz,
-  PaulXStretch's shimmer regime, #136); the runtime window is ≤ this (frame-size
-  control) and **defaults to 4096** (`FRAME_DEFAULT_IDX`). Per Voice: `old_[SS_W]`
-  + `ring_[2*SS_W]` + `win_[SS_W]` = 256 KB (`win_` is the voice's own snapshot of
-  the analysis window curve, so a live frame-size change can't corrupt a sounding
-  voice — the fast-scroll noise bug); `SS_MAX_VOICES = 2*SS_STEPS = 16` slots (a
-  voice's tail outlives the re-fire period, so slots must exceed SS_STEPS or steps
-  drop) → the voice pool (~4 MB) lives in **SDRAM** (a plain float array `init()`
-  carves + memsets), as does the **source buffer (~1.9 MB)**.
-  - **The three hot FFT buffers — `gWork`, `gSpec`, and `gWindow` (64 KB each at
-    SS_W 16384) — live in AXI SRAM** (`AXISRAM_DATA` → the `.axisram_bss` section
-    in our `dreamosc.lds`). AXI SRAM (D1, 480 KB, ~59% used) is fast +
+  PaulXStretch's shimmer regime, #136); the runtime window is any power of two
+  in `[SS_W_MIN, SS_W]` and **defaults to 4096** (`FRAME_DEFAULT_IDX`). Per Head:
+  `SS_FRAME_BUFS = 6` frame buffers of `SS_W` floats (old, cur, a staged pair, a
+  refresh pair) = 384 KB; `SS_HEADS = 10` (cap 6 gated + 1 armed + slack) → the
+  head pool (~3.9 MB) lives in **SDRAM** (a plain float array `init()` carves),
+  as do the **source buffer (~1.9 MB)** and the immutable tables (`gWindows`,
+  `gBlendA`, `gBlendC`, ~255 KB, read sequentially so they cache well). SDRAM is
+  configured cacheable + bufferable by libDaisy's MPU region 1.
+  - **The two hot FFT buffers — `gWork` and `gSpec` (64 KB each at SS_W 16384)
+    — live in AXI SRAM** (`AXISRAM_DATA` → the `.axisram_bss` section in our
+    `dreamosc.lds`). AXI SRAM (D1, 480 KB, ~49% used incl. code) is fast +
     L1-cacheable — the region ST designates for large hot working sets that
     outgrow DTCM (see `hardware_spec.md`). The per-frame FFT hits these hard, so
-    they belong in the fast tier, NOT external SDRAM. (They were briefly in
-    `DSY_SDRAM_BSS` as a stopgap when we still used libDaisy's stock linker
-    script, which had no AXI-SRAM bss section; owning `dreamosc.lds` fixed that.)
-    `gWindow` was split out of the `StretchTables` object into a plain global
-    exactly so it could be placed here — the invasive-but-correct move, not a
-    hack. **Safe by construction:** every access is bounded by `activeW`/`w_`
-    (audited), and `setWindow()`/the FFT always write before any read, so NOLOAD
-    (no `.bss` zeroing) is fine — nothing relies on zero-init.
-    **NOTE:** this placement is *correct per ST's guidance*, but the speedup over
-    SDRAM is NOT yet measured — confirm it on the bench (`avg_us` at 16384, AXI
-    vs the old SDRAM build) before claiming a win.
-  - The `Sequencer` OBJECT + `gTab` stay in internal RAM. Moving `gWindow` out
-    dropped **DTCM from ~94% to ~44%** — healthy headroom restored; `gTab` now
-    holds only the FFT twiddles + sinLut, not the 64 KB window LUT. The crossfade
-    model caps CONCURRENT sounding heads at 2, so CPU should stay in budget even
-    with 16 slots — but that is a bench-verified claim at the largest window, not
-    a given: confirm `avg_us`/`du` under `make PROFILE=1` at 16384.
+    they belong in the fast tier, NOT external SDRAM. **Safe by construction:**
+    the FFT always writes before any read, so NOLOAD (no `.bss` zeroing) is fine.
+    The speedup over SDRAM was never measured; it is a hypothesis for the bench.
+  - The `Sequencer` OBJECT + `gTab` stay in internal RAM (DTCM ~47%). A frame
+    buffer is always fully written by a render before the ISR can reference it,
+    so NOLOAD garbage never reaches the output.
 - **DO NOT put a C++ object with a constructor in `DSY_SDRAM_BSS`.** `.sdram_bss`
   is `NOLOAD` and SDRAM is not powered until `Init()`, so objects placed there get
   NEITHER their constructor run NOR their storage zeroed — they boot with garbage
@@ -449,11 +483,10 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
 - **Two Pythons, one truth:** `paulstretch.py` is the older origin convention;
   `stretchseq.py` + `stretch_core.h` are the current, matching pair. Verify against
   `stretchseq.py`.
-- **Host harness lag:** `host/host_main.cpp` still exposes `--spread` (the retired
-  onset-offset model), not the current `fade` crossfade — the host CLI predates
-  the crossfade rework. The DSP core it drives IS current; only the harness's
-  command-line surface is stale. Update it (spread → fade) when host_main next
-  needs touching; the unit tests (`test/`) already exercise the current model.
+- **Host aids:** `host/host_main.cpp` renders a WAV through the current core
+  (`--stretch/--duration/--fade`). `host/seam_probe.cpp` prints the RMS envelope
+  around every raw-cut seam — the measurement that found the missing pre-roll;
+  run it after any change to the seam or the pre-roll.
 
 ## archive/
 

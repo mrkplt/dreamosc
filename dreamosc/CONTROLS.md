@@ -59,8 +59,8 @@ led1** (`hueROYGBIVW`, so a color means the same on both LEDs and orange/yellow
 stay distinct). **Brightness on EVERY page tracks that page's encoded level** —
 a bright LED always means "this parameter is turned up".
 
-Click order: **stretch → steps → fade → window → stretch** (the page index is
-also the color index, so click order = RoYG).
+Click order: **stretch → steps → fade → window → ringout → stretch** (the page
+index is also the color index, so click order = ROYGB).
 
 | Page | led2 hue | encoder turn | brightness = |
 |------|----------|--------------|--------------|
@@ -68,6 +68,7 @@ also the color index, so click order = RoYG).
 | **steps** | orange | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
 | **fade** | yellow | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
 | **window** (frame) | green | index `FRAME_STOPS` {16384,8192,4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**; **default 4096**, mid-table) | knob position (CCW dim → CW bright) |
+| **ringout** | blue | remnant length 0..16 s → `seq.ringout` (additive; fast 1 s, slow 0.25 s/detent) | ring-out length (0 dim → 16 s bright) |
 
 - All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
   bottom of a range is still lit, never off): `stretchBrightness`,
@@ -94,6 +95,17 @@ also the color index, so click order = RoYG).
   longer bends step timing (the old model quantized the dwell to the analysis-hop
   grid, which snapped short steps at large windows). Turn duration down mid-dwell
   and the sequence fast-marches immediately, even out of a minute-long dwell.
+- **Ring-out** (Fizzy #155, #152): how long a step keeps sounding *after* the
+  read head has moved on. **0 = OFF** — the clean sequential instrument (a
+  departing step stops the instant the next begins; byte-identical to no
+  ring-out). Turn it up (0..16 s) and a departing step's life is handed to a
+  **remnant** that keeps rendering at **full volume** for that long, then stops
+  with a raw cut (spectral, not amplitude — no fade, like every seam). This is
+  the "enjoyable lingering tail" from #152 made a deliberate, budgeted feature:
+  a long ring-out over a fast march stacks overlapping tails, but total concurrent
+  rendering is **hard-capped at 6** (`SS_RENDER_CAP`) by **ditching the oldest**
+  remnant (the one furthest through its ring-out — least tail left to lose).
+  Watch `rmn`/`act` in `make PROFILE=1` to see the cap hold.
 - **Step count** (Fizzy #149): how many of the 8 steps the sequence walks, 1..8.
   Fewer steps = a shorter, faster-repeating pattern (a real compositional
   control). The `position[]`/`drift[]` arrays stay sized to 8; only steps below

@@ -276,6 +276,10 @@ static void processControls() {
       // shrank past the currently selected step.
       seq.setSteps(stepCount(seq.activeSteps, inc, 1, SS_STEPS));
       panel.clampToActive(seq.activeSteps);
+    } else if (encPage == PAGE_RINGOUT) {
+      // Ring-out remnant length 0..16 s (#155). 0 = off (clean instrument). Fast
+      // spin = 1 s/detent, slow = 0.25 s -- a coarse control, seconds of tail.
+      seq.ringout = stepAdditive(seq.ringout, inc, fast ? 1.0f : 0.25f, 0.0f, 16.0f);
     } else {   // PAGE_FADE
       seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
     }
@@ -296,19 +300,21 @@ static void processControls() {
   if (panel.speed2() > dbgPk2) dbgPk2 = panel.speed2();
 #endif
 
-  // --- led2: encoder page color (RoYG over stretch/steps/fade/window, same
-  // ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
+  // --- led2: encoder page color (ROYGB over stretch/steps/fade/window/ringout,
+  // same ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
   // encoded LEVEL, so a bright LED always means "this parameter is turned up":
   //   stretch -> red    = stretch detent index
   //   steps   -> orange = active step count
   //   fade    -> yellow = crossfade amount (0..0.5)
   //   frame   -> green  = frame-size (window) index
+  //   ringout -> blue   = ring-out remnant length (0..16 s)
   float b2;
   switch (encPage) {
     case PAGE_STRETCH: b2 = stretchBrightness(stretchIdx, STRETCH_NSTOPS); break;
     case PAGE_FADE:    b2 = fadeBrightness(seq.fade);                      break;
     case PAGE_FRAME:   b2 = frameBrightness(frameIdx, FRAME_NSTOPS);       break;
     case PAGE_STEPS:   b2 = stepBrightness(seq.activeSteps);               break;
+    case PAGE_RINGOUT: b2 = ringoutBrightness(seq.ringout);               break;
     default:           b2 = 0.15f;                                         break;
   }
   Rgb c2 = pageColor(encPage, b2);
@@ -379,6 +385,7 @@ int main(void) {
   seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
+  seq.ringout  = 0.0f;    // ring-out OFF by default (clean sequential instrument)
   // SS_W is now the 16384 MAX, but the default window is 4096 (FRAME_DEFAULT_IDX)
   // -- set it explicitly so gTab + seq start at 4096, not the max. The window
   // page grows it toward the shimmer regime or shrinks it from here.
@@ -440,11 +447,12 @@ int main(void) {
       // the knob-to-ear / pre-warm lead, so this is THE number to size on the
       // bench (see the HLTH fill_min).
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d frame=%d steps=%d fill=%u ftgt=%u ring=%u page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d rel_ms=%d frame=%d steps=%d fill=%u ftgt=%u ring=%u page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(globalDrift * 10000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
+          (int)(seq.ringout * 1000.0f + 0.5f),   // ring-out length (ms)
           seq.frameSize,
           seq.activeSteps,   // active step count (#149)
           (unsigned)seq.curFill(),      // live cushion of the sounding head
@@ -493,15 +501,18 @@ int main(void) {
           (int)(seq.drift[4]*10000+0.5f), (int)(seq.drift[5]*10000+0.5f),
           (int)(seq.drift[6]*10000+0.5f), (int)(seq.drift[7]*10000+0.5f));
       // HEALTH line: CPU and dropout accounting for this second. act = gated
-      // (sounding) heads -- the concurrency ceiling (<=2 gated, <=3 rendering with
-      // pre-warm; #155). fmin = cushion LOW-WATER across all heads this second
+      // (sounding) STEP heads; rmn = active ring-out remnants (#155). Total
+      // renderers (act-ish + pre-warm + rmn) are capped at SS_RENDER_CAP = 6 by
+      // ditch-oldest -- watch rmn on a fast march to see the cap hold. fmin =
+      // cushion LOW-WATER across all heads this second
       // (samples): how close the demand cushion came to starving -- the number
       // that says how far SS_FILL_TARGET can shrink. max_us = worst single
       // service() call (the burst avg_us hides). stk = deepest stack use (bytes
       // below _estack); a hang at 16384 with du=0 points here.
       pod.seed.PrintLine(
-          "HLTH act=%d units=%u svc_us=%u avg_us=%u max_us=%u fmin=%u isr_us=%u du=%u stk=%u",
-          seq.activeVoices(), (unsigned)profUnits, (unsigned)profBusyUs,
+          "HLTH act=%d rmn=%d units=%u svc_us=%u avg_us=%u max_us=%u fmin=%u isr_us=%u du=%u stk=%u",
+          seq.activeVoices(), seq.activeRemnants(),
+          (unsigned)profUnits, (unsigned)profBusyUs,
           (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)profMaxUs,
           (unsigned)seq.takeMinFill(),
           (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),

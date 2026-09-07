@@ -18,16 +18,18 @@
 #include "stretch_core.h"   // for SS_STEPS
 
 // Encoder pages (the parameter the encoder turn drives; click cycles). Duration
-// and drift live on the knobs (global mode); these four are the encoder's.
-// Click order: stretch -> steps -> fade -> frame(window) -> stretch. The page
-// INDEX maps to the RoYG hue via hueROYGBIVW (0=red..3=green), so this order is
-// also the LED color order: stretch=red, steps=orange, fade=yellow, window=green.
+// and drift live on the knobs (global mode); these five are the encoder's.
+// Click order: stretch -> steps -> fade -> frame(window) -> ringout -> stretch.
+// The page INDEX maps to the ROYGBIVW hue via hueROYGBIVW (0=red..4=blue), so
+// this order is also the LED color order: stretch=red, steps=orange, fade=yellow,
+// window=green, ringout=blue.
 enum EncoderPage {
   PAGE_STRETCH  = 0,   // red
   PAGE_STEPS    = 1,   // orange (active step count, #149)
   PAGE_FADE     = 2,   // yellow
   PAGE_FRAME    = 3,   // green  (frame/window size, #136)
-  PAGE_COUNT    = 4,
+  PAGE_RINGOUT  = 4,   // blue   (ring-out remnant length 0..16 s, #155)
+  PAGE_COUNT    = 5,
 };
 
 struct Rgb { float r, g, b; };
@@ -176,7 +178,7 @@ inline Rgb hueROYGBIVW(int i) {
 // encoded level -- stretch/fade/frame/steps brightness via the *Brightness
 // helpers below). So a bright LED always means "this parameter is turned up".
 inline Rgb pageColor(EncoderPage page, float b) {
-  Rgb h = hueROYGBIVW((int)page);   // pages 0..3 map to red/orange/yellow/green
+  Rgb h = hueROYGBIVW((int)page);   // pages 0..4 -> red/orange/yellow/green/blue
   return {h.r * b, h.g * b, h.b * b};
 }
 
@@ -217,6 +219,14 @@ inline float fadeBrightness(float fade, float fadeMax = 0.5f, float floorB = 0.1
 // as the window shrinks is intentional (it tracks the knob, not the size).
 inline float frameBrightness(int idx, int count, float floorB = 0.15f) {
   return stretchBrightness(idx, count, floorB);   // idx 0 dim -> max idx bright
+}
+
+// PAGE_RINGOUT blue intensity = ring-out length over [0, ringoutMax] seconds
+// (default 16 s). 0 (off, clean instrument) sits at the dim floor; a long tail
+// is bright. Same level convention as the other pages.
+inline float ringoutBrightness(float ringout, float ringoutMax = 16.0f,
+                               float floorB = 0.15f) {
+  return levelBrightness(ringoutMax > 0.0f ? ringout / ringoutMax : 0.0f, floorB);
 }
 
 // LED1 color for the selected step, ROYGBIVW over the 8 steps, at a fixed

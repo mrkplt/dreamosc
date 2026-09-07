@@ -358,6 +358,100 @@ TEST_CASE("activeSteps == 1 re-arms the single head each dwell (#149 degrade)") 
   REQUIRE(rms(out) > 0.0f);                     // it sounds
 }
 
+// --- ring-out remnants (#155 stage 2) --------------------------------------
+
+// Drive the sequencer for `n` samples, fully draining service() each sample
+// (device main-loop discipline), returning the peak activeRemnants() seen and
+// the output. Helper local to the ring-out tests.
+namespace {
+struct RingoutRun { std::vector<float> out; int peakRemnants; int peakTotal; };
+RingoutRun driveRingout(Sequencer& seq, uint32_t n) {
+  RingoutRun r{{}, 0, 0};
+  for (uint32_t i = 0; i < n; i++) {
+    for (int g = 0; g < 128 && seq.service(); g++) {}
+    int rem = seq.activeRemnants();
+    int tot = seq.activeVoices() + rem;
+    if (rem > r.peakRemnants) r.peakRemnants = rem;
+    if (tot > r.peakTotal)    r.peakTotal = tot;
+    r.out.push_back(seq.next());
+  }
+  return r;
+}
+}  // namespace
+
+TEST_CASE("ring-out: a departing head is adopted into a remnant and keeps sounding") {
+  // With ringout > 0, leaving a step spawns a remnant that renders at full volume
+  // for ~ringout seconds. Short dwells so several seams pass; assert remnants
+  // actually appear and the output stays finite/bounded.
+  gTab.init();
+  auto srcbuf = make_source(4.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.3f, 0.0f);
+  seq.ringout = 1.0f;                          // 1 s tails
+
+  auto r = driveRingout(seq, 48000 * 2);
+  for (float v : r.out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
+  REQUIRE(r.peakRemnants >= 1);                // ring-out actually spawned tails
+}
+
+TEST_CASE("ring-out: total concurrent renderers never exceed SS_RENDER_CAP") {
+  // The hard cap (Mark's ruling: 6 total; 9 would blow the chip). A fast march
+  // with a long ring-out would want many overlapping tails; ditch-oldest must
+  // hold the ceiling. peakTotal = gated step heads + active remnants.
+  gTab.init();
+  auto srcbuf = make_source(4.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.15f, 0.0f);   // fast march
+  seq.ringout = 8.0f;                          // long tails => wants many slots
+
+  auto r = driveRingout(seq, 48000 * 3);
+  INFO("peak total renderers " << r.peakTotal);
+  REQUIRE(r.peakTotal <= SS_RENDER_CAP);       // ceiling held by ditch-oldest
+  REQUIRE(r.peakRemnants >= 1);                // and ring-out was actually active
+}
+
+TEST_CASE("ring-out: a remnant stops after its render length (raw cut)") {
+  // A single tail must END, not ring forever. One active step, short dwell, a
+  // short ring-out: after the ring-out length past a hand-off the remnant count
+  // must return to 0 (the tail stopped).
+  gTab.init();
+  auto srcbuf = make_source(4.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
+  seq.setSteps(2);
+  seq.ringout = 0.5f;                           // half-second tails
+
+  // Run long enough that at least one remnant has spawned AND fully expired.
+  bool sawRemnant = false, sawExpiry = false;
+  for (uint32_t i = 0; i < 48000 * 4; i++) {
+    for (int g = 0; g < 128 && seq.service(); g++) {}
+    seq.next();
+    int rem = seq.activeRemnants();
+    if (rem > 0) sawRemnant = true;
+    if (sawRemnant && rem == 0) sawExpiry = true;   // a tail came and went
+  }
+  REQUIRE(sawRemnant);
+  REQUIRE(sawExpiry);                            // remnants stop, don't ring forever
+}
+
+TEST_CASE("ring-out == 0 is byte-identical to no remnants (clean instrument)") {
+  // Page 0 / off must leave the sequential instrument EXACTLY as it was: same
+  // samples as a run that never touches ringout. This is the regression guard
+  // that "ring-out off changes nothing".
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+
+  Sequencer a; make_seq(a, &src, 48000, 50.0f, 0.4f, 0.0f);   // ringout defaults 0
+  Sequencer b; make_seq(b, &src, 48000, 50.0f, 0.4f, 0.0f);
+  b.ringout = 0.0f;                             // explicitly off
+
+  auto oa = render(a, 3);
+  auto ob = render(b, 3);
+  REQUIRE(oa.size() == ob.size());
+  for (size_t i = 0; i < oa.size(); i++) REQUIRE(oa[i] == ob[i]);   // bit-exact
+}
+
 TEST_CASE("configurable step count: setSteps clamps to [1, SS_STEPS] (#149)") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);

@@ -307,11 +307,14 @@ TEST_CASE("smoothKnob: first read jumps, then eases") {
 
 // --- page + LED color -------------------------------------------------------
 
-TEST_CASE("nextPage cycles stretch -> steps -> fade -> frame -> stretch") {
+TEST_CASE("nextPage cycles stretch -> steps -> fade -> frame -> ringout -> stretch") {
+  // #155 added PAGE_RINGOUT (blue) after frame, so the cycle is now 5 pages and
+  // frame no longer wraps to stretch -- ringout does.
   REQUIRE(nextPage(PAGE_STRETCH) == PAGE_STEPS);
   REQUIRE(nextPage(PAGE_STEPS)   == PAGE_FADE);
   REQUIRE(nextPage(PAGE_FADE)    == PAGE_FRAME);
-  REQUIRE(nextPage(PAGE_FRAME)   == PAGE_STRETCH);   // wraps (4 pages)
+  REQUIRE(nextPage(PAGE_FRAME)   == PAGE_RINGOUT);
+  REQUIRE(nextPage(PAGE_RINGOUT) == PAGE_STRETCH);   // wraps (5 pages)
 }
 
 TEST_CASE("pageColor: RoYG in click order, shared palette, brightness scales") {

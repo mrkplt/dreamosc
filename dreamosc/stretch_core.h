@@ -19,9 +19,12 @@
 // character; amplitude is continuous by construction (zero-mean, RMS-tracks-
 // source), so a CLICK would be a bug, HEARING THE CUTOVER is not.
 //
-// STAGE 1 (this file): persistent heads + robotic sequencer + pre-warm + seam
-// crossfade + no hop quantization.  Ring-out remnants (the enjoyable lingering
-// tail as a budgeted feature) are STAGE 2 and not built here.
+// RING-OUT REMNANTS (#155): a departing step head's life is ADOPTED into a
+// remnant Head slot and keeps rendering at FULL VOLUME for `ringout` seconds,
+// then stops with a raw cut -- the #152 lingering tail, made a budgeted feature.
+// A remnant is just another Head. Total concurrent renderers (sounding step
+// heads + pre-warm + active remnants) are capped at SS_RENDER_CAP by ditching
+// the OLDEST remnant; ringout 0 = off = the clean sequential instrument.
 
 #ifndef STRETCH_CORE_H
 #define STRETCH_CORE_H
@@ -70,6 +73,20 @@ using stmlib::RotationPhasor;
 #endif
 #define SS_H (SS_W / 2)      // MAX output hop (SS_W/2); the RUNTIME hop is activeH
 #define SS_STEPS 8
+// Ring-out remnant heads (#155 stage 2): extra Head slots a departing step head's
+// life is ADOPTED into so it keeps rendering (full volume) for the ring-out time,
+// then stops. A remnant is just another Head. SS_REMNANTS is the slot count;
+// the RUNTIME concurrency cap (SS_RENDER_CAP) is what actually bounds CPU -- see
+// there. 6 slots so a fast march can bump several buffers out at once.
+#define SS_REMNANTS 6
+// Total heads in the pool: one per step + the remnant slots.
+#define SS_HEADS (SS_STEPS + SS_REMNANTS)
+// HARD render ceiling: the MOST heads that may be rendering (sounding step heads
+// + pre-warm + active remnants) at once. 6 total is the bench-proven-safe number
+// (the #152 pileup ran 6 with no dropouts); 9 would blow the H750. The sequencer
+// enforces this on the TOTAL by ditching the oldest remnant before it would be
+// exceeded -- so remnant slots are effectively (cap - sounding/pre-warm), dynamic.
+#define SS_RENDER_CAP 6
 
 // DEMAND-CUSHION ring per head (#155). The ring is NOT committed audio like the
 // old voice FIFO -- it is a small cushion of already-rendered future the ISR
@@ -97,14 +114,19 @@ using stmlib::RotationPhasor;
 // an audible tick on hardware). ~2 dB.
 #define SS_HEADROOM 0.8f
 
-// Per-head scratch: 4 rotating frame buffers (old/cur for each of the <=2 lanes)
-// + ring_ (SS_RING) + win_ (SS_W, this head's snapshot of the analysis window so
-// a live frame-size change can't corrupt a rendering head -- the fast-scroll
-// bug). One head per step. The caller allocates SS_POOL_FLOATS and passes it to
-// Sequencer::init(); at SS_W 16384 that is SS_STEPS * (4*16384 + 1024 + 16384)
-// floats.
-#define SS_HEAD_FLOATS (4 * SS_W + SS_RING + SS_W)
-#define SS_POOL_FLOATS (SS_STEPS * SS_HEAD_FLOATS)
+// Per-head scratch: 2 rotating frame buffers (old + cur for this head's SINGLE
+// lane) + ring_ (SS_RING) + win_ (SS_W, this head's snapshot of the analysis
+// window so a live frame-size change can't corrupt a rendering head -- the fast-
+// scroll bug). TWO buffers, not four: a head runs exactly ONE lane (the cf22704
+// two-lane in/out handoff is not used -- the sequencer owns the seam now), and a
+// single lane references at most old+cur, with laneAdvance reusing the retiring
+// buffer as the next render target. The caller allocates SS_POOL_FLOATS and
+// passes it to Sequencer::init(); at SS_W 16384 that is SS_HEADS * (2*16384 +
+// 1024 + 16384) floats -- SS_HEADS = SS_STEPS step heads + SS_REMNANTS ring-out
+// slots, all identical Head objects.
+#define SS_FRAME_BUFS  2
+#define SS_HEAD_FLOATS (SS_FRAME_BUFS * SS_W + SS_RING + SS_W)
+#define SS_POOL_FLOATS (SS_HEADS * SS_HEAD_FLOATS)
 
 // ---------------------------------------------------------------------------
 // Shared scratch. Only one head renders at a time, from the main loop, so a
@@ -263,9 +285,9 @@ class Head {
   // .sdram_bss get neither constructor nor zeroing (NOLOAD, SDRAM unpowered at
   // static init), so only plain data may live there (see CLAUDE.md #129).
   void setBuffers(float* slice) {
-    for (int i = 0; i < 4; i++) buf_[i] = slice + (size_t)i * SS_W;
-    ring_ = slice + 4 * SS_W;
-    win_  = slice + 4 * SS_W + SS_RING;
+    for (int i = 0; i < SS_FRAME_BUFS; i++) buf_[i] = slice + (size_t)i * SS_W;
+    ring_ = slice + SS_FRAME_BUFS * SS_W;
+    win_  = slice + SS_FRAME_BUFS * SS_W + SS_RING;
   }
 
   // Full reset: idle, ring zeroed (SDRAM arrives holding garbage). No lanes are
@@ -277,8 +299,10 @@ class Head {
     driftRng_ = seed ^ (0x9E3779B9u * (index + 1u));
     if (driftRng_ == 0) driftRng_ = 0x9E3779B9u;
     in_ = Lane();
-    out_ = Lane();
     gated_.store(false, std::memory_order_relaxed);
+    remnant_ = false;
+    remain_ = 0;
+    elapsed_ = 0;
     memset(ring_, 0, SS_RING * sizeof(float));
     memset(win_, 0, SS_W * sizeof(float));
     wr_.store(0, std::memory_order_relaxed);
@@ -291,8 +315,17 @@ class Head {
     return wr_.load(std::memory_order_relaxed)
          - rr_.load(std::memory_order_relaxed);
   }
-  bool sounding() const { return in_.alive() || out_.alive(); }
+  bool sounding() const { return in_.alive(); }
   bool gated() const { return gated_.load(std::memory_order_acquire); }
+  // Remnant bookkeeping (ring-out, #155). A remnant is a head whose life was
+  // ADOPTED from a departing step head; it keeps rendering at full volume until
+  // remain_ samples elapse, then stops. elapsed_ (samples since adoption) is the
+  // ditch-oldest key. These are read/written on the ISR + main loop; remnant_ and
+  // remain_ are only mutated by the main loop (adoption / free), and the ISR only
+  // decrements remain_ while a remnant is gated -- single-writer per phase.
+  bool remnant() const { return remnant_; }
+  uint32_t remnantElapsed() const { return elapsed_; }
+  bool free() const { return !gated_.load(std::memory_order_acquire) && !in_.alive(); }
 
   // Cushion low-water since the last read of it (profiler: how close the cushion
   // came to starving). Sampled in next(); read-and-reset from the main loop.
@@ -330,9 +363,13 @@ class Head {
 
     // Fresh life. Any previous life is discarded outright -- the sequencer's
     // gate/read is what makes a head audible, and a re-arm means the reader is
-    // (about to be) here again; there is no ring-out in stage 1.
+    // (about to be) here again. If this head still held a ring-out life, the
+    // departing content was already ADOPTED into a remnant slot before the
+    // re-arm (Sequencer::service), so nothing audible is lost here.
+    remnant_ = false;
+    remain_ = 0;
+    elapsed_ = 0;
     in_  = Lane();
-    out_ = Lane();
     in_.srcPos = (double)position * (double)src_->len;
     // Phase seed comes from the position, not a counter, so the same position
     // always yields the same audio -- what makes zero drift a literal repeat.
@@ -351,6 +388,69 @@ class Head {
     rr_.store(0, std::memory_order_release);
   }
 
+  // ADOPT a departing step head's life into THIS head as a ring-out remnant
+  // (main loop only, #155). The step head keeps rendering (full volume) here for
+  // `renderSamples` more samples, then stops -- the "enjoyable tail" of #152 made
+  // a budgeted feature. We must carry the LANE, not the ring: a ring is only a
+  // ~21 ms cushion of already-emitted audio, but the lane (srcPos/rng/stretch +
+  // its old/cur frame buffers + frozen geometry/window/gain) is what lets it KEEP
+  // rendering. So: struct-copy the lane, deep-copy its live frame buffers into
+  // THIS head's own buffers (remapping the pointers), copy the geometry + window
+  // snapshot + gain, and start a fresh empty ring. The remnant then renders
+  // forward exactly as the source head would have.
+  void adoptLane(const Head& from, uint32_t renderSamples) {
+    // Geometry + gain + window snapshot come with the life (a remnant may outlive
+    // a frame-size change on the step heads, so it must render at ITS size).
+    w_ = from.w_; h_ = from.h_; passes_ = from.passes_;
+    synthGain_ = from.synthGain_;
+    memcpy(win_, from.win_, (size_t)w_ * sizeof(float));
+
+    // Copy the lane, then remap its buffer pointers to OUR buffers and deep-copy
+    // the live frame contents. from.in_.old/cur point into from's buffers; map
+    // each to the same slot index in ours so the old/cur relationship is kept.
+    in_ = from.in_;
+    in_.old = remapBuf(from, from.in_.old);
+    in_.cur = remapBuf(from, from.in_.cur);
+    if (from.in_.old) memcpy(in_.old, from.in_.old, (size_t)from.in_.w * sizeof(float));
+    if (from.in_.cur) memcpy(in_.cur, from.in_.cur, (size_t)from.in_.w * sizeof(float));
+
+    remnant_ = true;
+    remain_  = renderSamples;
+    elapsed_ = 0;
+    // Fresh ring: the remnant fills from empty and is gated on immediately (it is
+    // already sounding on the step head; the reader crosses over seamlessly since
+    // both are the SAME phase-randomized stream continuing).
+    wr_.store(0, std::memory_order_release);
+    rr_.store(0, std::memory_order_release);
+    minFill_ = SS_RING;
+    gated_.store(true, std::memory_order_release);
+  }
+
+  // Advance a remnant's clocks by n consumed samples (ISR calls this once per
+  // sample it reads from a remnant). When the render time is spent, close the
+  // gate and kill the life -- a RAW stop (spectral, not amplitude; fine by the
+  // same algorithm logic as every seam). Returns true while still ringing.
+  inline bool remnantTick() {
+    elapsed_++;
+    if (elapsed_ >= remain_) {
+      gated_.store(false, std::memory_order_release);
+      in_ = Lane();          // kill the life so free() reports the slot available
+      remnant_ = false;
+      return false;
+    }
+    return true;
+  }
+
+  // Main-loop hard stop of a remnant (ditch-oldest): drop the gate and kill the
+  // life so free() reports the slot available for a new adoption this same
+  // service() pass. Distinct from remnantTick()'s ISR-side natural expiry.
+  void killRemnant() {
+    gated_.store(false, std::memory_order_release);
+    in_ = Lane();
+    remnant_ = false;
+    remain_ = 0;
+  }
+
   // Open/close the audible gate (main loop side of the arm; the ISR reads it).
   void openGate()  { gated_.store(true,  std::memory_order_release); }
   void closeGate() { gated_.store(false, std::memory_order_release); }
@@ -359,7 +459,7 @@ class Head {
   // crossed (the demand-driven part -- frames render as late as the cushion
   // allows, from the LIVE controls). Main loop only. Returns true if it emitted.
   bool topUp() {
-    if (!in_.alive() && !out_.alive()) return false;   // idle: nothing to make
+    if (!in_.alive()) return false;                    // idle: nothing to make
     uint32_t f = fill();
     if (f >= SS_FILL_TARGET) return false;             // cushion full enough
     uint32_t n = SS_FILL_TARGET - f;
@@ -416,10 +516,8 @@ class Head {
   void emit(uint32_t n) {
     uint32_t w = wr_.load(std::memory_order_relaxed);
     for (uint32_t i = 0; i < n; i++) {
-      float v = laneSample(in_) + laneSample(out_);
-      ring_[(w + i) & (SS_RING - 1)] = v;
+      ring_[(w + i) & (SS_RING - 1)] = laneSample(in_);
       laneAdvance(in_);
-      laneAdvance(out_);
     }
     // Release-store publishes the slice: all ring_ writes are visible to the ISR
     // before it can observe the advanced wr_.
@@ -474,15 +572,26 @@ class Head {
     }
   }
 
-  // A frame buffer no live lane references. Needed only when a lane has no
-  // retiring buffer to reuse (its first boundary), at which point at most three
-  // of the four are referenced.
+  // A frame buffer this head's (single) lane does not reference. With one lane
+  // and SS_FRAME_BUFS = 2, at most one of old/cur is set when freeBuf is needed
+  // (the lane's first boundary: cur set, old null -> the other buffer is free),
+  // and thereafter laneAdvance reuses the retiring buffer, so the two always
+  // suffice.
   float* freeBuf() const {
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < SS_FRAME_BUFS; i++) {
       float* b = buf_[i];
-      if (b != in_.old && b != in_.cur && b != out_.old && b != out_.cur)
-        return b;
+      if (b != in_.old && b != in_.cur) return b;
     }
+    return buf_[0];                    // unreachable by construction
+  }
+
+  // Map a frame-buffer pointer from another head `from` to the SAME slot index in
+  // THIS head's buffers, so adoptLane can deep-copy contents while preserving the
+  // lane's old/cur relationship. Returns nullptr for a null input.
+  float* remapBuf(const Head& from, float* p) const {
+    if (!p) return nullptr;
+    for (int i = 0; i < SS_FRAME_BUFS; i++)
+      if (p == from.buf_[i]) return buf_[i];
     return buf_[0];                    // unreachable by construction
   }
 
@@ -531,13 +640,20 @@ class Head {
 
   const Source* src_ = nullptr;
   uint32_t seed_ = 0, driftRng_ = 1;
-  Lane in_, out_;
+  Lane in_;                  // this head runs ONE lane (the sequencer owns seams)
   // This head's frozen render geometry + window snapshot for the CURRENT arm.
   int   w_ = SS_W_DEFAULT, h_ = SS_W_DEFAULT / 2, passes_ = 0;
   float synthGain_ = 1.0f;
+  // Ring-out remnant state (#155). remnant_: this head is a departing life kept
+  // rendering; remain_: samples of render left; elapsed_: samples since adoption
+  // (the ditch-oldest key). All plain (non-atomic): remnant_/remain_ set by the
+  // main loop at adoption, elapsed_ advanced by the ISR only while gated.
+  bool     remnant_ = false;
+  uint32_t remain_  = 0;
+  uint32_t elapsed_ = 0;
   // Buffers live in SDRAM, supplied via setBuffers(); pointers, not arrays, so
   // spell out the element count on every memset/memcpy.
-  float* buf_[4] = {nullptr, nullptr, nullptr, nullptr};
+  float* buf_[SS_FRAME_BUFS] = {nullptr};
   float* ring_ = nullptr;   // SS_RING-sample demand cushion
   float* win_  = nullptr;   // this head's snapshot of the analysis window curve
   uint32_t minFill_ = SS_RING;   // cushion low-water since last takeMinFill()
@@ -570,6 +686,14 @@ class Sequencer {
   // whole step); the pre-warm of the next makes 3 the render ceiling.
   float fade  = 0.0f;
 
+  // Ring-out (#155 stage 2): how long, in SECONDS, a departing step head keeps
+  // rendering at FULL VOLUME as a remnant before it stops (a raw spectral cut, no
+  // envelope -- Mark's ruling). 0 = OFF: no remnants, the clean sequential
+  // instrument (byte-identical to stage 1). Range 0..16 s. The 6-total render cap
+  // (SS_RENDER_CAP) bounds CPU regardless; a long ring-out on a fast march just
+  // means the oldest remnant is ditched to stay under the cap.
+  float ringout = 0.0f;
+
   // Frame/window size in samples (#136): a sound-CHARACTER control. Power of two,
   // 64..SS_W. Live now (not latched at fire) -- the head snapshots it per arm.
   // Default = SS_W_DEFAULT so host + firmware boot at the same window.
@@ -601,7 +725,7 @@ class Sequencer {
     src_ = src;
     sr_ = sampleRate;
     seed_ = seed;
-    for (int i = 0; i < SS_STEPS; i++) {
+    for (int i = 0; i < SS_HEADS; i++) {
       head_[i].setBuffers(pool + (size_t)i * SS_HEAD_FLOATS);
       head_[i].init(src, seed, (uint32_t)i);
     }
@@ -613,6 +737,7 @@ class Sequencer {
     fadeLen_ = 0;
     prewarmDone_ = false;
     armHead_ = armTail_ = 0;
+    relHead_ = relTail_ = 0;
     // Prime: arm the first head immediately (main loop will fill it) and schedule
     // its gate to open after the lookahead, so it is primed when it first sounds.
     startPending_ = true;
@@ -624,6 +749,12 @@ class Sequencer {
   uint32_t durSamples() const {
     uint32_t n = (uint32_t)(duration * sr_ + 0.5f);
     return n < 1 ? 1 : n;
+  }
+
+  // Ring-out length in samples (0 = off). Clamped to [0, 16 s].
+  uint32_t ringoutSamples() const {
+    float r = ringout < 0.0f ? 0.0f : (ringout > 16.0f ? 16.0f : ringout);
+    return (uint32_t)(r * sr_ + 0.5f);
   }
 
   // Nominal samples for ONE pass of all active steps: the start lookahead prime
@@ -717,6 +848,17 @@ class Sequencer {
       sum = head_[cur_].next();
     }
 
+    // --- READ the ring-out remnants (full volume, no envelope) and tick them ---
+    // Remnants live in the [SS_STEPS, SS_HEADS) slots. Each gated remnant is read
+    // once (keeps its rr_ in lockstep with wall time) and summed at full volume;
+    // remnantTick advances its render clock and closes it with a raw stop when
+    // spent. This is the #152 lingering tail, now bounded by SS_RENDER_CAP.
+    for (int i = SS_STEPS; i < SS_HEADS; i++) {
+      if (!head_[i].gated()) continue;
+      sum += head_[i].next();
+      head_[i].remnantTick();
+    }
+
     // --- ADVANCE the clock; handle end-of-dwell ---
     if (d.end) {
       if (single) {
@@ -731,7 +873,17 @@ class Sequencer {
         elapsed_ = 0;
         prewarmDone_ = false;
       } else {
-        if (cur_ != inc_) head_[cur_].closeGate();   // retire the outgoing head
+        // Retire the outgoing head. With ring-out ON, don't just close its gate:
+        // hand its still-rendering life to a REMNANT slot (main loop does the
+        // adoption -- see service()) so it keeps sounding for ringoutSamples(),
+        // then the step head re-arms fresh on its next visit. The ISR keeps the
+        // outgoing head gated + read until the main loop has adopted it, so its
+        // stream never drops mid-flight. With ring-out OFF, close it now (stage-1
+        // behavior, byte-identical).
+        if (cur_ != inc_) {
+          if (ringoutSamples() > 0) requestRelease(cur_);
+          else                      head_[cur_].closeGate();
+        }
         cur_ = inc_;                                 // incoming becomes current
         inc_ = cur_;                                 // seam done
         next_ = (cur_ + 1) % activeSteps;
@@ -752,6 +904,17 @@ class Sequencer {
   // this one thread so it never races the ISR) and tops up cushions. One unit of
   // work per call; returns true if it did work so a caller can spin until idle.
   bool service() {
+    // Release requests FIRST: adopt a departing step head's life into a remnant
+    // slot before the step head can be re-armed, so the ring-out is never lost.
+    uint32_t rh = relHead_.load(std::memory_order_acquire);
+    uint32_t rt = relTail_.load(std::memory_order_relaxed);
+    if (rh != rt) {
+      uint32_t step = relReq_[rt & (SS_ARMQ - 1)];
+      releaseToRemnant(step);
+      relTail_.store(rt + 1, std::memory_order_release);
+      return true;
+    }
+    // Then pre-warm/arm requests.
     uint32_t h = armHead_.load(std::memory_order_acquire);
     uint32_t t = armTail_.load(std::memory_order_relaxed);
     if (h != t) {
@@ -760,7 +923,8 @@ class Sequencer {
       armTail_.store(t + 1, std::memory_order_release);
       return true;
     }
-    for (int i = 0; i < SS_STEPS; i++)
+    // Then top up EVERY head's cushion (step heads + active remnants).
+    for (int i = 0; i < SS_HEADS; i++)
       if (head_[i].topUp()) return true;
     return false;
   }
@@ -774,6 +938,14 @@ class Sequencer {
     return n;
   }
 
+  // Diagnostic: how many ring-out remnants are currently sounding (profiler rmn).
+  int activeRemnants() const {
+    int n = 0;
+    for (int i = SS_STEPS; i < SS_HEADS; i++)
+      if (head_[i].gated()) n++;
+    return n;
+  }
+
   // Diagnostics for the profiler: live cushion fill of the sounding head, and the
   // low-water across ALL heads since the last call (read-and-reset), so cushion
   // depth is sized from data -- the number that says how close we came to
@@ -781,7 +953,7 @@ class Sequencer {
   uint32_t curFill() const { return head_[cur_].fill(); }
   uint32_t takeMinFill() {
     uint32_t m = SS_RING;
-    for (int i = 0; i < SS_STEPS; i++) {
+    for (int i = 0; i < SS_HEADS; i++) {
       uint32_t f = head_[i].takeMinFill();
       if (f < m) m = f;
     }
@@ -799,8 +971,69 @@ class Sequencer {
     armHead_.store(h + 1, std::memory_order_release);
   }
 
+  // ISR side: enqueue a RELEASE request (adopt this step head's life into a
+  // remnant). Like requestArm, no Head state is touched here -- the heavy
+  // adoption (a lane deep-copy) runs on the main loop.
+  inline void requestRelease(int step) {
+    uint32_t h = relHead_.load(std::memory_order_relaxed);
+    uint32_t t = relTail_.load(std::memory_order_acquire);
+    if (h - t >= SS_ARMQ) return;                 // queue full: drop (no ring-out)
+    relReq_[h & (SS_ARMQ - 1)] = (uint32_t)step;
+    relHead_.store(h + 1, std::memory_order_release);
+  }
+
+  // Main loop: adopt step head `step`'s departing life into a remnant slot,
+  // enforcing the SS_RENDER_CAP total-render ceiling with DITCH-OLDEST. Then the
+  // step head's gate closes (its life now lives on in the remnant); it re-arms on
+  // its next visit. Total renderers = sounding step heads + active remnants; if
+  // admitting one more remnant would exceed the cap, the OLDEST remnant (largest
+  // remnantElapsed) is stopped first to make room -- its tail is furthest through
+  // its ring-out, so it has the least remaining to lose.
+  void releaseToRemnant(int step) {
+    // Bound the CONTINUOUS render load against SS_RENDER_CAP. The sustained cost is
+    // the heads whose cushions actively DRAIN -- gated heads (a non-gated armed
+    // head fills once and idles, ~free). Count what will be rendering AFTER this
+    // adoption: the incoming step head (now sounding), the pre-warm of the next
+    // step (always one in flight around a seam), the surviving remnants, and the
+    // new remnant. The departing `step` head closes as it is adopted, so it does
+    // not add. Fixed non-remnant renderers around a seam = incoming + pre-warm = 2.
+    const int fixedStepRenderers = 2;
+    int remnants = 0, oldest = -1;
+    uint32_t oldestElapsed = 0;
+    for (int i = SS_STEPS; i < SS_HEADS; i++) {
+      if (!head_[i].remnant()) continue;
+      remnants++;
+      if (oldest < 0 || head_[i].remnantElapsed() >= oldestElapsed) {
+        oldest = i;
+        oldestElapsed = head_[i].remnantElapsed();
+      }
+    }
+    // Find a free remnant slot.
+    int slot = -1;
+    for (int i = SS_STEPS; i < SS_HEADS; i++)
+      if (head_[i].free()) { slot = i; break; }
+    // Cap check: after adoption total renderers = fixedStepRenderers + remnants +
+    // 1 (the new one). If that exceeds the cap (or no free slot), ditch the oldest
+    // remnant to make room -- its tail is furthest through its ring-out, so it has
+    // the LEAST REMAINING to lose (there is no "quietest"; the amplitude is random
+    // -- oldest = nearest done).
+    if (slot < 0 || fixedStepRenderers + remnants + 1 > SS_RENDER_CAP) {
+      if (oldest >= 0) {
+        head_[oldest].closeGate();
+        head_[oldest].killRemnant();
+        slot = oldest;
+      }
+    }
+    if (slot < 0) {                    // still nothing (all step heads sounding):
+      head_[step].closeGate();         // give up the ring-out, just retire cleanly
+      return;
+    }
+    head_[slot].adoptLane(head_[step], ringoutSamples());
+    head_[step].closeGate();           // life now lives in the remnant
+  }
+
   const Source* src_ = nullptr;
-  Head head_[SS_STEPS];
+  Head head_[SS_HEADS];    // SS_STEPS step heads + SS_REMNANTS ring-out slots
   float sr_ = 48000.0f;
   uint32_t seed_ = 0;
   // Robotic clock state.
@@ -817,6 +1050,10 @@ class Sequencer {
   // at armTail_. SS_ARMQ is a power of two.
   uint32_t armReq_[SS_ARMQ];
   std::atomic<uint32_t> armHead_{0}, armTail_{0};
+  // SPSC release queue: ISR (next) pushes a departing step index at relHead_; the
+  // main loop (service) pops at relTail_ and adopts the life into a remnant slot.
+  uint32_t relReq_[SS_ARMQ];
+  std::atomic<uint32_t> relHead_{0}, relTail_{0};
 };
 
 #endif  // STRETCH_CORE_H

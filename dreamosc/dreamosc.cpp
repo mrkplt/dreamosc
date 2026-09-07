@@ -1,12 +1,11 @@
 // dreamosc.cpp - Daisy Pod firmware for the Stretch Sequencer.
 //
-// Ticket #129: real audio path. Defines the globals stretch_core.h externs,
-// initializes the FFT tables, runs Sequencer::next() in the audio callback and
-// Sequencer::service() in the main loop. The source is a stubbed test tone until
-// SD-card load lands (#131). Controls are not yet wired (#132) and voice-buffer
-// SDRAM placement gets its proper budget pass in #130 — for now both the source
-// and the Sequencer (which owns the 8 voice buffers, ~256 KB) live in SDRAM so
-// the build fits.
+// Defines the globals stretch_core.h externs, initializes the FFT tables, runs
+// Sequencer::next() in the audio callback and Sequencer::service() in the main
+// loop. #155 (persistent-head): the Sequencer is a robotic read clock over 8
+// persistent per-step synthesis heads; each head keeps its own demand-cushion
+// ring full from the main loop. The head buffer pool (SS_POOL_FLOATS) lives in
+// SDRAM; the Sequencer OBJECT (heads' atomics) stays in internal SRAM.
 
 #include "daisy_pod.h"
 #include "stretch_core.h"
@@ -89,19 +88,21 @@ static float dbgPk1 = 0, dbgPk2 = 0;
 static float DSY_SDRAM_BSS sourceBuf[SOURCE_LEN];
 
 // The Sequencer stays in internal SRAM. It is a C++ object with member
-// initializers and Voice sub-objects; objects in .sdram_bss get NEITHER their
-// constructor run NOR their storage zeroed (the section is NOLOAD and SDRAM is
-// not even powered until Init()), so a Sequencer placed there boots with garbage
-// state and produces no sound. Its 8 voice buffers (~256 KB) fit in the 512 KB
-// SRAM. #130 revisits placement/budget deliberately; #129 needs it to run.
+// initializers and Head sub-objects (atomics); objects in .sdram_bss get NEITHER
+// their constructor run NOR their storage zeroed (the section is NOLOAD and SDRAM
+// is not even powered until Init()), so a Sequencer placed there boots with
+// garbage state and produces no sound (#129). The Head objects are small; only
+// their big buffers (the pool below) go to SDRAM.
 static Sequencer seq;
 
-// Voice working buffers (old_ + ring_ per voice, ~384 KB at SS_W 4096) live in
-// SDRAM: far too big for the 512 KB internal SRAM once anything else is present.
-// This is a plain array, NOT an object -- .sdram_bss is NOLOAD and SDRAM is
-// unpowered at static-init time, so constructors never run and storage is not
-// zeroed there. Sequencer::init() carves this up and hands each Voice a slice;
-// the Voice objects themselves stay in SRAM where C++ works normally.
+// Per-head working buffers (4 frame buffers + ring + window snapshot per head)
+// live in SDRAM: far too big for the 512 KB internal SRAM. At SS_W 16384 that is
+// SS_STEPS * (4*16384 + 1024 + 16384) floats ~= 2.5 MB. A plain array, NOT an
+// object -- .sdram_bss is NOLOAD and SDRAM is unpowered at static-init time, so
+// constructors never run and storage is not zeroed there. Sequencer::init()
+// carves this up and hands each Head a slice (Head::init memsets its ring/window
+// so NOLOAD garbage never reaches the output); the Head objects themselves stay
+// in SRAM where C++ works normally.
 static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
@@ -433,21 +434,22 @@ int main(void) {
       // *100 for stretch) since nano-newlib printf can't do floats reliably.
       // gdrift_cc: global drift in units of 0.01% (hundredths of a percent) ->
       // full scale 0..300 == 0..3% drift, so the fine 0.03% grid is visible.
-      // dur_ms is the REQUESTED duration; qlen_ms is what it QUANTIZES to on the
-      // active hop grid (activeH = frameSize/2), and intv_ms is the head-to-head
-      // start interval. qlen_ms drifting from dur_ms as frame size changes is the
-      // duration/frame-size coupling -- read all three to see it on the bench.
-      const float sr = pod.AudioSampleRate();
+      // #155: duration is now LIVE and UNQUANTIZED (no hop grid), so dur_ms IS the
+      // step length -- the old qlen_ms/intv_ms (quantized length + interval) are
+      // gone. fill/ftgt = per-head cushion depth in samples: the demand cushion is
+      // the knob-to-ear / pre-warm lead, so this is THE number to size on the
+      // bench (see the HLTH fill_min).
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d qlen_ms=%d intv_ms=%d gdrift_cc=%d fade_m=%d frame=%d steps=%d page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d frame=%d steps=%d fill=%u ftgt=%u ring=%u page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
-          (int)(seq.lenSamples() * 1000.0f / sr + 0.5f),
-          (int)(seq.intervalSamples() * 1000.0f / sr + 0.5f),
           (int)(globalDrift * 10000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
           seq.frameSize,
           seq.activeSteps,   // active step count (#149)
+          (unsigned)seq.curFill(),      // live cushion of the sounding head
+          (unsigned)SS_FILL_TARGET,
+          (unsigned)SS_RING,
           (int)encPage,
           panel.slot());   // 0 = GLOBAL, 1..N = step
       // KNOB line: raw + smoothed knob reads (*1000) and whether pickup has
@@ -490,15 +492,18 @@ int main(void) {
           (int)(seq.drift[2]*10000+0.5f), (int)(seq.drift[3]*10000+0.5f),
           (int)(seq.drift[4]*10000+0.5f), (int)(seq.drift[5]*10000+0.5f),
           (int)(seq.drift[6]*10000+0.5f), (int)(seq.drift[7]*10000+0.5f));
-      // HEALTH line: CPU and dropout accounting for this second. max_us = worst
-      // single service() call (the burst avg_us hides -- underruns come from the
-      // tail, not the mean). stk = deepest stack use seen (bytes below _estack);
-      // a hang at 16384 with du=0 points here. Both target the pre-mortem's
-      // "invisible at avg_us" failure modes at the big window.
+      // HEALTH line: CPU and dropout accounting for this second. act = gated
+      // (sounding) heads -- the concurrency ceiling (<=2 gated, <=3 rendering with
+      // pre-warm; #155). fmin = cushion LOW-WATER across all heads this second
+      // (samples): how close the demand cushion came to starving -- the number
+      // that says how far SS_FILL_TARGET can shrink. max_us = worst single
+      // service() call (the burst avg_us hides). stk = deepest stack use (bytes
+      // below _estack); a hang at 16384 with du=0 points here.
       pod.seed.PrintLine(
-          "HLTH act=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u stk=%u",
+          "HLTH act=%d units=%u svc_us=%u avg_us=%u max_us=%u fmin=%u isr_us=%u du=%u stk=%u",
           seq.activeVoices(), (unsigned)profUnits, (unsigned)profBusyUs,
           (unsigned)(profUnits ? profBusyUs / profUnits : 0), (unsigned)profMaxUs,
+          (unsigned)seq.takeMinFill(),
           (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),
           (unsigned)profStackUsed());
       profLastUnder = gUnderruns;

@@ -4,7 +4,7 @@
 // stretch_core.h having no platform dependencies.
 //
 //   c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
-//   ./stretchcore in.wav out.wav [--stretch 50] [--duration 4] [--spread 1]
+//   ./stretchcore in.wav out.wav [--stretch 50] [--duration 4] [--fade 0]
 //                 [--passes 1] [--seed 0x12345678]
 //
 // The step positions and the sample-by-sample drive loop mirror StretchSeq.ino
@@ -114,19 +114,19 @@ static void save_wav(const char* path, uint32_t sr, uint16_t ch,
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: %s in.wav out.wav [--stretch N] [--duration S] "
-                    "[--spread S] [--passes N] [--seed H]\n", argv[0]);
+                    "[--fade F] [--passes N] [--seed H]\n", argv[0]);
     return 1;
   }
   const char* in_path  = argv[1];
   const char* out_path = argv[2];
-  float    stretch = 50.0f, duration = 4.0f, spread = 1.0f;
+  float    stretch = 50.0f, duration = 4.0f, fade = 0.0f;
   int      passes  = 1;
   uint32_t seed    = 0x12345678u;
   for (int a = 3; a + 1 < argc; a += 2) {
     std::string k = argv[a];
     if      (k == "--stretch")  stretch  = atof(argv[a + 1]);
     else if (k == "--duration") duration = atof(argv[a + 1]);
-    else if (k == "--spread")   spread   = atof(argv[a + 1]);
+    else if (k == "--fade")     fade     = atof(argv[a + 1]);
     else if (k == "--passes")   passes   = atoi(argv[a + 1]);
     else if (k == "--seed")     seed     = strtoul(argv[a + 1], nullptr, 0);
   }
@@ -156,14 +156,13 @@ int main(int argc, char** argv) {
   seq.init(&src, (float)in.sr, voice_pool.data(), seed);
   seq.stretch  = stretch;
   seq.duration = duration;
-  seq.spread   = spread;
-  // Default positions as in StretchSeq.ino; drift 0 for a deterministic diff.
+  seq.fade     = fade;
+  // Default positions; drift 0 for a deterministic diff.
   const float pos[SS_STEPS] = {0.10f, 0.13f, 0.16f, 0.19f,
                                0.22f, 0.25f, 0.28f, 0.31f};
   for (int i = 0; i < SS_STEPS; i++) { seq.position[i] = pos[i]; seq.drift[i] = 0.0f; }
 
-  // Total length: passes * 8 steps on the even lattice.
-  // One pass of all SS_STEPS heads is patternSamples(); render `passes` of them.
+  // One pass of all active steps is patternSamples(); render `passes` of them.
   uint32_t total = seq.patternSamples() * passes;
 
   std::vector<float> out;
@@ -177,8 +176,8 @@ int main(int argc, char** argv) {
   }
 
   save_wav(out_path, in.sr, 1, out);
-  printf("rendered %u samples (%.2fs) stretch=%.1f dur=%.1f spread=%.1f "
+  printf("rendered %u samples (%.2fs) stretch=%.1f dur=%.1f fade=%.2f "
          "passes=%d -> %s\n",
-         total, total / (float)in.sr, stretch, duration, spread, passes, out_path);
+         total, total / (float)in.sr, stretch, duration, fade, passes, out_path);
   return 0;
 }

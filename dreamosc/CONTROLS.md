@@ -86,8 +86,14 @@ also the color index, so click order = RoYG).
   Small (256) = grainy/articulated, and on tonal material an audible per-hop
   WOBBLE (coarse bins beat fast). Large (up to 16384 ≈ 0.34 s) = glassy/frozen
   and turns that wobble into PaulXStretch's slow characteristic SHIMMER (fine
-  bins). Default 4096; grow it (CCW) for shimmer, shrink it (CW) for grain. Takes
-  effect on the next voice fire.
+  bins). Default 4096; grow it (CCW) for shimmer, shrink it (CW) for grain. It is
+  now a LIVE per-head control (#155): a change reaches a sounding head in cushion
+  time, not on the next fire.
+- **Duration is now LIVE and UNQUANTIZED** (#155). The step dwell is exactly
+  `round(duration·sr)` samples, independent of frame size — so frame size no
+  longer bends step timing (the old model quantized the dwell to the analysis-hop
+  grid, which snapped short steps at large windows). Turn duration down mid-dwell
+  and the sequence fast-marches immediately, even out of a minute-long dwell.
 - **Step count** (Fizzy #149): how many of the 8 steps the sequence walks, 1..8.
   Fewer steps = a shorter, faster-repeating pattern (a real compositional
   control). The `position[]`/`drift[]` arrays stay sized to 8; only steps below

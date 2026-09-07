@@ -22,13 +22,17 @@ GLOBAL ──button1──▶ step 1 ──button1──▶ … ──button1─
 
 | Mode | knob1 | knob2 | led1 |
 |------|-------|-------|------|
-| **GLOBAL** | duration (0.25..60 s) | global drift (0..0.25) | off |
-| **step i** | that step's position (0..1) | that step's per-step drift (0..0.25) | ROYGBIVW (step 1..8) |
+| **GLOBAL** | duration (0.25..60 s) | global drift (0..0.03) | off |
+| **step i** | that step's position (0..1) | that step's per-step drift (0..0.03) | ROYGBIVW (step 1..8) |
 
-- **Global drift is ADDITIVE** on top of each step's per-step drift; effective
-  per-step drift = `perStep + global`, clamped to [0,1]. (The two are kept in
-  separate storage so a global change never corrupts the per-step shadow — a
-  double-add bug that shipped once and is now guarded by a test.)
+- **Global drift is the FLOOR** for each step's per-step drift; effective
+  per-step drift = `max(perStep, global)`, clamped to [0,1]. Global lifts every
+  step to at least that much shimmer; a step can go HIGHER with its own knob but
+  never lower. (The two are kept in separate storage so a global change never
+  corrupts the per-step shadow — a double-add bug that shipped once, back when
+  the fold was additive, is now guarded by a test.)
+- **Drift range is 0..3%** of the source (max 0.03), with a fine grid of 0.03%
+  (0.0003) on a slow turn — 100 fine detents span the range.
 - **led1 = ROYGBIVW** shows the selected step (red=1 … white=8), off in GLOBAL.
 
 ## PICKUP (soft takeover) — everywhere

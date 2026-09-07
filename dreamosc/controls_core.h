@@ -32,12 +32,16 @@ enum EncoderPage {
 
 struct Rgb { float r, g, b; };
 
-// Fold a step's per-step drift with the global drift: additive, clamped into
-// [0,1] position space. Kept separate so the two never entangle (an earlier
-// in-place version double-added global every pass -- exactly the bug a test
-// catches).
+// Fold a step's per-step drift with the global drift: global drift is the FLOOR
+// -- it lifts every step to at least `global`, and a step's own per-step drift
+// only takes over when it exceeds the floor. So global sets a baseline shimmer
+// on all steps at once, and each step can go HIGHER (never lower) than that with
+// its own knob. Clamped into [0,1] position space. Kept a pure function so the
+// two never entangle (an earlier additive+in-place version double-added global
+// every pass -- exactly the bug a test catches). NOTE: this is max(), not add --
+// raising global no longer pushes an already-drifting step even further.
 inline float foldDrift(float perStep, float global) {
-  float eff = perStep + global;
+  float eff = perStep > global ? perStep : global;
   if (eff < 0.0f) eff = 0.0f;
   return eff > 1.0f ? 1.0f : eff;
 }
@@ -298,8 +302,8 @@ class PanelEditor {
   // drift. Always folds per-step + global into seq.drift[].
   void update(Sequencer& seq, float* dur, float* gdrift,
               float r1, float r2, float k1, float k2,
-              float moveThresh = 0.02f, float driftMax = 0.25f,
-              float durMin = 0.25f, float durMax = 60.0f, float gdriftMax = 0.25f) {
+              float moveThresh = 0.02f, float driftMax = 0.03f,
+              float durMin = 0.25f, float durMax = 60.0f, float gdriftMax = 0.03f) {
     if (!primed_) { prime(r1, r2); }
 
     // Anchor pending from a slot change (goTo can't see the raw reads): capture
@@ -325,12 +329,13 @@ class PanelEditor {
     r2Prev_ = r2;
 
     // Per-knob specs. Position: fast = 5% (20 detents), slow = continuous.
-    // Drift: fast = driftMax/30, slow = 0.1%. Duration: continuous both (a
-    // smooth sweep; grid TBD). Global drift: same as per-step drift.
+    // Drift: fast = driftMax/30, slow = 0.03% (0.0003) -- 0..driftMax(3%) is
+    // 100 fine detents of 0.03% each. Duration: continuous both (a smooth
+    // sweep; grid TBD). Global drift: same as per-step drift.
     const KnobSpec POSITION { 0.0f, 1.0f, 0.05f, 0.0f };
-    const KnobSpec DRIFT    { 0.0f, driftMax, driftMax / 30.0f, 0.001f };
+    const KnobSpec DRIFT    { 0.0f, driftMax, driftMax / 30.0f, 0.0003f };
     const KnobSpec DURATION { durMin, durMax, 0.0f, 0.0f };
-    const KnobSpec GDRIFT   { 0.0f, gdriftMax, gdriftMax / 30.0f, 0.001f };
+    const KnobSpec GDRIFT   { 0.0f, gdriftMax, gdriftMax / 30.0f, 0.0003f };
 
     if (slot_ == PE_GLOBAL) {
       if (k1Live_[slot_]) *dur    = applyKnob(DURATION, k1, spd1);

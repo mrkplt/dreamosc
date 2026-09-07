@@ -431,11 +431,20 @@ int main(void) {
       profIsrUs = 0;
       // SETTINGS line: globals + which step is selected. Integers *1000 (or
       // *100 for stretch) since nano-newlib printf can't do floats reliably.
+      // gdrift_cc: global drift in units of 0.01% (hundredths of a percent) ->
+      // full scale 0..300 == 0..3% drift, so the fine 0.03% grid is visible.
+      // dur_ms is the REQUESTED duration; qlen_ms is what it QUANTIZES to on the
+      // active hop grid (activeH = frameSize/2), and intv_ms is the head-to-head
+      // start interval. qlen_ms drifting from dur_ms as frame size changes is the
+      // duration/frame-size coupling -- read all three to see it on the bench.
+      const float sr = pod.AudioSampleRate();
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_m=%d fade_m=%d frame=%d steps=%d page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d qlen_ms=%d intv_ms=%d gdrift_cc=%d fade_m=%d frame=%d steps=%d page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
-          (int)(globalDrift * 1000.0f + 0.5f),
+          (int)(seq.lenSamples() * 1000.0f / sr + 0.5f),
+          (int)(seq.intervalSamples() * 1000.0f / sr + 0.5f),
+          (int)(globalDrift * 10000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
           seq.frameSize,
           seq.activeSteps,   // active step count (#149)
@@ -466,19 +475,21 @@ int main(void) {
           (int)(seq.position[4] * 1000.0f + 0.5f), (int)(seq.position[5] * 1000.0f + 0.5f),
           (int)(seq.position[6] * 1000.0f + 0.5f), (int)(seq.position[7] * 1000.0f + 0.5f));
       // DRF line: per-step drift shadow (what the knob set), then the EFFECTIVE
-      // drift the DSP reads (perStep + global). If effective differs from shadow
-      // uniformly, that's global drift; if the shadow itself varies, that's the
-      // per-step knob.
+      // drift the DSP reads = max(perStep, global) -- global is the FLOOR, not an
+      // addend. So a step whose own drift is ABOVE the floor reads its own value
+      // (eff == shadow); a step BELOW the floor reads the floor (eff > shadow).
+      // Units are 0.01% (hundredths of a percent), *10000, so the 0..3% range
+      // reads 0..300 and the fine 0.03% grid is visible.
       pod.seed.PrintLine(
           "DRF s %d %d %d %d %d %d %d %d | eff %d %d %d %d %d %d %d %d",
-          (int)(panel.perStepDrift(0)*1000+0.5f), (int)(panel.perStepDrift(1)*1000+0.5f),
-          (int)(panel.perStepDrift(2)*1000+0.5f), (int)(panel.perStepDrift(3)*1000+0.5f),
-          (int)(panel.perStepDrift(4)*1000+0.5f), (int)(panel.perStepDrift(5)*1000+0.5f),
-          (int)(panel.perStepDrift(6)*1000+0.5f), (int)(panel.perStepDrift(7)*1000+0.5f),
-          (int)(seq.drift[0]*1000+0.5f), (int)(seq.drift[1]*1000+0.5f),
-          (int)(seq.drift[2]*1000+0.5f), (int)(seq.drift[3]*1000+0.5f),
-          (int)(seq.drift[4]*1000+0.5f), (int)(seq.drift[5]*1000+0.5f),
-          (int)(seq.drift[6]*1000+0.5f), (int)(seq.drift[7]*1000+0.5f));
+          (int)(panel.perStepDrift(0)*10000+0.5f), (int)(panel.perStepDrift(1)*10000+0.5f),
+          (int)(panel.perStepDrift(2)*10000+0.5f), (int)(panel.perStepDrift(3)*10000+0.5f),
+          (int)(panel.perStepDrift(4)*10000+0.5f), (int)(panel.perStepDrift(5)*10000+0.5f),
+          (int)(panel.perStepDrift(6)*10000+0.5f), (int)(panel.perStepDrift(7)*10000+0.5f),
+          (int)(seq.drift[0]*10000+0.5f), (int)(seq.drift[1]*10000+0.5f),
+          (int)(seq.drift[2]*10000+0.5f), (int)(seq.drift[3]*10000+0.5f),
+          (int)(seq.drift[4]*10000+0.5f), (int)(seq.drift[5]*10000+0.5f),
+          (int)(seq.drift[6]*10000+0.5f), (int)(seq.drift[7]*10000+0.5f));
       // HEALTH line: CPU and dropout accounting for this second. max_us = worst
       // single service() call (the burst avg_us hides -- underruns come from the
       // tail, not the mean). stk = deepest stack use seen (bytes below _estack);

@@ -31,13 +31,15 @@ Sequencer& fresh_seq() {
 
 }  // namespace
 
-TEST_CASE("foldDrift: additive, clamped to [0,1]") {
+TEST_CASE("foldDrift: global is the floor (max), clamped to [0,1]") {
   REQUIRE(foldDrift(0.0f, 0.0f) == Approx(0.0f));
-  REQUIRE(foldDrift(0.1f, 0.2f) == Approx(0.3f));     // additive
-  REQUIRE(foldDrift(0.9f, 0.5f) == Approx(1.0f));     // clamps high
+  REQUIRE(foldDrift(0.1f, 0.2f) == Approx(0.2f));     // global floor wins
+  REQUIRE(foldDrift(0.2f, 0.1f) == Approx(0.2f));     // per-step exceeds floor -> per-step
+  REQUIRE(foldDrift(0.9f, 0.5f) == Approx(0.9f));     // per-step wins, no overflow
+  REQUIRE(foldDrift(1.5f, 0.0f) == Approx(1.0f));     // clamps high
   REQUIRE(foldDrift(-1.0f, 0.0f) == Approx(0.0f));    // clamps low
   REQUIRE(foldDrift(0.25f, 0.0f) == Approx(0.25f));   // global 0 = per-step only
-  REQUIRE(foldDrift(0.0f, 0.15f) == Approx(0.15f));   // per-step 0 = global only
+  REQUIRE(foldDrift(0.0f, 0.15f) == Approx(0.15f));   // per-step 0 = global floor
 }
 
 // Helpers: a PanelEditor starts in GLOBAL; advance() once lands on step 1
@@ -197,49 +199,64 @@ TEST_CASE("GLOBAL mode: knobs drive duration and global drift, with pickup") {
   // Move knob1 -> duration = durMin + (durMax-durMin)*k1 (defaults 0.25..60).
   pe.update(seq, &dur, &gd, 0.5f, 0.0f, 0.5f, 0.0f);
   REQUIRE(dur == Approx(0.25f + (60.0f - 0.25f) * 0.5f));
-  // Move knob2 -> global drift = 0.25 * k2.
+  // Move knob2 -> global drift = gdriftMax * k2 (default gdriftMax = 0.03 = 3%).
   pe.update(seq, &dur, &gd, 0.5f, 0.4f, 0.5f, 0.4f);
-  REQUIRE(gd == Approx(0.25f * 0.4f));
+  REQUIRE(gd == Approx(0.03f * 0.4f));
 }
 
-TEST_CASE("per-step drift is independent between steps; global adds to all") {
+TEST_CASE("per-step drift is independent between steps; global is the floor for all") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
   PanelEditor pe;
   pe.prime(0.0f, 0.0f);
   pe.advance();                             // step 1 (index 0)
-  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f);     // re-anchor at 0
-  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f);   // knob2 0->0.80: perStep[0] = 0.25*0.8 = 0.2
-  REQUIRE(pe.perStepDrift(0) == Approx(0.20f));
+  // This case tests the FOLD/independence math (foldDrift = max), not the drift
+  // max -- pass an explicit driftMax=0.25 so the designed 0.2 / global values are
+  // reachable and the arithmetic stays legible. (Signature order: moveThresh
+  // then driftMax.)
+  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.25f);     // re-anchor at 0
+  // Margin = one slow-grid step (0.0003): the slow drift grid quantizes 0.25*0.8
+  // to the nearest 0.0003 (0.2001), so assert the fold behavior to within a grid
+  // step rather than an exact 0.20 that the finer grid no longer lands on.
+  const float G = 0.0003f;   // slow drift grid step (see DRIFT KnobSpec)
+  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f, 0.02f, 0.25f);   // knob2 0->0.80: perStep[0] = 0.25*0.8 = 0.2
+  REQUIRE(pe.perStepDrift(0) == Approx(0.20f).margin(G));
   REQUIRE(pe.perStepDrift(1) == Approx(0.0f));   // untouched
-  REQUIRE(seq.drift[0] == Approx(0.20f));        // + global(0)
+  REQUIRE(seq.drift[0] == Approx(0.20f).margin(G));   // max(0.20, global 0)
   REQUIRE(seq.drift[1] == Approx(0.0f));
 
-  // Raise global (back in a step; global still folds into ALL steps). Passing
-  // gd via pointer -- set it, then update to re-fold.
+  // Raise global (back in a step; global is the floor for ALL steps). Passing
+  // gd via pointer -- set it, then update to re-fold. Floor 0.10 is BELOW step0's
+  // own 0.20, so step0 keeps 0.20; step1 (own 0) rises to the 0.10 floor.
   gd = 0.10f;
-  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f);
-  REQUIRE(seq.drift[0] == Approx(0.30f));   // 0.20 + 0.10
-  REQUIRE(seq.drift[1] == Approx(0.10f));   // 0.00 + 0.10
-  REQUIRE(pe.perStepDrift(0) == Approx(0.20f));   // shadow UNCHANGED (no double-add)
+  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f, 0.02f, 0.25f);
+  REQUIRE(seq.drift[0] == Approx(0.20f).margin(G));   // max(0.20, 0.10) -> own value wins
+  REQUIRE(seq.drift[1] == Approx(0.10f));   // max(0.00, 0.10) -> floor
+  REQUIRE(pe.perStepDrift(0) == Approx(0.20f).margin(G));   // shadow UNCHANGED (no double-add)
 
-  gd = 0.05f;
-  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f);
-  REQUIRE(seq.drift[0] == Approx(0.25f));   // 0.20 + 0.05, not accumulated
-  REQUIRE(pe.perStepDrift(0) == Approx(0.20f));
+  // Floor now ABOVE step0's own 0.20 -> step0 lifts to the 0.25 floor; the
+  // per-step shadow still does not move (fold is non-destructive).
+  gd = 0.25f;
+  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f, 0.02f, 0.25f);
+  REQUIRE(seq.drift[0] == Approx(0.25f));   // max(0.20, 0.25) -> floor wins (exact gd)
+  REQUIRE(pe.perStepDrift(0) == Approx(0.20f).margin(G));
 }
 
-TEST_CASE("effective drift clamps at 1.0 when per-step + global overflow") {
+TEST_CASE("effective drift with max-fold stays in range; a floor above per-step wins") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
   PanelEditor pe;
   pe.prime(0.0f, 0.0f);
   pe.advance();                             // step 1
-  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f);    // re-anchor at 0
-  pe.update(seq, &dur, &gd, 0.0f, 1.0f, 0.0f, 1.0f);    // perStep[0] = 0.25 (max via knob)
-  gd = 0.9f;
-  pe.update(seq, &dur, &gd, 0.0f, 1.0f, 0.0f, 1.0f);    // 0.25 + 0.9 = 1.15 -> clamp 1.0
-  REQUIRE(seq.drift[0] == Approx(1.0f));
+  // max-fold cannot overflow from two in-range inputs (unlike the old additive
+  // fold). Drive per-step to its 0.25 max, then a floor ABOVE it: the floor wins,
+  // and the result never exceeds 1.0. Explicit driftMax=0.25 for legible values.
+  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.25f);    // re-anchor at 0
+  pe.update(seq, &dur, &gd, 0.0f, 1.0f, 0.0f, 1.0f, 0.02f, 0.25f);    // perStep[0] = 0.25 (max via knob)
+  REQUIRE(seq.drift[0] == Approx(0.25f));   // max(0.25, floor 0)
+  gd = 0.9f;                                // floor above per-step
+  pe.update(seq, &dur, &gd, 0.0f, 1.0f, 0.0f, 1.0f, 0.02f, 0.25f);
+  REQUIRE(seq.drift[0] == Approx(0.9f));    // max(0.25, 0.9) -> floor, still <= 1.0
 }
 
 // --- encoder stepping helpers -----------------------------------------------

@@ -92,12 +92,18 @@ using stmlib::RotationPhasor;
 // old voice FIFO -- it is a small cushion of already-rendered future the ISR
 // drains at 1:1, so the fill IS the knob-to-ear / reconfigure latency and the
 // pre-warm lead. A control change reaches the ear in ~cushion time, not a whole
-// hop. SS_RING is a small power of two; SS_FILL_TARGET is where the producer
-// stops topping up (fill oscillates in [FILL_TARGET - SLICE, FILL_TARGET]). At
-// 48 kHz 512 samples ~= 10.7 ms. THESE ARE THE TUNABLE (see the profiler): shrink
-// toward the bench-measured worst-case single render at 16384, floored by it.
-#define SS_RING        1024        // per-head cushion ring (power of two)
-#define SS_FILL_TARGET 512         // producer top-up target within the ring
+// hop. The cushion is FRAME-PROPORTIONAL: the top-up target scales with the
+// active window (fillTarget() = activeW/2, one hop), because one FFT render costs
+// ~N*log2(N) and at SS_W 16384 a single render is longer than a small fixed
+// cushion -- a fixed 1024/512 cushion (~11 ms) underran at 16384 and under
+// remnant bursts (du climbing, fmin=0). The RING allocation stays fixed at the
+// max (SS_RING = 2*SS_W, a power of two so the & (SS_RING-1) mask holds and the
+// pool never re-carves); only the TOP-UP TARGET moves at runtime with the active
+// frame (StretchTables::fillTarget()). SS_SLICE is the per-unit emit cap so one
+// service() call never blocks the loop for a whole cushion. The target sizing is
+// an OPEN ISSUE (see OPEN_ISSUES.md): it is a frame-size heuristic, not derived
+// from the measured per-render cost.
+#define SS_RING        (2 * SS_W)  // per-head cushion ring (power of two, max size)
 #define SS_SLICE       128         // max samples emitted per service() unit
 // Pre-warm/onset lead: a head is armed this many samples before its audible
 // onset so the main loop primes its cushion first (it sits silent-and-filling,
@@ -166,6 +172,16 @@ struct StretchTables {
   int   activeW = SS_W_DEFAULT;
   int   activeH = SS_W_DEFAULT / 2;
   int   activePasses = 0;    // log2(activeW), the arg ShyFFT's runtime path wants
+
+  // Frame-proportional cushion target: the producer tops each head's ring up to
+  // this many samples. Scales with the active window (activeW/2 = one hop) so a
+  // big-frame render, whose cost grows with the window, fits inside the cushion.
+  // At 16384 -> 8192 (~171 ms); at 4096 -> 2048 (~43 ms). Bounded by SS_RING.
+  // See OPEN_ISSUES.md ("Cushion depth is not sized from measured render cost").
+  inline uint32_t fillTarget() const {
+    uint32_t t = (uint32_t)activeW / 2u;      // ~one hop; covers the worst render burst
+    return t > (uint32_t)SS_RING ? (uint32_t)SS_RING : t;
+  }
 
   void init() {
     fft.Init();
@@ -461,8 +477,9 @@ class Head {
   bool topUp() {
     if (!in_.alive()) return false;                    // idle: nothing to make
     uint32_t f = fill();
-    if (f >= SS_FILL_TARGET) return false;             // cushion full enough
-    uint32_t n = SS_FILL_TARGET - f;
+    uint32_t target = gTab.fillTarget();               // frame-proportional cushion
+    if (f >= target) return false;                     // cushion full enough
+    uint32_t n = target - f;
     if (n > SS_SLICE) n = SS_SLICE;
     emit(n);
     return true;

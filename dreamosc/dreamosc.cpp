@@ -456,7 +456,7 @@ int main(void) {
           seq.frameSize,
           seq.activeSteps,   // active step count (#149)
           (unsigned)seq.curFill(),      // live cushion of the sounding head
-          (unsigned)SS_FILL_TARGET,
+          (unsigned)gTab.fillTarget(),  // frame-proportional top-up target
           (unsigned)SS_RING,
           (int)encPage,
           panel.slot());   // 0 = GLOBAL, 1..N = step
@@ -506,7 +506,7 @@ int main(void) {
       // ditch-oldest -- watch rmn on a fast march to see the cap hold. fmin =
       // cushion LOW-WATER across all heads this second
       // (samples): how close the demand cushion came to starving -- the number
-      // that says how far SS_FILL_TARGET can shrink. max_us = worst single
+      // that says how far the fill target (now frame-proportional) can shrink. max_us = worst single
       // service() call (the burst avg_us hides). stk = deepest stack use (bytes
       // below _estack); a hang at 16384 with du=0 points here.
       pod.seed.PrintLine(

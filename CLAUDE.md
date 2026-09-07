@@ -221,6 +221,9 @@ AXI SRAM); we do NOT re-pull libDaisy's copy. If `APP_TYPE` ever moves off
 
 ```
 dreamosc/
+  THEORY_OF_OPERATION.md  HOW it works: synthesis math, head state machine, the
+                      staged-frame queue protocol, scheduler, clock, memory,
+                      invariants. Read before changing stretch_core.h.
   stretch_core.h      DSP core: Source, Head, Sequencer, StretchTables (portable)
   controls_core.h     Control-surface logic: PanelEditor, encoder stepping, LED
                       colors (portable, host-tested — see CONTROLS.md)

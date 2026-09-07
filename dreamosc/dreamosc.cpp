@@ -59,7 +59,9 @@ volatile uint32_t gUnderruns = 0;
 // Timing is done in raw TIM2 ticks (System::GetTick) and converted per delta,
 // because System::GetUs() wraps every 2^32/200e6 = 21.5 s and a delta across
 // the wrap reads ~4.27e9 (the "32-bit wrap" in the old OPEN_ISSUES.md).
-static volatile uint32_t profIsrTicks = 0;
+// ISR time is a running total the ISR alone writes; the main loop prints the
+// delta since its last print (a shared "add then reset" was a lost update).
+static volatile uint32_t profIsrTicksTotal = 0;
 static uint32_t profTicksPerUs = 1;
 static inline uint32_t profUs(uint32_t ticks) { return ticks / profTicksPerUs; }
 
@@ -371,17 +373,22 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 #ifdef PROFILE
   uint32_t t0 = System::GetTick();
 #endif
-  // size is the INTERLEAVED sample count (2 * block). Render the block mono
-  // in one call (per-block constants hoisted inside), then duplicate to L/R.
+  // size is the INTERLEAVED sample count (2 * block). Render mono in chunks
+  // of at most AUDIO_BLOCK (per-block constants hoisted inside), then
+  // duplicate to L/R. Chunking means a larger-than-expected block can never
+  // leave the tail of `out` unwritten.
   size_t n = size / 2;
-  if (n > AUDIO_BLOCK) n = AUDIO_BLOCK;
-  seq.render(monoBlock, (int)n);
-  for (size_t i = 0; i < n; i++) {
-    out[2 * i]     = monoBlock[i];   // left
-    out[2 * i + 1] = monoBlock[i];   // right
+  for (size_t off = 0; off < n; off += AUDIO_BLOCK) {
+    size_t m = n - off;
+    if (m > AUDIO_BLOCK) m = AUDIO_BLOCK;
+    seq.render(monoBlock, (int)m);
+    for (size_t i = 0; i < m; i++) {
+      out[2 * (off + i)]     = monoBlock[i];   // left
+      out[2 * (off + i) + 1] = monoBlock[i];   // right
+    }
   }
 #ifdef PROFILE
-  profIsrTicks += System::GetTick() - t0;
+  profIsrTicksTotal += System::GetTick() - t0;   // ISR-only writer; main reads deltas
 #endif
 #endif
 }
@@ -430,7 +437,7 @@ int main(void) {
   uint32_t lastControlMs = System::GetNow();
 #ifdef PROFILE
   uint32_t profBusyTicks = 0, profUnits = 0, profLastUnder = 0;
-  uint32_t profLastLate = 0, profLastRefresh = 0;
+  uint32_t profLastLate = 0, profLastRefresh = 0, profLastIsr = 0;
   // Peak single service() duration this window: an under-fed head comes from
   // the WORST single render, which the average hides. Watch max_us at 16384.
   uint32_t profMaxTicks = 0;
@@ -459,8 +466,9 @@ int main(void) {
     uint32_t now = System::GetNow();
     if (now - profLastPrint >= 1000) {
       profLastPrint = now;
-      uint32_t isr = profUs(profIsrTicks);
-      profIsrTicks = 0;
+      uint32_t isrTotal = profIsrTicksTotal;
+      uint32_t isr = profUs(isrTotal - profLastIsr);
+      profLastIsr = isrTotal;
       // SETTINGS line: globals + which step is selected. Integers *1000 (or
       // *100 for stretch) since nano-newlib printf can't do floats reliably.
       // gdrift_cc: global drift in units of 0.01% (hundredths of a percent) ->
@@ -531,12 +539,13 @@ int main(void) {
       // rfr = re-renders driven by control changes; slack = min samples to
       // deadline at render start this second (negative = a render started past
       // its boundary); cost = per-size render cost estimates in samples,
-      // 16384..256. max_us = worst single render. stk = deepest stack use.
+      // 16384..256. free = FREE pool slots (a leak shows here as a steady
+      // decline). max_us = worst single render. stk = deepest stack use.
       uint32_t busyUs = profUs(profBusyTicks);
       uint32_t late = seq.lateSamples(), rfr = seq.refreshes();
       pod.seed.PrintLine(
-          "HLTH act=%d rng=%d arm=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u slack=%d cost=%u/%u/%u/%u/%u/%u/%u stk=%u",
-          seq.activeVoices(), seq.activeRemnants(), seq.armedHeads(),
+          "HLTH act=%d rng=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u slack=%d cost=%u/%u/%u/%u/%u/%u/%u stk=%u",
+          seq.activeVoices(), seq.activeRemnants(), seq.armedHeads(), seq.freeHeads(),
           (unsigned)profUnits, (unsigned)busyUs,
           (unsigned)(profUnits ? busyUs / profUnits : 0), (unsigned)profUs(profMaxTicks),
           (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),

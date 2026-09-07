@@ -69,7 +69,7 @@ using stmlib::RotationPhasor;
 // ringing head with the least left to admit a new one.
 #define SS_RENDER_CAP 6
 // Pool: cap + one armed (pre-warmed) + slack, so allocation never has to ditch
-// just to arm. Memory is cheap.
+// just to arm. Memory is cheap. (static_assert below pins the relation.)
 #define SS_HEADS 10
 // Frame buffers per head: old + cur + a staged pair + a refresh pair.
 #define SS_FRAME_BUFS 6
@@ -87,6 +87,11 @@ using stmlib::RotationPhasor;
 // (SS_W + SS_W/2 + ... + SS_W_MIN). Blend/correction curves: one per HOP size.
 #define SS_WIN_FLOATS (2 * SS_W - SS_W_MIN)
 #define SS_HOP_FLOATS (SS_W - SS_W_MIN / 2)
+
+// Worst-case live occupancy is cap gated heads + one armed head; one more so
+// allocHead() always finds a FREE slot without ditching a ringing head to arm.
+static_assert(SS_HEADS >= SS_RENDER_CAP + 2, "head pool must exceed the render cap by 2");
+static_assert(SS_FRAME_BUFS >= 6, "old + cur + staged pair + refresh pair");
 
 // ---------------------------------------------------------------------------
 // Shared scratch and tables. Defined by the platform (dreamosc.cpp, host).
@@ -108,6 +113,19 @@ extern float gWindows[SS_WIN_FLOATS];
 extern float gBlendA[SS_HOP_FLOATS];
 extern float gBlendC[SS_HOP_FLOATS];
 extern volatile uint32_t gUnderruns;   // frame holds (a head repeated a frame)
+
+// Test-only preemption hooks. The host suite is single-threaded, so an ISR
+// firing in the middle of a main-loop routine can only be simulated by calling
+// into the ISR side at a named point. Compiled out unless SS_TEST_HOOKS is
+// defined (the test build defines it; firmware and host_main do not).
+//   1: Head::render(), between the oldIdx_ and curIdx_ loads (ctx = Head*)
+//   2: Sequencer::service(), between plan() and render()   (ctx = Head*)
+#ifdef SS_TEST_HOOKS
+extern void (*gSsTestHook)(int id, void* ctx);
+#define SS_HOOK(id, ctx) do { if (gSsTestHook) gSsTestHook((id), (void*)(ctx)); } while (0)
+#else
+#define SS_HOOK(id, ctx) do {} while (0)
+#endif
 
 inline int ssLog2(int n) { int p = 0; while ((1 << p) < n) p++; return p; }
 
@@ -360,22 +378,40 @@ class Head {
     else        remain_.store(r - 1, std::memory_order_relaxed);
   }
 
+  // ISR, once per block: drop every queued descriptor that a later one
+  // supersedes (same next frame, newer render) and every stale one. The ISR
+  // owns qTail_, so popping here is its right. This is what lets a head take
+  // any number of control-driven refreshes while it waits (F4): the queue
+  // never holds more than the one descriptor that will actually be applied,
+  // so the buffer budget (old, cur, that descriptor's pair, one more pair)
+  // always has room for the next refresh.
+  void isrDrainSuperseded() {
+    uint32_t tail = qTail_.load(std::memory_order_relaxed);
+    uint32_t head = qHead_.load(std::memory_order_acquire);
+    if (tail == head) return;
+    uint32_t life = life_.load(std::memory_order_relaxed);
+    uint32_t applied = applied_.load(std::memory_order_relaxed);
+    uint32_t keep = head;                // default: nothing valid, drop all
+    for (uint32_t i = tail; i != head; i++) {
+      const Staged& d = q_[i & (SS_DESCQ - 1)];
+      if (d.life == life && d.frameIdx == applied + 1) keep = i;
+    }
+    if (keep != tail) qTail_.store(keep, std::memory_order_release);
+  }
+
   // ---- main-loop side ----------------------------------------------------
 
-  // Decide what this head wants rendered. `clock` is the ISR sample counter;
-  // `w` the live window; `stretch`/`pos` the live controls. Fills `deadline`
-  // (absolute sample). Also syncs main-loop bookkeeping with what the ISR has
-  // applied since the last call.
-  Want plan(uint32_t clock, int w, float stretch, float pos, uint32_t& deadline,
-            uint32_t minRefreshGap) {
-    State st = state();
-    if (st == FREE) return NONE;
+  // Sync main-loop bookkeeping with what the ISR has applied. Called at the
+  // top of plan() AND render() (F7): a boundary between the two must not let
+  // render() stage a frame the ISR has already played.
+  void syncApplied(uint32_t clock) {
     uint32_t life = life_.load(std::memory_order_acquire);
     if (life != seenLife_) {             // new life: reset our bookkeeping
       seenLife_ = life;
       stagedFrame_ = 0; lastApplied_ = 0;
       curTravel_ = 0.0; curSizeIdx_ = -1;
-      refreshesPending_ = 0; lastRenderClock_ = clock - minRefreshGap;
+      stagedSizeIdx_ = -1;
+      lastRefreshClock_ = clock - 0x10000u;
     }
     uint32_t applied = applied_.load(std::memory_order_acquire);
     if (applied != lastApplied_) {       // the ISR consumed a staged frame
@@ -384,8 +420,20 @@ class Head {
       curSizeIdx_ = d.sizeIdx;
       lastApplied_ = applied;
       stagedFrame_ = applied;            // anything else queued is stale now
-      refreshesPending_ = 0;
     }
+  }
+
+  // Decide what this head wants rendered. `clock` is the ISR sample counter;
+  // `w` the live window; `stretch`/`pos` the live controls. Fills `deadline`
+  // (absolute sample). `minRefreshGap`: at most one control-driven refresh per
+  // this many samples per head (the caller passes one hop, so a creeping knob
+  // costs one render per hop, never more -- F8).
+  Want plan(uint32_t clock, int w, float stretch, float pos, uint32_t& deadline,
+            uint32_t minRefreshGap) {
+    State st = state();
+    if (st == FREE) return NONE;
+    syncApplied(clock);
+    uint32_t applied = lastApplied_;
     bool armed = (st == ARMED || st == READY);
     if (armed) deadline = due_.load(std::memory_order_relaxed);
     else       deadline = clock + (h_ - phase_);
@@ -393,68 +441,99 @@ class Head {
     if (st == RINGING && remain() <= (uint32_t)(h_ - phase_)) return NONE;
     bool pending = stagedFrame_ > applied;
     if (!pending) return REQUIRED;
-    // Refresh: controls moved materially since this frame was staged.
-    if (refreshesPending_ >= 1) return NONE;
-    if ((int32_t)(clock - lastRenderClock_) < (int32_t)minRefreshGap) return NONE;
+    // Refresh: controls moved materially since this frame was staged. Room:
+    // the ISR drains superseded descriptors per block, so the queue holds at
+    // most the live one plus what we add; wait if two are already there.
+    if (qHead_.load(std::memory_order_relaxed) - qTail_.load(std::memory_order_acquire) >= 2)
+      return NONE;
+    // The gap is measured from the last REFRESH (not the required render that
+    // starts every hop), so the first turn after a boundary lands right away.
+    if ((int32_t)(clock - lastRefreshClock_) < (int32_t)minRefreshGap) return NONE;
+    // Position threshold 0.002 of the source: below a quarter window at the
+    // default size, inaudible in a smeared cloud; above ADC jitter.
     bool moved = (ssSizeIdx(w) != stagedSizeIdx_)
               || (stretch != stagedStretch_)
-              || (fabsf(pos - stagedPos_) > 0.001f);
+              || (fabsf(pos - stagedPos_) > 0.002f);
     return moved ? REFRESH : NONE;
   }
 
-  // Render what plan() asked for. Returns the size index rendered (for cost
-  // accounting), or -1 if nothing was published (life changed under us).
-  int render(uint32_t clock, int w, float stretch, float pos) {
-    uint32_t life = life_.load(std::memory_order_acquire);
-    if (life != seenLife_) return -1;
+  // Render what plan() asked for. `slack` = samples to this head's deadline,
+  // `costNew` = the per-frame render cost estimate at window `w`. Returns the
+  // number of frames rendered and published (1 or 2), or 0 if nothing was
+  // published (life changed, no room). `sizeIdxOut` = the size rendered.
+  int render(uint32_t clock, int w, float stretch, float pos,
+             uint32_t slack, uint32_t costNew, int& sizeIdxOut) {
+    syncApplied(clock);                  // F7: re-sync across a boundary
+    uint32_t life = seenLife_;
     State st = state();
-    if (st == FREE) return -1;
+    if (st == FREE) return 0;
     int sizeIdx = ssSizeIdx(w);
-    int h = w / 2;
-    float st_ = stretch > 0.01f ? stretch : 0.01f;
-    double hop = (double)h / (double)st_;
     uint32_t applied = lastApplied_;
     bool pending = stagedFrame_ > applied;
     uint32_t frameIdx = pending ? stagedFrame_ : applied + 1;
+    bool armed = (st == ARMED || st == READY);
 
     Staged d;
     d.life = life;
     d.frameIdx = frameIdx;
-    d.sizeIdx = (uint8_t)sizeIdx;
     d.stretchUsed = stretch;
     d.posUsed = pos;
-    bool armed = (st == ARMED || st == READY);
+    float st_ = stretch > 0.01f ? stretch : 0.01f;
     if (armed) {                         // pre-roll pair: frame 0 at -hop, frame 1 at 0
       d.kind = PAIR;
       d.travel = 0.0;
-    } else if (sizeIdx != curSizeIdx_) { // size change: re-render a pair at the new size
-      d.kind = PAIR;
-      d.travel = curTravel_ + hop;
+    } else if (sizeIdx != curSizeIdx_) {
+      // Size change: a pair at the new size. If that pair cannot make this
+      // boundary but could make one from a full hop, play it safe (F5): stage
+      // a SINGLE at the OLD size now (no hold) and let the pair render right
+      // after the boundary with a whole hop of slack. If a pair cannot fit in
+      // a full hop either, waiting gains nothing: render it now.
+      uint32_t pairCost = 2 * costNew;
+      bool fits = slack > pairCost;
+      bool atMaxSlack = slack + 64 >= (uint32_t)h_;
+      if (fits || atMaxSlack) {
+        d.kind = PAIR;
+        d.travel = curTravel_ + (double)(w / 2) / (double)st_;
+      } else {
+        sizeIdx = curSizeIdx_;
+        d.kind = SINGLE;
+        d.travel = curTravel_ + (double)(ssSizeW(sizeIdx) / 2) / (double)st_;
+      }
     } else {
       d.kind = SINGLE;
-      d.travel = curTravel_ + hop;
+      d.travel = curTravel_ + (double)(w / 2) / (double)st_;
     }
-    // Free buffers: exclude old/cur (ISR) and everything still queued. Read the
-    // queue tail FIRST, then old/cur: a pop between the two reads moves a
-    // buffer from the queue into cur, and this order keeps it excluded either way.
+    d.sizeIdx = (uint8_t)sizeIdx;
+    double hop = (double)(ssSizeW(sizeIdx) / 2) / (double)st_;
+
+    // Free buffers: exclude everything still queued and the ISR's old/cur.
+    // Read order matters (F1): queue tail first, then CUR, then OLD. The only
+    // ISR transitions that claim a buffer are a SINGLE pop (queued -> cur,
+    // cur -> old) and a PAIR pop (queued, queued -> old, cur); a hold claims
+    // nothing (old = cur). Reading cur before old means a pop between the two
+    // loads leaves the buffer that just became old already captured as cur.
     uint32_t tail = qTail_.load(std::memory_order_acquire);
     uint32_t head = qHead_.load(std::memory_order_relaxed);
-    if (head - tail >= SS_DESCQ - 1) return -1;   // no queue room (never in practice)
+    if (head - tail >= SS_DESCQ - 1) return 0;    // no queue room (never in practice)
     bool used[SS_FRAME_BUFS] = {false};
     for (uint32_t i = tail; i != head; i++) {
       const Staged& q = q_[i & (SS_DESCQ - 1)];
       if (q.a >= 0) used[q.a] = true;
       if (q.b >= 0) used[q.b] = true;
     }
-    int oi = oldIdx_.load(std::memory_order_relaxed);
     int ci = curIdx_.load(std::memory_order_relaxed);
+    SS_HOOK(1, this);
+    int oi = oldIdx_.load(std::memory_order_relaxed);
     if (oi >= 0) used[oi] = true;
     if (ci >= 0) used[ci] = true;
     int need = d.kind == PAIR ? 2 : 1, got = 0;
     int8_t pick[2] = {-1, -1};
     for (int i = 0; i < SS_FRAME_BUFS && got < need; i++)
       if (!used[i]) pick[got++] = (int8_t)i;
-    if (got < need) return -1;           // cannot happen by construction (6 buffers)
+    if (got < need) return 0;            // cannot happen by construction (6 buffers)
+#ifdef SS_TEST_HOOKS
+    dbgLastPick_ = pick[0];
+#endif
 
     double base = (double)pos * (double)src_->len;
     if (d.kind == PAIR) {
@@ -466,9 +545,9 @@ class Head {
       d.a = pick[0]; d.b = -1;
     }
     // The life may have ended (or changed) during the render: then this frame
-    // is for a dead life. Do not publish (plan() resets on the next pass).
-    if (life_.load(std::memory_order_acquire) != life) return -1;
-    if (state() == FREE) return -1;
+    // is for a dead life. Do not publish (syncApplied resets on the next pass).
+    if (life_.load(std::memory_order_acquire) != life) return 0;
+    if (state() == FREE) return 0;
     q_[head & (SS_DESCQ - 1)] = d;
     qHead_.store(head + 1, std::memory_order_release);
     // READY is a hint for the ISR (goLive validates the queue itself). CAS from
@@ -479,13 +558,13 @@ class Head {
                                      std::memory_order_release,
                                      std::memory_order_relaxed);
     }
-    if (pending) refreshesPending_++;
     stagedFrame_ = frameIdx;
     stagedSizeIdx_ = sizeIdx;
     stagedStretch_ = stretch;
     stagedPos_ = pos;
-    lastRenderClock_ = clock;
-    return sizeIdx;
+    if (pending) lastRefreshClock_ = clock;
+    sizeIdxOut = sizeIdx;
+    return d.kind == PAIR ? 2 : 1;
   }
 
   // Live base position for this life: the step's position plus the drift
@@ -499,6 +578,29 @@ class Head {
 
   uint32_t holds() const { return holds_; }
   int hop() const { return h_; }
+#ifdef SS_TEST_HOOKS
+  // Test-only introspection (see SS_HOOK).
+  int  dbgOldIdx() const { return oldIdx_.load(std::memory_order_relaxed); }
+  int  dbgCurIdx() const { return curIdx_.load(std::memory_order_relaxed); }
+  int  dbgLastPick() const { return dbgLastPick_; }
+  bool dbgPending() const { return stagedFrame_ > lastApplied_; }
+  int  dbgPendingKind() const { return q_[(qHead_.load(std::memory_order_relaxed) - 1) & (SS_DESCQ - 1)].kind; }
+  uint32_t dbgDue() const { return due_.load(std::memory_order_relaxed); }
+  uint32_t dbgQueued() const { return qHead_.load(std::memory_order_relaxed) - qTail_.load(std::memory_order_relaxed); }
+  // Queued descriptors the ISR will discard (frame already applied, or a
+  // stale life): each one was a wasted render.
+  int dbgStaleQueued() const {
+    int n = 0;
+    uint32_t applied = applied_.load(std::memory_order_relaxed);
+    uint32_t life = life_.load(std::memory_order_relaxed);
+    for (uint32_t i = qTail_.load(std::memory_order_relaxed);
+         i != qHead_.load(std::memory_order_relaxed); i++) {
+      const Staged& d = q_[i & (SS_DESCQ - 1)];
+      if (d.life != life || d.frameIdx <= applied) n++;
+    }
+    return n;
+  }
+#endif
   // Would the next render at window w be a pair (two frames)? Armed heads
   // always render a pre-roll pair; a gated head does when the size changes.
   bool nextIsPair(int w) const {
@@ -602,8 +704,10 @@ class Head {
   int      curSizeIdx_ = -1;
   int      stagedSizeIdx_ = -1;
   float    stagedStretch_ = 0.0f, stagedPos_ = -1.0f;
-  int      refreshesPending_ = 0;
-  uint32_t lastRenderClock_ = 0;
+  uint32_t lastRefreshClock_ = 0;
+#ifdef SS_TEST_HOOKS
+  int      dbgLastPick_ = -1;
+#endif
 };
 
 // ---------------------------------------------------------------------------
@@ -678,31 +782,50 @@ class Sequencer {
     uint32_t dur = durSamples();
     SeamGeom g = seamGeom(dur, fade);
     uint32_t ro = ringoutSamples();
-    // Keep the armed head's deadline honest against a live duration change.
-    if (nxt_ >= 0) {
-      uint32_t c = clock_.load(std::memory_order_relaxed);
-      uint32_t until = g.onset > elapsed_ ? (uint32_t)(g.onset - elapsed_) : 0u;
-      head_[nxt_].setDue(c + until);
+    uint32_t c = clock_.load(std::memory_order_relaxed);
+    // Per-block ISR housekeeping: drop superseded staged frames (F4), keep the
+    // armed head's deadline honest against live duration/fade changes (F3),
+    // and re-arm now if the step count shrank under the armed head (F9) so
+    // the seam is not late.
+    for (int i = 0; i < SS_HEADS; i++)
+      if (head_[i].stateIsr() != Head::FREE) head_[i].isrDrainSuperseded();
+    if (nxt_ >= 0 && nxtStep_ >= activeSteps) {
+      head_[nxt_].free(); nxt_ = -1;
+      int from = inc_ >= 0 ? inc_ : cur_;
+      if (from >= 0) armNext(c, g.onset, (head_[from].step() + 1) % activeSteps);
     }
+    if (nxt_ >= 0) head_[nxt_].setDue(c + samplesToNextOnset(g.onset));
     for (int i = 0; i < n; i++) out[i] = tick(g, ro);
   }
   inline float next() { float s; render(&s, 1); return s; }
 
   // ---- main loop: rendering ------------------------------------------------
 
-  // One unit of work: the most urgent render. Returns true if it rendered.
-  bool service() {
+  // Seed/override the per-size render cost estimate (samples per frame). The
+  // firmware may seed it from bench numbers; the costed host harness pins it
+  // to the cost it charges (F2), since the host ISR clock cannot measure it.
+  void setCostEstimate(int sizeIdx, uint32_t samples) {
+    if (sizeIdx < 0 || sizeIdx >= SS_NSIZES) return;
+    costSamples_[sizeIdx] = samples < 16 ? 16 : samples;
+  }
+
+  // One unit of work: the most urgent render. Returns the number of frames
+  // rendered (0 = nothing to do or nothing published).
+  int service() {
     uint32_t clock = clock_.load(std::memory_order_relaxed);
     int w = ssClampW(frameSize);
     int bestReq = -1, bestRef = -1;
     uint32_t reqDl = 0, refDl = 0;
+    // Refresh gap: one per hop per head, and never faster than the render
+    // itself can turn around (F8).
+    uint32_t gap = 4 * costSamples_[ssSizeIdx(w)];
+    if (gap < (uint32_t)(w / 2)) gap = (uint32_t)(w / 2);
+    if (gap < 480) gap = 480;
     for (int i = 0; i < SS_HEADS; i++) {
       Head& h = head_[i];
       if (h.isFree()) continue;
       float pos = h.basePos(position[h.step()]);
       uint32_t dl;
-      uint32_t gap = 4 * costSamples_[ssSizeIdx(w)];
-      if (gap < 480) gap = 480;
       Head::Want want = h.plan(clock, w, stretch, pos, dl, gap);
       if (want == Head::REQUIRED) {
         if (bestReq < 0 || (int32_t)(dl - reqDl) < 0) { bestReq = i; reqDl = dl; }
@@ -735,22 +858,28 @@ class Sequencer {
     } else if (refOk) {
       pick = bestRef; refresh = true;
     }
-    if (pick < 0) return false;
+    if (pick < 0) return 0;
     Head& h = head_[pick];
+    SS_HOOK(2, &h);
     int32_t slack = (int32_t)((refresh ? refDl : reqDl) - clock);
     if (slack < minSlack_) minSlack_ = slack;
     uint32_t t0 = clock_.load(std::memory_order_relaxed);
-    int s = h.render(clock, w, stretch, h.basePos(position[h.step()]));
+    int s = -1;
+    int frames = h.render(clock, w, stretch, h.basePos(position[h.step()]),
+                          slack < 0 ? 0u : (uint32_t)slack, cost, s);
     uint32_t took = clock_.load(std::memory_order_relaxed) - t0;
-    if (s >= 0) {
-      // Recent max with slow decay: an outlier does not poison refreshes forever.
+    if (frames > 0 && took > 0) {
+      // Per-frame cost, recent max with slow decay: an outlier does not
+      // poison refreshes forever. (took == 0 means the clock did not move,
+      // i.e. no information -- the host harness; leave the estimate alone.)
+      uint32_t per = took / (uint32_t)frames;
       uint32_t c = costSamples_[s];
       c -= c >> 6;
-      if (took > c) c = took;
+      if (per > c) c = per;
       costSamples_[s] = c < 16 ? 16 : c;
-      if (refresh) refreshes_++;
     }
-    return true;
+    if (frames > 0 && refresh) refreshes_++;
+    return frames;
   }
 
   // ---- diagnostics -----------------------------------------------------------
@@ -789,6 +918,11 @@ class Sequencer {
   // Min slack (samples to deadline at render start) since last call; resets.
   int32_t takeMinSlack() { int32_t m = minSlack_; minSlack_ = 0x7fffffff; return m; }
   uint32_t clock() const { return clock_.load(std::memory_order_relaxed); }
+#ifdef SS_TEST_HOOKS
+  Head& dbgHead(int i) { return head_[i]; }
+  int   dbgCur() const { return cur_; }
+  int   dbgNxt() const { return nxt_; }
+#endif
 
  private:
   inline float tick(const SeamGeom& g, uint32_t ro) {
@@ -889,9 +1023,20 @@ class Sequencer {
     if (p < 0.0f) p = 0.0f;
     if (p >= 1.0f) p = 0.999999f;
     uint32_t lifeSeed = seed_ ^ (uint32_t)(p * 4294967295.0);
-    uint32_t until = onset > elapsed_ ? (uint32_t)(onset - elapsed_) : 0u;
-    head_[h].alloc(step, lifeSeed, off, clock + until);
+    head_[h].alloc(step, lifeSeed, off, clock + samplesToNextOnset(onset));
     nxt_ = h; nxtStep_ = step;
+  }
+
+  // Samples until the NEXT go-live (the armed head's deadline). Outside a
+  // seam: the rest of this dwell up to onset. Inside a seam (F3): the rest of
+  // the fade, then the incoming head's whole dwell up to its onset.
+  uint32_t samplesToNextOnset(uint32_t onset) const {
+    if (inc_ >= 0) {
+      uint32_t fp = (uint32_t)(elapsed_ - seamStart_);
+      uint32_t left = fadeLen_ > fp ? fadeLen_ - fp : 0u;
+      return left + onset;
+    }
+    return onset > elapsed_ ? (uint32_t)(onset - elapsed_) : 0u;
   }
 
   // ISR-side pool bookkeeping (relaxed state reads: the ISR is the writer).

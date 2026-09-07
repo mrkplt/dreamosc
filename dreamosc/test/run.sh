@@ -12,10 +12,14 @@ echo "== Vendored sources match their pinned upstream SHAs =="
 
 echo
 echo "== Catch2 unit tests (DSP core + vendored FFT) =="
-c++ -std=c++17 -O1 -I"$TEST_DIR/.." -I"$TEST_DIR" \
+# -DSS_TEST_HOOKS enables the ISR-preemption hook points in stretch_core.h that
+# test_findings.cpp drives; firmware and host_main never define it.
+c++ -std=c++17 -O1 -DSS_TEST_HOOKS -I"$TEST_DIR/.." -I"$TEST_DIR" \
     "$TEST_DIR/test_stretch_core.cpp" "$TEST_DIR/test_shy_fft.cpp" \
-    "$TEST_DIR/test_controls_core.cpp" \
+    "$TEST_DIR/test_controls_core.cpp" "$TEST_DIR/test_findings.cpp" \
     -o "$TEST_DIR/unit_tests"
+# [!mayfail] tests document open findings (test_findings.cpp): they report as
+# "failed as expected" without failing the gate. Drop the tag when remediated.
 "$TEST_DIR/unit_tests"
 
 echo

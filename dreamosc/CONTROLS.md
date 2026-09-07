@@ -43,9 +43,10 @@ knob takes over its parameter for the current slot only after it has physically
 you tour the steps and change only the ones you touch.
 
 Two implementation facts that were hard-won bugs:
-- **Detect movement on the RAW knob, write the SMOOTHED value.** A one-pole
-  smoother caps the per-pass delta below any threshold, so detecting on the
-  smoothed read means pickup never engages.
+- **Detect movement on the RAW knob.** A one-pole smoother caps the per-pass
+  delta below any threshold, so detecting on the smoothed read means pickup
+  never engages. Duration and drift WRITE the smoothed value; position writes
+  the raw (snapped) value, see below.
 - **Freeze the move reference at an ANCHOR** (the pot position at slot entry) and
   don't update it until the knob engages. If the reference updates every poll it
   *chases* the pot, so a SLOW turn never accumulates a threshold-crossing delta
@@ -53,8 +54,8 @@ Two implementation facts that were hard-won bugs:
 
 ## Encoder
 
-Turn drives the current page; click cycles the page. led2 = page hue (**RoYG**
-over the four pages, in click order) drawn from the **same ROYGBIVW palette as
+Turn drives the current page; click cycles the page. led2 = page hue (**RoYGB**
+over the five pages, in click order) drawn from the **same ROYGBIVW palette as
 led1** (`hueROYGBIVW`, so a color means the same on both LEDs and orange/yellow
 stay distinct). **Brightness on EVERY page tracks that page's encoded level** —
 a bright LED always means "this parameter is turned up".
@@ -68,12 +69,12 @@ index is also the color index, so click order = ROYGB).
 | **steps** | orange | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
 | **fade** | yellow | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
 | **window** (frame) | green | index `FRAME_STOPS` {16384,8192,4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**; **default 4096**, mid-table) | knob position (CCW dim → CW bright) |
-| **ringout** | blue | remnant length 0..16 s → `seq.ringout` (additive; fast 1 s, slow 0.25 s/detent) | ring-out length (0 dim → 16 s bright) |
+| **ringout** | blue | ring-out length 0..16 s → `seq.ringout` (additive; fast 1 s, slow 0.25 s/detent) | ring-out length (0 dim → 16 s bright) |
 
-- All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
+- All five use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
   bottom of a range is still lit, never off): `stretchBrightness`,
-  `fadeBrightness`, `frameBrightness`, `stepBrightness`. The level reads at a
-  glance without the OLED.
+  `stepBrightness`, `fadeBrightness`, `frameBrightness`, `ringoutBrightness`.
+  The level reads at a glance without the OLED.
 
 - **Stretch is a detent table**, not continuous: PaulStretch factors aren't
   perceptually linear, so what matters is the regime (scan/drift/freeze). Fine
@@ -89,13 +90,24 @@ index is also the color index, so click order = ROYGB).
   and turns that wobble into PaulXStretch's slow characteristic SHIMMER (fine
   bins). Default 4096; grow it (CCW) for shimmer, shrink it (CW) for grain. It is
   a LIVE control: every sounding head re-renders a pre-roll pair at the new size
-  and switches at its next hop boundary (at most one hop, plus the pair's render
-  time at 16384). The profiler's `hop` shows what the sounding head is actually
-  playing.
+  and switches at a hop boundary. Shrinking lands at the next boundary (one
+  hop). Growing to a size whose pair costs more than what is left of the
+  current hop lands one boundary later (two hops), and at the render cap a
+  growth to 16384 is a burst of pairs that can hold (repeat) frames for a few
+  hops — see the F5 finding test. The profiler's `hop` shows what the sounding
+  head is actually playing.
 - **Position and stretch are live too.** A staged frame is re-rendered when the
   controls it was made with change (if there is slack before its deadline), so a
   turn reaches the ear within about one hop plus the blend. Position moves the
-  SOUNDING head, not just the next visit.
+  SOUNDING head, not just the next visit. The NEXT step's pre-warmed head
+  re-renders too, as often as you turn (the ISR drops superseded frames once
+  per block, finding F4), so it always goes live at the latest position.
+- **Pot smoothing and refreshes** (finding F8): position is written from the
+  RAW pot (snapped by the fast-move grid), not the one-pole smoothed read, so
+  a turn is a few discrete updates rather than a ~250 ms creep that would cost
+  a re-render per hop. The core also caps refreshes at one per hop per head and
+  ignores position deltas under 0.2%. Duration and drift keep the smoother.
+  Refreshes land at hop boundaries; they do not click.
 - **Duration is now LIVE and UNQUANTIZED** (#155). The step dwell is exactly
   `round(duration·sr)` samples, independent of frame size — so frame size no
   longer bends step timing (the old model quantized the dwell to the analysis-hop

@@ -5,7 +5,7 @@ Known, unresolved issues, and what the bench owes the frame model.
 ## The frame model is host-tested, not yet heard
 
 Everything below `REVIEW_responsiveness.md` proposed is implemented and green
-on the host (71 test cases) and links for the device, but none of it has been
+on the host (72 test cases) and links for the device, but none of it has been
 heard on the Pod. In `make PROFILE=1` terms, the bench owes:
 
 - **Raw cut level by ear** at fade 0, 4096 and 16384. Host measurement: the
@@ -23,6 +23,22 @@ heard on the Pod. In `make PROFILE=1` terms, the bench owes:
   counts re-renders; `slack` should stay positive. If a fast knob sweep drives
   `du` up, the refresh threshold (0.001 in position) or the minimum gap
   (4 × cost, ≥ 10 ms) is the knob.
+
+## Code-review findings on the frame model (all remediated, all guarded)
+
+Each finding from the review of 6917a0a has a test in `test/test_findings.cpp`
+that reproduced it on the host (measuring the rendered audio) and now guards
+the fix. What the bench still owes here:
+
+- **F5b, throughput at the cap:** growing to 16384 with six gated heads is
+  43 holds in the following 2 s at the modelled cost (~18 ms per 16384 frame
+  at 400 MHz). A hold is a ~43 ms spectral freeze on one head, never silence.
+  This is CPU, not scheduling (six pre-roll pairs are more than five old hops
+  of work). Re-measure `du` on the bench at 480 MHz after a frame-size growth
+  with ring-out at 8 s; tighten the test bound from the real cost.
+- **F8, ADC jitter:** position is now written from the raw pot. If a parked,
+  engaged knob shows `rfr` ticking every hop, the pot's noise exceeds the
+  0.002 refresh threshold; raise it or re-introduce a light smoother.
 
 ## Not measured
 

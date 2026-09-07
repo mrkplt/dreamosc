@@ -489,16 +489,12 @@ TEST_CASE("a knob turn right after go-live is not starved by the armed pair (cos
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     seq.setFrame(16384);
     std::vector<float> out; out.reserve(48000);
-    double budget = 0.0; const double cost = 0.0038 * 16384 * 14;
+    testutil::CostedProducer p(0.0038);
     size_t live = 0;
     for (uint32_t n = 0; n < 48000; n++) {
       if (live == 0 && seq.curHop() > 0) live = n;
       if (move && live > 0 && n == live + 100) seq.position[0] = 0.7f;
-      if (n % 32 == 0) {
-        budget += 32;
-        while (budget >= cost && seq.service()) budget -= cost;
-        if (budget > 4.0 * cost) budget = 4.0 * cost;
-      }
+      p.step(seq, n);
       out.push_back(seq.next());
     }
     return std::make_pair(out, live);

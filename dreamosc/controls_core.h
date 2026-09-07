@@ -352,7 +352,13 @@ class PanelEditor {
       if (k2Live_[slot_]) *gdrift = applyKnob(GDRIFT,   k2, spd2);
     } else {
       int s = slot_ - 1;
-      if (k1Live_[slot_]) seq.position[s]  = applyKnob(POSITION, k1, spd1);
+      // POSITION is written from the RAW pot (r1), not the smoothed read: the
+      // core applies position at frame boundaries (no zipper to smooth), and a
+      // one-pole's ~250 ms creep would cost a re-render per hop for its whole
+      // tail (finding F8) and add its own settling latency. The fast-move grid
+      // in applyKnob still snaps; ADC jitter sits below the core's refresh
+      // threshold. Duration and drift keep the smoother.
+      if (k1Live_[slot_]) seq.position[s]  = applyKnob(POSITION, r1, spd1);
       if (k2Live_[slot_]) perStepDrift_[s] = applyKnob(DRIFT,    k2, spd2);
     }
 

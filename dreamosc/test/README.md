@@ -43,8 +43,13 @@ scheduling on the host. The former Python golden regression is retired.
 
 - A new DSP property → a `TEST_CASE` in `test_stretch_core.cpp`. Prefer an
   invariant (bounds, energy, length, determinism) over a magic expected number.
-- A new behavior the Python reference also models → add a case to `CASES` in
-  `regression.py`.
-- Tolerances are set from measured agreement **with a written reason** — see the
-  comment on `RMS_DB_TOL`. Do not loosen a tolerance to hide a regression; if a
-  gap is an implementation difference, say why in the comment.
+- A code-review finding → a `TEST_CASE` in `test_findings.cpp` tagged
+  `[finding][!mayfail]` that reproduces it AND measures its effect on the
+  rendered audio (click detector, silent windows, first-difference sample).
+  `[!mayfail]` reports "failed as expected" without failing the gate; drop the
+  tag once the finding is remediated so the test becomes a guard. ISR
+  preemption is simulated through the `SS_HOOK` points (test build only).
+  Each test writes its audio to `/tmp/dreamosc_findings/*.wav` for listening.
+- Tolerances are set from measurement **with a written reason** (see the
+  seam-continuity test's self-calibrated floor). Do not loosen a tolerance to
+  hide a regression; if a gap is an implementation difference, say why.

@@ -427,9 +427,11 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   over USB serial (`screen /dev/tty.usbmodem* 115200`): a `SET` line (full
   instrument state), `KNOB`/`POS`/`DRF` lines (per-step + control state), and an
   `HLTH` line (gated/ringing/armed heads, service µs, per-render `avg_us` and
-  `max_us`, ISR µs, frame holds `du`, `late` samples, re-renders `rfr`, min
-  `slack` to deadline, per-size render `cost`, stack high-water), all as scaled
-  integers (nano-newlib printf can't do floats). Timing uses raw `GetTick()`
+  `max_us`, ISR µs, frame holds `du`, `late` samples, re-renders `rfr`, output
+  `clip` count, min `slack` to deadline) plus a `COST` line (per-size render
+  `cost`, stack high-water) — split because the combined line overran
+  libDaisy's 128-byte Logger buffer — all as scaled integers (nano-newlib
+  printf can't do floats). Timing uses raw `GetTick()`
   deltas: `System::GetUs()` wraps every 21.5 s and poisoned the old numbers
   once per wrap. This is how the
   spread-0 CPU overload was measured, how the pickup and "steps go silent" bugs

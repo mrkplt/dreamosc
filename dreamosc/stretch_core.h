@@ -113,6 +113,9 @@ extern float gWindows[SS_WIN_FLOATS];
 extern float gBlendA[SS_HOP_FLOATS];
 extern float gBlendC[SS_HOP_FLOATS];
 extern volatile uint32_t gUnderruns;   // frame holds (a head repeated a frame)
+extern volatile uint32_t gClips;       // output samples the +-1 clamp caught
+                                       // (a full ring-out stack can overrun
+                                       // SS_HEADROOM -- distortion, not density)
 
 // Test-only preemption hooks. The host suite is single-threaded, so an ISR
 // firing in the middle of a main-loop routine can only be simulated by calling
@@ -998,8 +1001,8 @@ class Sequencer {
 
     clock_.store(c + 1, std::memory_order_relaxed);
     float out = sum * SS_HEADROOM;
-    if (out > 1.0f) out = 1.0f;
-    else if (out < -1.0f) out = -1.0f;
+    if (out > 1.0f) { out = 1.0f; gClips++; }
+    else if (out < -1.0f) { out = -1.0f; gClips++; }
     return out;
   }
 

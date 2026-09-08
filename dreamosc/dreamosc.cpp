@@ -44,6 +44,7 @@ float DSY_SDRAM_BSS gBlendC[SS_HOP_FLOATS];
 // repeated its current frame (spectrally the same, never silent). The one
 // number that says the producer fell behind. Printed as `du` in PROFILE.
 volatile uint32_t gUnderruns = 0;
+volatile uint32_t gClips = 0;
 
 #ifdef PROFILE
 // `make PROFILE=1`: per-second CPU accounting over USB serial. Read it with
@@ -437,7 +438,7 @@ int main(void) {
   uint32_t lastControlMs = System::GetNow();
 #ifdef PROFILE
   uint32_t profBusyTicks = 0, profUnits = 0, profLastUnder = 0;
-  uint32_t profLastLate = 0, profLastRefresh = 0, profLastIsr = 0;
+  uint32_t profLastLate = 0, profLastRefresh = 0, profLastIsr = 0, profLastClip = 0;
   // Peak single service() duration this window: an under-fed head comes from
   // the WORST single render, which the average hides. Watch max_us at 16384.
   uint32_t profMaxTicks = 0;
@@ -536,27 +537,36 @@ int main(void) {
       // the ringing head with the least left. du = frame HOLDS (a head repeated
       // a frame: the producer fell behind); late = samples a seam waited for an
       // incoming head that was not ready (the step ran long, never silent);
-      // rfr = re-renders driven by control changes; slack = min samples to
+      // rfr = re-renders driven by control changes; clip = output samples the
+      // +-1 clamp caught this second (a ring-out stack overrunning SS_HEADROOM
+      // reads as distortion, not just loudness); slack = min samples to
       // deadline at render start this second (negative = a render started past
-      // its boundary); cost = per-size render cost estimates in samples,
-      // 16384..256. free = FREE pool slots (a leak shows here as a steady
-      // decline). max_us = worst single render. stk = deepest stack use.
+      // its boundary). free = FREE pool slots (a leak shows here as a steady
+      // decline). max_us = worst single render. A separate COST line carries the
+      // per-size render cost estimates in samples (16384..256) and stk (deepest
+      // stack use); it split off HLTH because the combined string overran
+      // libDaisy's 128-byte Logger buffer and truncated cost[1..6] + stk.
       uint32_t busyUs = profUs(profBusyTicks);
       uint32_t late = seq.lateSamples(), rfr = seq.refreshes();
+      // Two lines: the full HLTH string overruns libDaisy's 128-byte Logger
+      // buffer and silently truncated cost[1..6] and stk (see COST below).
       pod.seed.PrintLine(
-          "HLTH act=%d rng=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u slack=%d cost=%u/%u/%u/%u/%u/%u/%u stk=%u",
+          "HLTH act=%d rng=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u clip=%u slack=%d",
           seq.activeVoices(), seq.activeRemnants(), seq.armedHeads(), seq.freeHeads(),
           (unsigned)profUnits, (unsigned)busyUs,
           (unsigned)(profUnits ? busyUs / profUnits : 0), (unsigned)profUs(profMaxTicks),
           (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),
           (unsigned)(late - profLastLate), (unsigned)(rfr - profLastRefresh),
-          (int)seq.takeMinSlack(),
+          (unsigned)(gClips - profLastClip),
+          (int)seq.takeMinSlack());
+      pod.seed.PrintLine(
+          "COST 16384=%u 8192=%u 4096=%u 2048=%u 1024=%u 512=%u 256=%u stk=%u",
           (unsigned)seq.costSamples(0), (unsigned)seq.costSamples(1),
           (unsigned)seq.costSamples(2), (unsigned)seq.costSamples(3),
           (unsigned)seq.costSamples(4), (unsigned)seq.costSamples(5),
           (unsigned)seq.costSamples(6),
           (unsigned)profStackUsed());
-      profLastUnder = gUnderruns;
+      profLastUnder = gUnderruns; profLastClip = gClips;
       profLastLate = late; profLastRefresh = rfr;
       profBusyTicks = profUnits = 0;
       profMaxTicks = 0;   // reset the per-window peak (stk is a running high-water)

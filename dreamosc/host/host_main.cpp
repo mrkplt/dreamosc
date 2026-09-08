@@ -28,6 +28,7 @@ float         gWindows[SS_WIN_FLOATS];
 float         gBlendA[SS_HOP_FLOATS];
 float         gBlendC[SS_HOP_FLOATS];
 volatile uint32_t gUnderruns = 0;   // frame holds (see Head::tick)
+volatile uint32_t gClips = 0;       // +-1 clamp hits (see render output tail)
 
 // --- minimal 16-bit PCM WAV I/O (mono/stereo), matching stretchseq.py -------
 

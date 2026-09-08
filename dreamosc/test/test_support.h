@@ -18,6 +18,7 @@ inline float         gWindows[SS_WIN_FLOATS];
 inline float         gBlendA[SS_HOP_FLOATS];
 inline float         gBlendC[SS_HOP_FLOATS];
 inline volatile uint32_t gUnderruns = 0;   // frame holds (see Head::tick)
+inline volatile uint32_t gClips = 0;       // +-1 clamp hits (see render output tail)
 #ifdef SS_TEST_HOOKS
 inline void (*gSsTestHook)(int id, void* ctx) = nullptr;
 #endif

@@ -27,16 +27,6 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
 
 ### Still owed
 
-- **Compiler flags (`-O3`, `-fmove-loop-invariants`, `-fno-math-errno`)** —
-  `dreamosc/Makefile`, host-tested build only. Sound-neutral by construction
-  (no FP reassociation; `-ffast-math` deliberately off) but the speedup is a
-  hypothesis. Compare `COST` and `max_us` against the alpha4 numbers above
-  (4096: 128 / ~1177 µs; 16384: 672–673 / ~14500 µs single, 28721 µs pair)
-  and confirm `du=0 late=0 clip=0` at both sizes. Code grew 107,360 →
-  111,288 B (SRAM 48.5% → 49.3%). Note `stk` cannot see render-depth stack
-  growth from the extra inlining: `profSampleStack()` samples MSP between
-  `service()` calls, never inside a render, so `stk` never sees render depth
-  (a profiler gap in its own right). Watch for a hang rather than a number.
 - **Raw cut level by ear** at fade 0, 4096 and 16384. Host measurement: the
   first 5 ms after a cut now sits within the material's own wander (deepest
   −2 to −9 dB in 5 ms windows) instead of −34/−62 dB.
@@ -78,6 +68,23 @@ the fix. What the bench still owes here:
   times the D-cache; the bit-reversal and early passes miss).
 - AXI SRAM vs SDRAM for the FFT scratch (placed per ST's guidance; the speedup
   was never confirmed).
+
+## Closed by measurement (recorded so they are not re-tried)
+
+- **Compiler flags `-O3` + `-fmove-loop-invariants` + `-fno-math-errno`**
+  (tried 2026-09-08, commit 856fac4, reverted). Bench at 480 MHz, frame 16384,
+  `steps=1`, `fade=0.5`, `dur=260 ms`: `COST 16384` **704–720** vs alpha4's
+  672–673 (+5–7% slower), `COST 4096` **142** vs 128 (+11% slower), pair
+  re-render `max_us` 30,047–30,132 vs 28,721 (+5%); `stk` 176 → 216; `du=0
+  late=0 clip=0` throughout. Binary +3.7%. The render is memory-bound at
+  16384 (ShyFFT ping-pongs 128 KB through the 16 KB D-cache per pass), so
+  arithmetic-side flags cannot help there, and at 4096 `-O3`'s unrolling made
+  the codegen worse outright. GCC's tree-level hoisting (`-ftree-loop-im`,
+  on at -O2) was already doing what `-fmove-loop-invariants` re-enables.
+  Caveat: the alpha4 reference was a single-head run (`fade=0`); the +5–7%
+  at 16384 may include some two-head cache eviction, but the +11% at 4096
+  cannot. libDaisy's `-O2` stands. `-ffast-math` was never tried and must
+  not be: FP reassociation changes the rendered audio.
 
 ## Closed by construction (recorded so they are not re-opened)
 

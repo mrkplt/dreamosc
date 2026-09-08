@@ -136,13 +136,14 @@ polyphony.
 - **This REPLACES the old `spread` model** (which let all 8 heads stack at
   spread 0 — a ~2.3× CPU overload on the H750 that caused constant dropouts,
   measured via `make PROFILE=1`). The crossfade design caps concurrency at two
-  sounding heads (plus ring-out); the origin of "spread" was always these seam
-  crossfades.
-- **Ring-out** (`ringout` seconds, encoder page) lets a departing head keep
-  sounding at full volume after the next step begins, then stop with a raw cut.
-  Gated heads (sounding + incoming + ringing) are hard-capped at
-  `SS_RENDER_CAP`; the ringing head with the least left is ditched to admit a
-  new one. There is one source, one timeline, one sequence.
+  sounding heads; the origin of "spread" was always these seam crossfades.
+  There is one source, one timeline, one sequence.
+- **No ring-out.** A departing head stops the instant its seam completes (a raw
+  cut, spectral not amplitude). An earlier "ring-out" feature (#155) let a
+  departing head linger at full volume for up to 16 s — a budgeted revival of
+  the #152 lingering tail — but it stacked heads (loud/dense, not #152's sparse
+  decay) and was a wildly expensive way to simulate a delay. It was removed; the
+  lingering texture will return as a real delay line (its own card).
 
 ### Frames are the unit (how a head is actually made)
 
@@ -163,9 +164,8 @@ known exactly (`h − phase`) and served earliest-deadline-first.
   boundary (spectrally the same) and counts a hold (`du` in the profiler).
 - **Head pool, armed a whole dwell ahead.** The next step's head is allocated
   and pre-rolled the moment the current step goes live. Go-live waits for the
-  incoming head to be ready (the step runs *late*, never silent). Ring-out is
-  just "do not free the departing head yet". Single-step mode and startup get a
-  fresh head each visit, so there is no re-arm hole.
+  incoming head to be ready (the step runs *late*, never silent). Single-step
+  mode and startup get a fresh head each visit, so there is no re-arm hole.
 - **Live controls by speculative re-render.** Stretch, position and frame size
   are read at every render; a staged frame is re-rendered when the controls it
   was made with have changed and there is slack before its deadline (cost is
@@ -392,7 +392,7 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   source drift check plus Catch2 unit tests over `stretch_core.h` (determinism,
   bounds, seam continuity at every size, pre-roll level, no startup/single-step
   hole, constant-loudness, live-control latency, a cost-modelled producer for
-  scheduling, holds-never-silence, ring-out cap/expiry, drift, multi-samplerate,
+  scheduling, holds-never-silence, drift, multi-samplerate,
   click detection, per-frame-size rendering), `controls_core.h`
   (pickup, mode navigation, drift-fold, encoder stepping, LED colors), and
   `shy_fft.h` (round-trips). Gates on exit code; the count grows with behavior —
@@ -426,7 +426,7 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
 - **`make PROFILE=1`** builds a diagnostic firmware that prints per-second lines
   over USB serial (`screen /dev/tty.usbmodem* 115200`): a `SET` line (full
   instrument state), `KNOB`/`POS`/`DRF` lines (per-step + control state), and an
-  `HLTH` line (gated/ringing/armed heads, service µs, per-render `avg_us` and
+  `HLTH` line (gated/armed heads, service µs, per-render `avg_us` and
   `max_us`, ISR µs, frame holds `du`, `late` samples, re-renders `rfr`, output
   `clip` count, min `slack` to deadline) plus a `COST` line (per-size render
   `cost`, stack high-water) — split because the combined line overran

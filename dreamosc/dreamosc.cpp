@@ -49,13 +49,14 @@ volatile uint32_t gClips = 0;
 #ifdef PROFILE
 // `make PROFILE=1`: per-second CPU accounting over USB serial. Read it with
 //   screen /dev/tty.usbmodem<tab> 115200
-// HLTH fields: act (gated step heads), rng (ringing heads), arm (armed heads),
-// units (service() calls that rendered), svc_us (main-loop DSP us that second),
-// avg_us (per unit), max_us (WORST single render), isr_us (audio-callback us
-// that second), du (frame holds that second), late (samples a seam waited for
-// its incoming head), rfr (control-driven re-renders), slack (min samples to
-// deadline at render start, signed), cost (per-size render cost estimate in
-// samples, 16384 down to 256), stk (deepest stack use seen, bytes).
+// HLTH fields: act (gated step heads, at most 2), arm (armed heads), free (FREE
+// pool slots), units (service() calls that rendered), svc_us (main-loop DSP us
+// that second), avg_us (per unit), max_us (WORST single render), isr_us
+// (audio-callback us that second), du (frame holds that second), late (samples a
+// seam waited for its incoming head), rfr (control-driven re-renders), clip
+// (+-1 clamp hits that second), slack (min samples to deadline at render start,
+// signed). A separate COST line carries the per-size render cost estimate in
+// samples (16384 down to 256) and stk (deepest stack use seen, bytes).
 //
 // Timing is done in raw TIM2 ticks (System::GetTick) and converted per delta,
 // because System::GetUs() wraps every 2^32/200e6 = 21.5 s and a delta across
@@ -299,10 +300,6 @@ static void processControls() {
       // shrank past the currently selected step.
       seq.setSteps(stepCount(seq.activeSteps, inc, 1, SS_STEPS));
       panel.clampToActive(seq.activeSteps);
-    } else if (encPage == PAGE_RINGOUT) {
-      // Ring-out remnant length 0..16 s (#155). 0 = off (clean instrument). Fast
-      // spin = 1 s/detent, slow = 0.25 s -- a coarse control, seconds of tail.
-      seq.ringout = stepAdditive(seq.ringout, inc, fast ? 1.0f : 0.25f, 0.0f, 16.0f);
     } else {   // PAGE_FADE
       seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
     }
@@ -323,21 +320,19 @@ static void processControls() {
   if (panel.speed2() > dbgPk2) dbgPk2 = panel.speed2();
 #endif
 
-  // --- led2: encoder page color (ROYGB over stretch/steps/fade/window/ringout,
-  // same ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
+  // --- led2: encoder page color (RoYG over stretch/steps/fade/window, same
+  // ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
   // encoded LEVEL, so a bright LED always means "this parameter is turned up":
   //   stretch -> red    = stretch detent index
   //   steps   -> orange = active step count
   //   fade    -> yellow = crossfade amount (0..0.5)
   //   frame   -> green  = frame-size (window) index
-  //   ringout -> blue   = ring-out remnant length (0..16 s)
   float b2;
   switch (encPage) {
     case PAGE_STRETCH: b2 = stretchBrightness(stretchIdx, STRETCH_NSTOPS); break;
     case PAGE_FADE:    b2 = fadeBrightness(seq.fade);                      break;
     case PAGE_FRAME:   b2 = frameBrightness(frameIdx, FRAME_NSTOPS);       break;
     case PAGE_STEPS:   b2 = stepBrightness(seq.activeSteps);               break;
-    case PAGE_RINGOUT: b2 = ringoutBrightness(seq.ringout);               break;
     default:           b2 = 0.15f;                                         break;
   }
   Rgb c2 = pageColor(encPage, b2);
@@ -421,7 +416,6 @@ int main(void) {
   seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
-  seq.ringout  = 0.0f;    // ring-out OFF by default (clean sequential instrument)
   // Default window 4096 (FRAME_DEFAULT_IDX), not the 16384 max. The window page
   // grows it toward the shimmer regime or shrinks it from here, live.
   seq.setFrame(FRAME_STOPS[frameIdx]);
@@ -478,12 +472,11 @@ int main(void) {
       // head's current hop in samples (frame size as actually applied), step =
       // the step it is playing, blk = audio block.
       pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d rel_ms=%d frame=%d hop=%d step=%d steps=%d blk=%u page=%d slot=%d",
+          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d frame=%d hop=%d step=%d steps=%d blk=%u page=%d slot=%d",
           (int)(seq.stretch * 100.0f + 0.5f),
           (int)(seq.duration * 1000.0f + 0.5f),
           (int)(globalDrift * 10000.0f + 0.5f),
           (int)(seq.fade * 1000.0f + 0.5f),
-          (int)(seq.ringout * 1000.0f + 0.5f),   // ring-out length (ms)
           seq.frameSize,                         // requested (live control)
           seq.curHop(),                          // applied on the sounding head
           seq.curStep(),
@@ -532,27 +525,24 @@ int main(void) {
           (int)(seq.drift[4]*10000+0.5f), (int)(seq.drift[5]*10000+0.5f),
           (int)(seq.drift[6]*10000+0.5f), (int)(seq.drift[7]*10000+0.5f));
       // HEALTH line: CPU and supply accounting for this second. act = gated
-      // step heads (sounding + incoming); rng = ringing heads; arm = armed
-      // (pre-warmed) heads. Gated heads are capped at SS_RENDER_CAP by ditching
-      // the ringing head with the least left. du = frame HOLDS (a head repeated
-      // a frame: the producer fell behind); late = samples a seam waited for an
-      // incoming head that was not ready (the step ran long, never silent);
-      // rfr = re-renders driven by control changes; clip = output samples the
-      // +-1 clamp caught this second (a ring-out stack overrunning SS_HEADROOM
-      // reads as distortion, not just loudness); slack = min samples to
-      // deadline at render start this second (negative = a render started past
-      // its boundary). free = FREE pool slots (a leak shows here as a steady
-      // decline). max_us = worst single render. A separate COST line carries the
-      // per-size render cost estimates in samples (16384..256) and stk (deepest
-      // stack use); it split off HLTH because the combined string overran
-      // libDaisy's 128-byte Logger buffer and truncated cost[1..6] + stk.
+      // step heads (sounding + incoming, at most 2); arm = armed (pre-warmed)
+      // heads. du = frame HOLDS (a head repeated a frame: the producer fell
+      // behind); late = samples a seam waited for an incoming head that was not
+      // ready (the step ran long, never silent); rfr = re-renders driven by
+      // control changes; clip = output samples the +-1 clamp caught this second
+      // (the phase-randomized peaks can overrun SS_HEADROOM -> distortion, not
+      // loudness); slack = min samples to deadline at render start this second
+      // (negative = a render started past its boundary). free = FREE pool slots
+      // (a leak shows here as a steady decline). max_us = worst single render. A
+      // separate COST line carries the per-size render cost estimates in samples
+      // (16384..256) and stk (deepest stack use); it split off HLTH because the
+      // combined string overran libDaisy's 128-byte Logger buffer and truncated
+      // cost[1..6] + stk.
       uint32_t busyUs = profUs(profBusyTicks);
       uint32_t late = seq.lateSamples(), rfr = seq.refreshes();
-      // Two lines: the full HLTH string overruns libDaisy's 128-byte Logger
-      // buffer and silently truncated cost[1..6] and stk (see COST below).
       pod.seed.PrintLine(
-          "HLTH act=%d rng=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u clip=%u slack=%d",
-          seq.activeVoices(), seq.activeRemnants(), seq.armedHeads(), seq.freeHeads(),
+          "HLTH act=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u clip=%u slack=%d",
+          seq.activeVoices(), seq.armedHeads(), seq.freeHeads(),
           (unsigned)profUnits, (unsigned)busyUs,
           (unsigned)(profUnits ? busyUs / profUnits : 0), (unsigned)profUs(profMaxTicks),
           (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),

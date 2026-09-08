@@ -12,14 +12,14 @@ using namespace testutil;
 
 static std::vector<float> pool(SS_POOL_FLOATS);
 
-static void probe(int frame, float duration, float fade, float ringout, int steps) {
+static void probe(int frame, float duration, float fade, int steps) {
   gTab.init();
   auto srcbuf = make_source(4.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq;
   seq.init(&src, 48000.0f, pool.data());
   seq.stretch = 50.0f; seq.duration = duration; seq.fade = fade;
-  seq.ringout = ringout; seq.setSteps(steps);
+  seq.setSteps(steps);
   seq.setFrame(frame);
 
   uint32_t dur = seq.durSamples();
@@ -32,8 +32,8 @@ static void probe(int frame, float duration, float fade, float ringout, int step
   size_t s0 = first_audible(out);
   const uint32_t W = 240;   // 5 ms windows
   double ref = rms_range(out, s0 + dur + dur / 2, 4800);
-  printf("frame=%d dur=%.2fs fade=%.2f ringout=%.1f steps=%d  ref_rms=%.4f  first audible at sample %zu\n",
-         frame, duration, fade, ringout, steps, ref, s0);
+  printf("frame=%d dur=%.2fs fade=%.2f steps=%d  ref_rms=%.4f  first audible at sample %zu\n",
+         frame, duration, fade, steps, ref, s0);
   uint32_t hop = frame / 2;
   for (int k = 1; k <= 2; k++) {
     size_t seam = s0 + (size_t)k * dur;
@@ -53,8 +53,8 @@ static void probe(int frame, float duration, float fade, float ringout, int step
 }
 
 int main() {
-  probe(4096, 1.0f, 0.0f, 0.0f, 8);
-  probe(16384, 1.0f, 0.0f, 0.0f, 8);
-  probe(4096, 1.0f, 0.0f, 0.0f, 1);   // single-step case
+  probe(4096, 1.0f, 0.0f, 8);
+  probe(16384, 1.0f, 0.0f, 8);
+  probe(4096, 1.0f, 0.0f, 1);   // single-step case
   return 0;
 }

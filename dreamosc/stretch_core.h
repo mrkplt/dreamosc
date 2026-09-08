@@ -26,9 +26,9 @@
 // under-fed head repeats its current frame (spectrally the same, never silent).
 //
 // HEAD POOL: a head is a pool slot allocated at pre-warm (the moment the current
-// step goes live, so the lead is the whole dwell) and freed when its step ends
-// or its ring-out expires. Ring-out is just "do not free the departing head
-// yet": no adoption, no copy, no remnant slots.
+// step goes live, so the lead is the whole dwell) and freed when its step ends.
+// Heads are strictly sequential -- at most two sound at once, and only during a
+// seam crossfade (cur + inc); no adoption, no copy, no lingering tails.
 
 #ifndef STRETCH_CORE_H
 #define STRETCH_CORE_H
@@ -64,12 +64,9 @@ using stmlib::RotationPhasor;
 #define SS_STEPS 8
 // Number of window sizes: SS_W, SS_W/2, ... SS_W_MIN. Tables are built for each.
 #define SS_NSIZES 7
-// HARD render ceiling: the most GATED heads (sounding + incoming + ringing) at
-// once. 6 is the bench-proven number at the old clock; the sequencer ditches the
-// ringing head with the least left to admit a new one.
-#define SS_RENDER_CAP 6
-// Pool: cap + one armed (pre-warmed) + slack, so allocation never has to ditch
-// just to arm. Memory is cheap. (static_assert below pins the relation.)
+// Pool: at most three heads are live at once (current + incoming at a seam +
+// one armed/pre-warmed for the next step); the rest is slack so allocation
+// never has to steal. Memory is cheap. (static_assert below pins the relation.)
 #define SS_HEADS 10
 // Frame buffers per head: old + cur + a staged pair + a refresh pair.
 #define SS_FRAME_BUFS 6
@@ -88,9 +85,10 @@ using stmlib::RotationPhasor;
 #define SS_WIN_FLOATS (2 * SS_W - SS_W_MIN)
 #define SS_HOP_FLOATS (SS_W - SS_W_MIN / 2)
 
-// Worst-case live occupancy is cap gated heads + one armed head; one more so
-// allocHead() always finds a FREE slot without ditching a ringing head to arm.
-static_assert(SS_HEADS >= SS_RENDER_CAP + 2, "head pool must exceed the render cap by 2");
+// Worst-case live occupancy is 3: current + incoming (during a seam) + one
+// armed head pre-warmed for the next step. The pool is larger so allocHead()
+// always finds a FREE slot immediately, with headroom to spare.
+static_assert(SS_HEADS >= 4, "pool must cover cur + inc + armed with slack");
 static_assert(SS_FRAME_BUFS >= 6, "old + cur + staged pair + refresh pair");
 
 // ---------------------------------------------------------------------------
@@ -262,7 +260,7 @@ inline SeamGeom seamGeom(uint32_t durSamples, float fade) {
 
 class Head {
  public:
-  enum State : uint8_t { FREE = 0, ARMED, READY, GATED, RINGING };
+  enum State : uint8_t { FREE = 0, ARMED, READY, GATED };
   enum Kind : int8_t { SINGLE = 0, PAIR = 1 };
   enum Want : uint8_t { NONE = 0, REQUIRED, REFRESH };
 
@@ -292,7 +290,6 @@ class Head {
     appliedSlot_.store(0, std::memory_order_relaxed);
     qHead_.store(0, std::memory_order_relaxed);
     qTail_.store(0, std::memory_order_relaxed);
-    remain_.store(0, std::memory_order_relaxed);
     due_.store(0, std::memory_order_relaxed);
     phase_ = 0; h_ = 0; old_ = cur_ = nullptr; A_ = C_ = nullptr;
     seenLife_ = 0;
@@ -309,7 +306,6 @@ class Head {
   bool  isFree() const { return state() == FREE; }
   bool  isArmed() const { State s = state(); return s == ARMED || s == READY; }
   int   step() const { return step_; }
-  uint32_t remain() const { return remain_.load(std::memory_order_relaxed); }
 
   // FREE -> ARMED. Drains any stale descriptors (the ISR is the queue consumer,
   // so it may pop at any time) so a new life never sees the old life's frames.
@@ -324,7 +320,6 @@ class Head {
     curIdx_.store(-1, std::memory_order_relaxed);
     old_ = cur_ = nullptr;
     phase_ = 0; h_ = 0;
-    remain_.store(0, std::memory_order_relaxed);
     life_.fetch_add(1, std::memory_order_release);
     state_.store(ARMED, std::memory_order_release);
   }
@@ -340,15 +335,6 @@ class Head {
     return true;
   }
 
-  // GATED -> RINGING for `remain` samples (ring-out), or -> FREE.
-  void retire(uint32_t ringout) {
-    if (ringout > 0) {
-      remain_.store(ringout, std::memory_order_relaxed);
-      state_.store(RINGING, std::memory_order_release);
-    } else {
-      free();
-    }
-  }
   void free() {
     state_.store(FREE, std::memory_order_release);
     old_ = cur_ = nullptr;
@@ -356,9 +342,9 @@ class Head {
     curIdx_.store(-1, std::memory_order_relaxed);
   }
 
-  // One output sample of this head's stream (GATED or RINGING), then advance.
-  // At the hop boundary rotate frames from the staged queue, or hold (repeat
-  // the current frame) if nothing is staged -- never silence.
+  // One output sample of this GATED head's stream, then advance. At the hop
+  // boundary rotate frames from the staged queue, or hold (repeat the current
+  // frame) if nothing is staged -- never silence.
   inline float tick() {
     uint32_t p = phase_;
     float a = A_[p];
@@ -373,12 +359,6 @@ class Head {
       phase_ = 0;
     }
     return s;
-  }
-  // RINGING bookkeeping: one sample consumed; frees itself when spent.
-  inline void ringTick() {
-    uint32_t r = remain_.load(std::memory_order_relaxed);
-    if (r <= 1) { remain_.store(0, std::memory_order_relaxed); free(); }
-    else        remain_.store(r - 1, std::memory_order_relaxed);
   }
 
   // ISR, once per block: drop every queued descriptor that a later one
@@ -440,8 +420,6 @@ class Head {
     bool armed = (st == ARMED || st == READY);
     if (armed) deadline = due_.load(std::memory_order_relaxed);
     else       deadline = clock + (h_ - phase_);
-    // Ringing head about to expire before its next boundary: nothing to make.
-    if (st == RINGING && remain() <= (uint32_t)(h_ - phase_)) return NONE;
     bool pending = stagedFrame_ > applied;
     if (!pending) return REQUIRED;
     // Refresh: controls moved materially since this frame was staged. Room:
@@ -685,7 +663,6 @@ class Head {
   std::atomic<int>      oldIdx_{-1}, curIdx_{-1};
   std::atomic<uint32_t> applied_{0}, appliedSlot_{0};
   std::atomic<uint32_t> qTail_{0};
-  std::atomic<uint32_t> remain_{0};
   std::atomic<uint32_t> due_{0};
   int      step_ = 0;
   uint32_t lifeSeed_ = 0;
@@ -725,7 +702,6 @@ class Sequencer {
   float stretch = 50.0f;      // live: read at every render
   float duration = 4.0f;      // live, unquantized dwell in seconds
   float fade  = 0.0f;         // seam overlap 0..0.5; 0 = raw cut
-  float ringout = 0.0f;       // seconds a departing head keeps sounding (0 = off)
   int   frameSize = SS_W_DEFAULT;   // live: read at every render
   int   activeSteps = SS_STEPS;
 
@@ -767,10 +743,6 @@ class Sequencer {
     uint32_t n = (uint32_t)(duration * sr_ + 0.5f);
     return n < 1 ? 1 : n;
   }
-  uint32_t ringoutSamples() const {
-    float r = ringout < 0.0f ? 0.0f : (ringout > 16.0f ? 16.0f : ringout);
-    return (uint32_t)(r * sr_ + 0.5f);
-  }
   // One pass of all active steps plus a startup allowance (the first pair
   // render); host drive loops use this as a bounded length.
   uint32_t patternSamples() const {
@@ -780,11 +752,10 @@ class Sequencer {
   // ---- ISR: audio ----------------------------------------------------------
 
   // Render n mono samples. Per-block constants are hoisted; the per-sample
-  // work is the seam decision, the gated heads' blends, and the ring-out ticks.
+  // work is the seam decision and the gated heads' blends.
   void render(float* out, int n) {
     uint32_t dur = durSamples();
     SeamGeom g = seamGeom(dur, fade);
-    uint32_t ro = ringoutSamples();
     uint32_t c = clock_.load(std::memory_order_relaxed);
     // Per-block ISR housekeeping: drop superseded staged frames (F4), keep the
     // armed head's deadline honest against live duration/fade changes (F3),
@@ -798,7 +769,7 @@ class Sequencer {
       if (from >= 0) armNext(c, g.onset, (head_[from].step() + 1) % activeSteps);
     }
     if (nxt_ >= 0) head_[nxt_].setDue(c + samplesToNextOnset(g.onset));
-    for (int i = 0; i < n; i++) out[i] = tick(g, ro);
+    for (int i = 0; i < n; i++) out[i] = tick(g);
   }
   inline float next() { float s; render(&s, 1); return s; }
 
@@ -890,11 +861,6 @@ class Sequencer {
   int activeVoices() const {      // gated STEP heads (sounding + incoming)
     return (cur_ >= 0 ? 1 : 0) + (inc_ >= 0 ? 1 : 0);
   }
-  int activeRemnants() const {    // ringing heads
-    int n = 0;
-    for (int i = 0; i < SS_HEADS; i++) if (head_[i].state() == Head::RINGING) n++;
-    return n;
-  }
   int armedHeads() const {
     int n = 0;
     for (int i = 0; i < SS_HEADS; i++) {
@@ -928,13 +894,13 @@ class Sequencer {
 #endif
 
  private:
-  inline float tick(const SeamGeom& g, uint32_t ro) {
+  inline float tick(const SeamGeom& g) {
     float sum = 0.0f;
     uint32_t c = clock_.load(std::memory_order_relaxed);
 
     if (cur_ < 0) {                       // startup: first head not live yet
       if (nxt_ < 0) armNext(c, g.onset, 0);
-      if (nxt_ >= 0 && admit() && head_[nxt_].goLive()) {
+      if (nxt_ >= 0 && head_[nxt_].goLive()) {
         cur_ = nxt_; nxt_ = -1;
         elapsed_ = 0;
         armNext(c, g.onset, (head_[cur_].step() + 1) % activeSteps);
@@ -945,22 +911,20 @@ class Sequencer {
       }
     }
 
-    // Seam: the incoming head goes live at onset, once it is ready and the cap
-    // admits it. If it is not ready the outgoing head keeps sounding (late,
-    // never silent).
+    // Seam: the incoming head goes live at onset once it is ready. If it is not
+    // ready the outgoing head keeps sounding (late, never silent).
     if (inc_ < 0 && elapsed_ >= g.onset) {
       if (nxt_ >= 0 && nxtStep_ >= activeSteps) {   // steps shrank under the arm
         head_[nxt_].free(); nxt_ = -1;
       }
       if (nxt_ < 0) armNext(c, g.onset, (head_[cur_].step() + 1) % activeSteps);
-      if (nxt_ >= 0 && admit() && head_[nxt_].goLive()) {
+      if (nxt_ >= 0 && head_[nxt_].goLive()) {
         inc_ = nxt_; nxt_ = -1;
         fadeLen_ = g.fadeLen;
         seamStart_ = elapsed_;
         int after = (head_[inc_].step() + 1) % activeSteps;
         if (fadeLen_ == 0) {              // raw cut: outgoing stops now
-          head_[cur_].retire(ro);
-          enforceCap();
+          head_[cur_].free();
           cur_ = inc_; inc_ = -1;
           elapsed_ = 0;
         }
@@ -974,8 +938,7 @@ class Sequencer {
     if (inc_ >= 0) {
       uint32_t fp = (uint32_t)(elapsed_ - seamStart_);
       if (fp >= fadeLen_) {               // seam complete: retire outgoing
-        head_[cur_].retire(ro);
-        enforceCap();
+        head_[cur_].free();
         cur_ = inc_; inc_ = -1;
         elapsed_ = 0;                     // this sample is the new dwell's first
         sum = head_[cur_].tick();
@@ -990,13 +953,6 @@ class Sequencer {
     } else {
       sum = head_[cur_].tick();
       elapsed_++;
-    }
-
-    // Ring-out heads at full volume.
-    for (int i = 0; i < SS_HEADS; i++) {
-      if (head_[i].stateIsr() != Head::RINGING) continue;
-      sum += head_[i].tick();
-      head_[i].ringTick();
     }
 
     clock_.store(c + 1, std::memory_order_relaxed);
@@ -1042,45 +998,12 @@ class Sequencer {
     return onset > elapsed_ ? (uint32_t)(onset - elapsed_) : 0u;
   }
 
-  // ISR-side pool bookkeeping (relaxed state reads: the ISR is the writer).
+  // ISR-side pool bookkeeping (relaxed state reads: the ISR is the writer). The
+  // pool always has a FREE slot: at most 3 heads are live (cur + inc + armed)
+  // and SS_HEADS covers that with slack, so allocation never has to steal.
   int allocHead() {
     for (int i = 0; i < SS_HEADS; i++) if (head_[i].stateIsr() == Head::FREE) return i;
-    int o = oldestRinging();
-    if (o >= 0) { head_[o].free(); return o; }
     return -1;
-  }
-  int oldestRinging() const {             // the ringing head with the least left
-    int best = -1; uint32_t least = 0;
-    for (int i = 0; i < SS_HEADS; i++) {
-      if (head_[i].stateIsr() != Head::RINGING) continue;
-      uint32_t r = head_[i].remain();
-      if (best < 0 || r < least) { best = i; least = r; }
-    }
-    return best;
-  }
-  int gatedCount() const {
-    int n = 0;
-    for (int i = 0; i < SS_HEADS; i++) {
-      Head::State s = head_[i].stateIsr();
-      if (s == Head::GATED || s == Head::RINGING) n++;
-    }
-    return n;
-  }
-  // Make room for one more gated head under SS_RENDER_CAP.
-  bool admit() {
-    while (gatedCount() >= SS_RENDER_CAP) {
-      int o = oldestRinging();
-      if (o < 0) return false;
-      head_[o].free();
-    }
-    return true;
-  }
-  void enforceCap() {
-    while (gatedCount() > SS_RENDER_CAP) {
-      int o = oldestRinging();
-      if (o < 0) return;
-      head_[o].free();
-    }
   }
 
   const Source* src_ = nullptr;

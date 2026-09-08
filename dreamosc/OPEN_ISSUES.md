@@ -11,13 +11,15 @@ heard on the Pod. In `make PROFILE=1` terms, the bench owes:
 - **Raw cut level by ear** at fade 0, 4096 and 16384. Host measurement: the
   first 5 ms after a cut now sits within the material's own wander (deepest
   −2 to −9 dB in 5 ms windows) instead of −34/−62 dB.
-- **`du` (holds) and `late` at 16384** under a 0.25 s march with ring-out at
-  2 s and 8 s. The cost-modelled host harness passes at the old bench cost
-  (~18 ms per 16384 frame); the real number at 480 MHz is unknown. `cost=`
-  on the HLTH line is the measured per-size render cost in samples.
-- **`isr_us` at block 32 with six gated heads.** The ISR now blends two frame
-  reads per gated head per sample (it used to read one ring sample); the main
-  loop lost its whole per-sample kernel in exchange.
+- **`du` (holds) and `late` at 16384** under a 0.25 s march with a full 0.5
+  crossfade (cur + inc both render 16384 pairs through the seam). The
+  cost-modelled host harness passes at the old bench cost (~18 ms per 16384
+  frame); the real number at 480 MHz is unknown. `COST` on the profiler is the
+  measured per-size render cost in samples.
+- **`isr_us` at block 32 at a crossfade seam (two gated heads).** The ISR now
+  blends two frame reads per gated head per sample (it used to read one ring
+  sample); the main loop lost its whole per-sample kernel in exchange. Max
+  concurrent is two sounding heads plus one armed rendering ahead.
 - **480 MHz** clean on the codec and QSPI paths (`pod.Init(true)`).
 - **Refresh feel:** turning position/stretch/frame on a sounding head. `rfr`
   counts re-renders; `slack` should stay positive. If a fast knob sweep drives
@@ -30,12 +32,13 @@ Each finding from the review of 6917a0a has a test in `test/test_findings.cpp`
 that reproduced it on the host (measuring the rendered audio) and now guards
 the fix. What the bench still owes here:
 
-- **F5b, throughput at the cap:** growing to 16384 with six gated heads is
-  43 holds in the following 2 s at the modelled cost (~18 ms per 16384 frame
-  at 400 MHz). A hold is a ~43 ms spectral freeze on one head, never silence.
-  This is CPU, not scheduling (six pre-roll pairs are more than five old hops
-  of work). Re-measure `du` on the bench at 480 MHz after a frame-size growth
-  with ring-out at 8 s; tighten the test bound from the real cost.
+- **F5b, throughput under a full crossfade:** growing to 16384 while cur + inc
+  both render pairs at a seam is bounded holds in the following 2 s at the
+  modelled cost (~18 ms per 16384 frame at 400 MHz). A hold is a spectral
+  freeze on one head, never silence. This is CPU, not scheduling (the pre-roll
+  pairs are several old hops of work). Re-measure `du` on the bench at 480 MHz
+  after a frame-size growth under a 0.5 crossfade; tighten the test bound from
+  the real cost.
 - **F8, ADC jitter:** position is now written from the raw pot. If a parked,
   engaged knob shows `rfr` ticking every hop, the pot's noise exceeds the
   0.002 refresh threshold; raise it or re-introduce a light smoother.

@@ -13,7 +13,7 @@ Sections:
 3. The head pool and its state machine
 4. The staged-frame queue: how the main loop hands frames to the ISR
 5. The scheduler: earliest deadline first, speculative refresh, cost model
-6. The sequencer clock: dwell, seams, ring-out, the render cap
+6. The sequencer clock: dwell and seams
 7. Live controls and their latencies
 8. Determinism
 9. Memory map and placement
@@ -98,9 +98,8 @@ floats in SDRAM. The ISR side holds:
 | `old_`, `cur_` (+ `oldIdx_`, `curIdx_`) | the two frames being blended |
 | `phase_`, `h_` | position inside the hop and the hop length of the frames in play |
 | `A_`, `C_` | the blend/correction tables for `h_` |
-| `state_` | FREE / ARMED / READY / GATED / RINGING |
+| `state_` | FREE / ARMED / READY / GATED |
 | `life_` | bumped at every allocation; tags everything the main loop publishes |
-| `remain_` | ring-out samples left (RINGING only) |
 | `due_` | absolute sample at which this head is expected to go live (ARMED) |
 | `step_`, `lifeSeed_`, `driftOff_` | which step, the phase seed, the drift offset drawn at arm |
 
@@ -119,22 +118,21 @@ it was rendered at, and the control values the last staged frame used.
 ## 3. The head pool and its state machine
 
 Heads are not bound to steps. A step visit allocates a head from the pool of
-`SS_HEADS = 10`, uses it, and frees it. Ring-out is "do not free the departing
-head yet". This is what removed the adoption copy, the empty-ring gap, and the
-single-step and startup holes of the previous design.
+`SS_HEADS = 10`, uses it, and frees it. This is what removed the adoption copy,
+the empty-ring gap, and the single-step and startup holes of the previous
+design.
 
 ```
 FREE ──ISR alloc(step, seed, drift, due, life++)──▶ ARMED
 ARMED ──main loop stages the pre-roll pair──▶ READY          (a hint; see below)
 READY ──ISR goLive(): apply the pair, phase 0──▶ GATED
-GATED ──ISR end of dwell, ringout > 0──▶ RINGING ──remain hits 0, or ditched──▶ FREE
-GATED ──ISR end of dwell, ringout == 0──▶ FREE
+GATED ──ISR end of dwell──▶ FREE
 ```
 
 Single-writer rules:
 
 - The ISR writes every transition except ARMED→READY, and owns `old_`,
-  `cur_`, `phase_`, `h_`, `remain_`, `due_`, `applied_`, `qTail_`.
+  `cur_`, `phase_`, `h_`, `due_`, `applied_`, `qTail_`.
 - The main loop writes ARMED→READY (by compare-and-swap from ARMED, so a head
   the ISR freed and re-allocated meanwhile can never be marked READY by a stale
   render), the descriptors, and `qHead_`.
@@ -142,10 +140,11 @@ Single-writer rules:
   tagged with the current life; if none is there it returns false and the
   outgoing head keeps sounding (section 6). Nothing trusts the hint.
 
-Allocation (`Sequencer::allocHead`, ISR) takes the first FREE slot; if none,
-it ditches the RINGING head with the least ring-out left. With the pool sized
-`SS_RENDER_CAP + 2` or more (a `static_assert`), a FREE slot always exists
-without ditching just to arm: worst-case occupancy is `cap` gated + 1 armed.
+Allocation (`Sequencer::allocHead`, ISR) takes the first FREE slot. Worst-case
+live occupancy is three heads — current + incoming (during a seam) + one armed
+for the next step — and the pool is sized well above that (a `static_assert`
+pins `SS_HEADS ≥ 4`), so a FREE slot always exists and allocation never has to
+steal.
 
 Freeing (`Head::free`) clears the state and the frame pointers. It does not
 touch the queue or the life; the next `alloc()` bumps `life_` and drains the
@@ -218,14 +217,13 @@ words).
 render, do it, return. Each call:
 
 1. For every non-free head, `plan()` reports what it wants and its deadline:
-   - **REQUIRED**: no frame staged for `applied + 1`. Deadline: for a gated or
-     ringing head, `clock + (h − phase)`; for an armed head, its `due`.
+   - **REQUIRED**: no frame staged for `applied + 1`. Deadline: for a gated
+     head, `clock + (h − phase)`; for an armed head, its `due`.
    - **REFRESH**: a frame is staged but the controls it used differ from live
      (size index or stretch differ, or position moved by more than 0.002), the
      queue has room, and at least one hop (or `4 × cost`, or 10 ms) has passed
      since this head's last refresh.
-   - **NONE**: nothing to do, including a ringing head that will expire
-     before its next boundary.
+   - **NONE**: nothing to do.
 2. Pick the REQUIRED render with the earliest deadline (wrap-safe signed
    compare). Exception: an ARMED head's pre-roll pair whose due is more than
    `8 × cost` away yields to a slack-valid REFRESH, since it is due a whole
@@ -257,17 +255,17 @@ from bench numbers and lets the costed host harness pin it.
 ## 6. The sequencer clock
 
 The ISR owns time. Per block, `Sequencer::render()` hoists the constants
-(dwell length `round(duration · sr)`, seam geometry, ring-out length), does
-the per-block housekeeping (queue drains, the armed head's due, a re-arm if
-the step count shrank under the armed head), then ticks samples.
+(dwell length `round(duration · sr)`, seam geometry), does the per-block
+housekeeping (queue drains, the armed head's due, a re-arm if the step count
+shrank under the armed head), then ticks samples.
 
 **Dwell and seam.** `seamGeom(dur, fade)` gives `fadeLen = dur · fade` (fade
 clamped to 0..0.5) and `onset = dur − fadeLen`. A dwell runs `elapsed_` from 0.
-At `elapsed_ ≥ onset` the incoming head goes live if it is READY and the cap
-admits it; `seamStart_` and `fadeLen_` are frozen. During the seam the
+At `elapsed_ ≥ onset` the incoming head goes live if it is READY;
+`seamStart_` and `fadeLen_` are frozen. During the seam the
 incoming head fades in and the outgoing fades out under an equal-power
 quarter-sine (`sin²+cos² = 1`, constant power for uncorrelated sources). At
-`fp = elapsed_ − seamStart_ ≥ fadeLen_` the outgoing head retires, the
+`fp = elapsed_ − seamStart_ ≥ fadeLen_` the outgoing head is freed, the
 incoming becomes current, and `elapsed_` restarts at 1 (that sample is the
 new dwell's first). Fade 0 collapses this to a raw cut at `elapsed_ == dur`:
 the outgoing head stops, the incoming starts at full level (pre-rolled), the
@@ -285,14 +283,10 @@ possible when duration is cranked below the time a pre-roll pair takes to
 render, or under overload), the outgoing head keeps sounding and `late_`
 counts the samples. Nothing goes silent; the step runs long.
 
-**Ring-out.** With `ringout > 0`, a retiring head becomes RINGING for
-`ringout · sr` samples: read at full volume every sample, decremented, freed
-when spent. It keeps rendering (it is a normal head to the scheduler) until it
-is about to expire.
-
-**The render cap.** Gated heads (current + incoming + ringing) never exceed
-`SS_RENDER_CAP = 6`. Before admitting a head at go-live and after each retire,
-the ringing head with the least remaining is freed until the cap holds.
+**Concurrency.** Heads are strictly sequential: at most two sound at once, and
+only during a seam (current + incoming). A third head — the next step's — is
+armed and rendering its pre-roll a whole dwell ahead, so the heaviest
+concurrent render load is three heads (cur + inc + armed), never more.
 
 **Startup and single-step.** At startup nothing sounds until the first head's
 pair is rendered (a few ms), then it goes live; there is no lookahead wait.
@@ -310,7 +304,6 @@ re-arm hole.
 | frame size | every render | ≤ 1 hop (pair at the new size at the next boundary); 2 hops when the pair cannot fit what is left of the current hop |
 | duration | every block | immediate (the dwell clock is live and unquantized) |
 | fade | every block; frozen at go-live | next seam |
-| ring-out | every block | next retire |
 | drift | drawn once per life at arm | next visit of that step |
 | step count | every block | next go-live (an armed head for a now-invalid step is re-armed at once) |
 
@@ -383,16 +376,17 @@ in AXI SRAM.
 Per-second lines over USB serial. Timing uses raw `System::GetTick()` deltas
 because `GetUs()` wraps every 21.5 s.
 
-`SET`: stretch, duration, global drift, fade, ring-out, requested frame,
+`SET`: stretch, duration, global drift, fade, requested frame,
 `hop` (what the sounding head is actually playing), current step, step count,
 block, encoder page, panel slot.
 
-`HLTH`: `act` gated step heads, `rng` ringing, `arm` armed, `free` pool slots
+`HLTH`: `act` gated step heads (at most 2), `arm` armed, `free` pool slots
 (a leak shows as a steady decline), `units` renders, `svc_us`/`avg_us`/
 `max_us` main-loop DSP time, `isr_us`, `du` holds, `late` samples a seam
-waited, `rfr` control-driven re-renders, `slack` minimum samples-to-deadline
-at render start (negative = a render started past its boundary), `cost`
-per-size estimate in samples (16384 down to 256), `stk` stack high-water.
+waited, `rfr` control-driven re-renders, `clip` output clamp hits, `slack`
+minimum samples-to-deadline at render start (negative = a render started past
+its boundary). A separate `COST` line carries the per-size estimate in samples
+(16384 down to 256) and `stk` stack high-water.
 
 The directive stands: every runtime value goes on one of these lines.
 
@@ -433,10 +427,10 @@ Check any change against these.
 5. Every atomic has one writer per transition; every cross-side handoff is
    release/acquire; the ISR applies only descriptors tagged with the current
    life and the next frame index.
-6. Gated heads ≤ `SS_RENDER_CAP`; pool ≥ cap + 2; six buffers per head.
+6. At most two heads sound at once (cur + inc at a seam); worst-case live
+   occupancy is three (cur + inc + armed); pool ≥ 4; six buffers per head.
 7. A fixed configuration renders identically; a refresh with unchanged
    controls is bit-identical.
 8. No control latches at arm except drift. Stretch, position and size are
    read at every render.
-9. `ringout == 0` renders byte-identically to a build that has no ring-out.
-10. Every runtime value is on a PROFILE line.
+9. Every runtime value is on a PROFILE line.

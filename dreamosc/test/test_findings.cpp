@@ -238,25 +238,26 @@ TEST_CASE("F4: only one refresh per armed life: a second knob turn on the next s
 // check, so a pair that could not make its boundary held (repeated) a frame.
 // Fixed: when the pair would miss but could fit in a full hop, a SINGLE at the
 // old size is staged instead and the pair renders right after the boundary.
-// Two cases: (a) SCHEDULING -- few heads, the pair fits a hop: no holds at
-// all; (b) THROUGHPUT -- the cap: six pairs are 6 x 1760 = 10560 samples of
-// modelled work against 2048-sample hops (more than five hops of the whole
-// budget), so holds are inevitable at this cost; the guard is that they are
-// bounded and never silence. (The pre-fix "1 hold" was measured with a harness
-// that charged a pair as one frame; 43 was the first honest number.)
+// Two cases: (a) SCHEDULING -- a single sounding head, the pair fits a hop:
+// no holds at all; (b) THROUGHPUT -- a fast dwell with a full 0.5 crossfade,
+// so cur + inc both render 16384 pairs through the seam (plus the armed
+// pre-roll), the heaviest concurrent render load the sequential model allows
+// (three heads; ring-out that once stacked six is gone). Holds may occur while
+// those pairs turn around; the guard is that they stay bounded and never go
+// silent. (The pre-fix "1 hold" was measured with a harness that charged a
+// pair as one frame; the honest number is a handful.)
 // ---------------------------------------------------------------------------
 namespace {
 struct GrowthRun { uint32_t holds; int gated; int silent; };
-GrowthRun grow_to_16384(float ringout, std::vector<float>& out) {
+GrowthRun grow_to_16384(float fade, std::vector<float>& out) {
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
-  seq.ringout = ringout;
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, fade);
   CostedProducer p(0.0038);
   uint32_t holdsBefore = 0; int gated = 0;
   for (uint32_t n = 0; n < 48000 * 4; n++) {
     if (n == 48000 * 2) {
-      holdsBefore = seq.holds(); gated = seq.activeVoices() + seq.activeRemnants();
+      holdsBefore = seq.holds(); gated = seq.activeVoices();
       seq.setFrame(16384);
     }
     p.step(seq, n);
@@ -269,7 +270,7 @@ GrowthRun grow_to_16384(float ringout, std::vector<float>& out) {
 TEST_CASE("F5a: growing to 16384 with the pair fitting a hop is hold-free", "[finding]") {
   gTab.init();
   std::vector<float> out;
-  GrowthRun r = grow_to_16384(0.3f, out);                   // ~2 gated heads
+  GrowthRun r = grow_to_16384(0.0f, out);                   // butt-joint: 1 head
   write_wav(wavpath("F5a_growth_two_heads.wav").c_str(), out);
   WARN("F5a: " << r.gated << " gated heads at the change; holds in the 2 s after: " << r.holds
        << "; silent windows: " << r.silent);
@@ -277,18 +278,19 @@ TEST_CASE("F5a: growing to 16384 with the pair fitting a hop is hold-free", "[fi
   REQUIRE(r.holds == 0);
 }
 
-TEST_CASE("F5b: growing to 16384 at the render cap is throughput-bound: bounded holds, no silence",
+TEST_CASE("F5b: growing to 16384 under a full crossfade is throughput-bound: bounded holds, no silence",
           "[finding]") {
   gTab.init();
   std::vector<float> out;
-  GrowthRun r = grow_to_16384(8.0f, out);                   // fills the cap
+  GrowthRun r = grow_to_16384(0.5f, out);                   // cur + inc both render
   write_wav(wavpath("F5b_growth_at_cap.wav").c_str(), out);
   WARN("F5b: " << r.gated << " gated heads at the change; holds in the 2 s after: " << r.holds
-       << " (each a ~43 ms spectral freeze on one head); silent windows: " << r.silent);
+       << " (each a spectral freeze on one head); silent windows: " << r.silent);
   REQUIRE(r.silent == 0);
-  // Measured 43 at the modelled cost; 60 leaves margin for scheduling order.
-  // If this rises, the fallback regressed; if the render cost drops on the
-  // bench (480 MHz, CMSIS FFT), tighten it from the new measurement.
+  // Bounded holds under the heaviest concurrent-render case (cur + inc pairs at
+  // 16384). 60 leaves margin for scheduling order; if this rises, the fallback
+  // regressed. If the render cost drops on the bench (480 MHz, CMSIS FFT),
+  // tighten it from the new measurement.
   REQUIRE(r.holds <= 60);
 }
 

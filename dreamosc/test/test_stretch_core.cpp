@@ -461,15 +461,16 @@ TEST_CASE("live stretch reaches the sounding head within two hops") {
 
 // --- scheduling under a cost-modelled producer ------------------------------
 
-TEST_CASE("cost-modelled producer at bench cost keeps a fast ring-out march fed") {
+TEST_CASE("cost-modelled producer at bench cost keeps a fast crossfade march fed") {
   // 0.0038 samples per (w log2 w) = ~18 ms per 16384 frame at 48 kHz, the bench
-  // number at the old clock. At 4096 with a 0.25 s march and 2 s ring-out up to
-  // six heads render at once; the EDF scheduler must keep them all fed.
+  // number at the old clock. The heaviest steady case is a fast dwell with a
+  // full 0.5 crossfade at 16384: cur + inc both render at once through every
+  // seam, plus the armed pre-roll pair. The EDF scheduler must keep them fed.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
-  seq.ringout = 2.0f;
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.5f);
+  seq.setFrame(16384);
   auto out = render_costed(seq, 48000 * 4, 0.0038);
   for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
   REQUIRE(silent_windows(out, first_audible(out)) == 0);
@@ -511,8 +512,8 @@ TEST_CASE("an overloaded producer degrades to frame repeats, never silence") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
-  seq.ringout = 2.0f;
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.5f);
+  seq.setFrame(16384);
   uint32_t before = gUnderruns;
   auto out = render_costed(seq, 48000 * 3, 0.05);   // ~13x the bench cost
   for (float v : out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
@@ -532,79 +533,6 @@ TEST_CASE("a starved head repeats its frame and counts holds") {
   REQUIRE(gUnderruns > before);
   for (float v : out) REQUIRE(std::isfinite(v));
   REQUIRE(silent_windows(out, 0) == 0);
-}
-
-// --- ring-out ----------------------------------------------------------------
-
-namespace {
-struct RingoutRun { std::vector<float> out; int peakRemnants; int peakTotal; };
-RingoutRun driveRingout(Sequencer& seq, uint32_t n) {
-  RingoutRun r{{}, 0, 0};
-  for (uint32_t i = 0; i < n; i++) {
-    for (int g = 0; g < 128 && seq.service(); g++) {}
-    int rem = seq.activeRemnants();
-    int tot = seq.activeVoices() + rem;
-    if (rem > r.peakRemnants) r.peakRemnants = rem;
-    if (tot > r.peakTotal)    r.peakTotal = tot;
-    r.out.push_back(seq.next());
-  }
-  return r;
-}
-}  // namespace
-
-TEST_CASE("ring-out: a departing head keeps sounding") {
-  gTab.init();
-  auto srcbuf = make_source(4.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.3f, 0.0f);
-  seq.ringout = 1.0f;
-  auto r = driveRingout(seq, 48000 * 2);
-  for (float v : r.out) { REQUIRE(std::isfinite(v)); REQUIRE(std::abs(v) <= 1.0f); }
-  REQUIRE(r.peakRemnants >= 1);
-}
-
-TEST_CASE("ring-out: gated heads never exceed SS_RENDER_CAP") {
-  gTab.init();
-  auto srcbuf = make_source(4.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.15f, 0.0f);
-  seq.ringout = 8.0f;
-  auto r = driveRingout(seq, 48000 * 3);
-  INFO("peak gated " << r.peakTotal);
-  REQUIRE(r.peakTotal <= SS_RENDER_CAP);
-  REQUIRE(r.peakRemnants >= 1);
-  REQUIRE(seq.freeHeads() >= 1);                   // no pool leak
-}
-
-TEST_CASE("ring-out: a ringing head stops after its length") {
-  gTab.init();
-  auto srcbuf = make_source(4.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
-  seq.setSteps(2);
-  seq.ringout = 0.5f;
-  bool sawRemnant = false, sawExpiry = false;
-  for (uint32_t i = 0; i < 48000 * 4; i++) {
-    for (int g = 0; g < 128 && seq.service(); g++) {}
-    seq.next();
-    int rem = seq.activeRemnants();
-    if (rem > 0) sawRemnant = true;
-    if (sawRemnant && rem == 0) sawExpiry = true;
-  }
-  REQUIRE(sawRemnant);
-  REQUIRE(sawExpiry);
-}
-
-TEST_CASE("ring-out == 0 is byte-identical to the default") {
-  gTab.init();
-  auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer a; make_seq(a, &src, 48000, 50.0f, 0.4f, 0.0f);
-  Sequencer b; make_seq(b, &src, 48000, 50.0f, 0.4f, 0.0f);
-  b.ringout = 0.0f;
-  auto oa = render(a, 3), ob = render(b, 3);
-  REQUIRE(oa.size() == ob.size());
-  for (size_t i = 0; i < oa.size(); i++) REQUIRE(oa[i] == ob[i]);
 }
 
 // --- step count, sizes, drift ------------------------------------------------

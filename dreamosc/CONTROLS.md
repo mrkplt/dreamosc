@@ -54,14 +54,14 @@ Two implementation facts that were hard-won bugs:
 
 ## Encoder
 
-Turn drives the current page; click cycles the page. led2 = page hue (**RoYGB**
-over the five pages, in click order) drawn from the **same ROYGBIVW palette as
+Turn drives the current page; click cycles the page. led2 = page hue (**RoYG**
+over the four pages, in click order) drawn from the **same ROYGBIVW palette as
 led1** (`hueROYGBIVW`, so a color means the same on both LEDs and orange/yellow
 stay distinct). **Brightness on EVERY page tracks that page's encoded level** —
 a bright LED always means "this parameter is turned up".
 
-Click order: **stretch → steps → fade → window → ringout → stretch** (the page
-index is also the color index, so click order = ROYGB).
+Click order: **stretch → steps → fade → window → stretch** (the page
+index is also the color index, so click order = RoYG).
 
 | Page | led2 hue | encoder turn | brightness = |
 |------|----------|--------------|--------------|
@@ -69,11 +69,10 @@ index is also the color index, so click order = ROYGB).
 | **steps** | orange | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
 | **fade** | yellow | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
 | **window** (frame) | green | index `FRAME_STOPS` {16384,8192,4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**; **default 4096**, mid-table) | knob position (CCW dim → CW bright) |
-| **ringout** | blue | ring-out length 0..16 s → `seq.ringout` (additive; fast 1 s, slow 0.25 s/detent) | ring-out length (0 dim → 16 s bright) |
 
-- All five use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
+- All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
   bottom of a range is still lit, never off): `stretchBrightness`,
-  `stepBrightness`, `fadeBrightness`, `frameBrightness`, `ringoutBrightness`.
+  `stepBrightness`, `fadeBrightness`, `frameBrightness`.
   The level reads at a glance without the OLED.
 
 - **Stretch is a detent table**, not continuous: PaulStretch factors aren't
@@ -92,10 +91,10 @@ index is also the color index, so click order = ROYGB).
   a LIVE control: every sounding head re-renders a pre-roll pair at the new size
   and switches at a hop boundary. Shrinking lands at the next boundary (one
   hop). Growing to a size whose pair costs more than what is left of the
-  current hop lands one boundary later (two hops), and at the render cap a
-  growth to 16384 is a burst of pairs that can hold (repeat) frames for a few
-  hops — see the F5 finding test. The profiler's `hop` shows what the sounding
-  head is actually playing.
+  current hop lands one boundary later (two hops), and under a full crossfade a
+  growth to 16384 renders pairs for both seam heads at once, which can hold
+  (repeat) frames for a few hops — see the F5 finding test. The profiler's `hop`
+  shows what the sounding head is actually playing.
 - **Position and stretch are live too.** A staged frame is re-rendered when the
   controls it was made with change (if there is slack before its deadline), so a
   turn reaches the ear within about one hop plus the blend. Position moves the
@@ -113,16 +112,6 @@ index is also the color index, so click order = ROYGB).
   longer bends step timing (the old model quantized the dwell to the analysis-hop
   grid, which snapped short steps at large windows). Turn duration down mid-dwell
   and the sequence fast-marches immediately, even out of a minute-long dwell.
-- **Ring-out** (Fizzy #155, #152): how long a step keeps sounding *after* the
-  read head has moved on. **0 = OFF** — the clean sequential instrument (a
-  departing step stops the instant the next begins; byte-identical to no
-  ring-out). Turn it up (0..16 s) and the departing head simply is not freed:
-  it keeps rendering at **full volume** for that long, then stops with a raw cut
-  (spectral, not amplitude — no fade, like every seam). This is the "enjoyable
-  lingering tail" from #152 made a deliberate, budgeted feature: a long ring-out
-  over a fast march stacks overlapping tails, but gated heads are **hard-capped
-  at 6** (`SS_RENDER_CAP`) by **ditching the ringing head with the least left**.
-  Watch `rng`/`act` in `make PROFILE=1` to see the cap hold.
 - **Step count** (Fizzy #149): how many of the 8 steps the sequence walks, 1..8.
   Fewer steps = a shorter, faster-repeating pattern (a real compositional
   control). The `position[]`/`drift[]` arrays stay sized to 8; only steps below

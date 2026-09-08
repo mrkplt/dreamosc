@@ -497,9 +497,14 @@ int main(void) {
   // Starting values; the knobs/encoder take over from here (see processControls).
   // Pickup applies from boot: a knob takes over its parameter only after it has
   // physically moved (PanelEditor), so these hold until the pots are touched.
+  // EVERY public control is set here explicitly: init() leaves them alone by
+  // design (they are the player's), so this list -- not init() -- is what
+  // makes the boot state independent of the PROFILE fingerprint above (the
+  // step count leaked once: df0af04 booted the PROFILE build with 3 steps).
   encoderSync(enc, seq);  // stretch 50x, window 4096 (the core's SS_W_DEFAULT)
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
+  seq.setSteps(SS_STEPS);
 
   pod.StartAdc();
   startControlTimer();       // encoder + buttons: TIM5 IRQ from here on (L1)

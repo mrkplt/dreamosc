@@ -76,21 +76,37 @@ TEST_CASE("renderFingerprint equals the CRC of the block-32 harness output", "[c
   REQUIRE(a.holds() == 0);                   // a drained render never holds
 }
 
-TEST_CASE("Sequencer::init() after a fingerprint render restores a clean state", "[cadence]") {
-  // The firmware fingerprints, then init()s again for the audible boot state:
-  // the second life must render exactly like a fresh Sequencer, with the
-  // diagnostics (holds) back at zero.
+TEST_CASE("the boot sequence after a fingerprint render restores the audible state exactly",
+          "[cadence]") {
+  // The PROFILE firmware fingerprints (stretch 50, dwell 0.5, fade 0.5,
+  // 3 steps, 4096) and then rebuilds the audible boot state. init() leaves
+  // the PUBLIC controls alone by design (they are the player's), so every
+  // control the fingerprint touched must be set again explicitly -- the step
+  // count leaked once (df0af04 claimed "untouched"; it booted with 3 steps).
+  // This mirrors dreamosc.cpp's boot: init, encoderSync, duration, fade,
+  // steps; then renders four dwells (a 3-step walk and an 8-step walk only
+  // diverge at the fourth) against a never-fingerprinted Sequencer.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   float block[kBlock];
-  Sequencer used; make_seq(used, &src, 48000, 50.0f, 0.5f, 0.5f); used.setSteps(3);
+  auto boot = [&](Sequencer& s) {
+    make_seq(s, &src, 48000, 50.0f, 1.0f, 0.0f);   // init + the boot values
+    s.setFrame(SS_W_DEFAULT);
+    s.setSteps(SS_STEPS);
+  };
+  Sequencer used; make_seq(used, &src, 48000, 50.0f, 0.5f, 0.5f);
+  used.setSteps(3); used.setFrame(4096);
   renderFingerprint(used, block, kBlock, 24000);
-  make_seq(used, &src, 48000, 50.0f, 1.0f, 0.0f);
-  Sequencer fresh; make_seq(fresh, &src, 48000, 50.0f, 1.0f, 0.0f);
+  boot(used);
+  Sequencer fresh; boot(fresh);
   REQUIRE(used.holds() == 0);
-  auto x = drive_blocks(used, 48000, kBlock, [](uint32_t) {});
-  auto y = drive_blocks(fresh, 48000, kBlock, [](uint32_t) {});
+  REQUIRE(used.activeSteps == fresh.activeSteps);
+  REQUIRE(used.frameSize == fresh.frameSize);
+  REQUIRE(used.fade == fresh.fade);
+  REQUIRE(used.duration == fresh.duration);
+  auto x = drive_blocks(used, 48000 * 4, kBlock, [](uint32_t) {});
+  auto y = drive_blocks(fresh, 48000 * 4, kBlock, [](uint32_t) {});
   REQUIRE(x == y);
 }
 

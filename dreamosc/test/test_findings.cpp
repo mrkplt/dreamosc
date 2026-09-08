@@ -31,13 +31,6 @@ using namespace testutil;
 
 namespace {
 
-void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
-              float duration, float fade = 0.0f) {
-  static std::vector<float> pool(SS_POOL_FLOATS);
-  seq.init(src, sr, pool.data(), 0x12345678u);
-  seq.stretch = stretch; seq.duration = duration; seq.fade = fade;
-}
-
 const char* wavdir() {
   static const char* d = "/tmp/dreamosc_findings";
   mkdir(d, 0755);
@@ -45,14 +38,22 @@ const char* wavdir() {
 }
 std::string wavpath(const char* name) { return std::string(wavdir()) + "/" + name; }
 
-int silent_windows(const std::vector<float>& out, size_t from, double thresh = 1e-4) {
-  const size_t W = 240;
-  int worst = 0, run = 0;
-  for (size_t s = from; s + W <= out.size(); s += W) {
-    if (rms_range(out, s, W) < thresh) { run++; if (run > worst) worst = run; }
-    else run = 0;
+// The F1/F7 harness: run `total` samples with a drained producer, nudging
+// stretch at n == 3000 so the pending frame is REFRESHED (the render the hook
+// fires inside), and call `probe()` after EVERY service() call so a test can
+// capture head state the moment its hook has fired, before a later render
+// overwrites it.
+template <typename P>
+void run_refresh_probe(Sequencer& seq, std::vector<float>& out, uint32_t total, P probe) {
+  for (uint32_t n = 0; n < total; n++) {
+    if (n == 3000) seq.stretch = 51.0f;
+    for (int g = 0; g < 64; g++) {
+      bool did = seq.service();
+      probe();
+      if (!did) break;
+    }
+    out.push_back(seq.next());
   }
-  return worst;
 }
 
 // Hook plumbing: one static context the C function pointer can reach.
@@ -109,22 +110,15 @@ TEST_CASE("F1: buffer-pick race overwrites the frame the ISR is blending (audibl
 
   // Steady state: past the first boundary, mid-hop. Then change stretch so the
   // pending frame is REFRESHED; hook 1 fires inside that refresh's buffer scan.
-  const uint32_t total = 48000;
-  for (uint32_t n = 0; n < total; n++) {
-    if (n == 3000) seq.stretch = 51.0f;
-    for (int g = 0; g < 64; g++) {
-      bool did = seq.service();
-      // Capture the pick of the render the hook fired in, before any later
-      // render overwrites dbgLastPick().
-      if (gHook.fired && gHook.pickedBuf < 0) {
-        Head& h = seq.dbgHead(seq.dbgCur());
-        gHook.pickedBuf = h.dbgLastPick();
-        gHook.oldAfter = h.dbgOldIdx(); gHook.curAfter = h.dbgCurIdx();
-      }
-      if (!did) break;
+  // Capture the pick of the render the hook fired in, before any later render
+  // overwrites dbgLastPick().
+  run_refresh_probe(seq, out, 48000, [&] {
+    if (gHook.fired && gHook.pickedBuf < 0) {
+      Head& h = seq.dbgHead(seq.dbgCur());
+      gHook.pickedBuf = h.dbgLastPick();
+      gHook.oldAfter = h.dbgOldIdx(); gHook.curAfter = h.dbgCurIdx();
     }
-    out.push_back(seq.next());
-  }
+  });
   write_wav(wavpath("F1_buffer_pick_race.wav").c_str(), out);
   REQUIRE(gHook.fired);                       // the scenario was injected
 
@@ -176,7 +170,7 @@ TEST_CASE("F3: armed head's deadline reads 'now' during a crossfade seam", "[fin
   uint32_t minDue = 0xffffffffu;
   std::vector<float> out;
   for (uint32_t n = 0; n < 48000 * 3; n++) {
-    for (int g = 0; g < 64 && seq.service(); g++) {}
+    drain(seq);
     int32_t s = seq.takeMinSlack();
     if (s < minSlack) minSlack = s;
     if (seq.dbgNxt() >= 0) {
@@ -210,7 +204,7 @@ TEST_CASE("F4: only one refresh per armed life: a second knob turn on the next s
       if (n == 24000) seq.position[1] = p1;                 // first turn at 0.5 s
       if (n == 60000 && p2 > 0) seq.position[1] = p2;       // second at 1.25 s
       if (*live == 0 && seq.curStep() == 1) *live = n;
-      for (int g = 0; g < 64 && seq.service(); g++) {}
+      drain(seq);
       out.push_back(seq.next());
     }
     return out;
@@ -309,15 +303,9 @@ TEST_CASE("F7: a boundary between plan() and render() wastes a render", "[findin
   std::vector<float> out;
   HookGuard hg(2, &seq, &out);
   int stale = -1;
-  for (uint32_t n = 0; n < 48000; n++) {
-    if (n == 3000) seq.stretch = 51.0f;                    // provoke a refresh pick
-    for (int g = 0; g < 64; g++) {
-      bool did = seq.service();
-      if (gHook.fired && stale < 0) stale = seq.dbgHead(seq.dbgCur()).dbgStaleQueued();
-      if (!did) break;
-    }
-    out.push_back(seq.next());
-  }
+  run_refresh_probe(seq, out, 48000, [&] {          // the stretch nudge provokes a refresh pick
+    if (gHook.fired && stale < 0) stale = seq.dbgHead(seq.dbgCur()).dbgStaleQueued();
+  });
   write_wav(wavpath("F7_plan_render_desync.wav").c_str(), out);
   REQUIRE(gHook.fired);
   int clicks = count_clicks(out, [](size_t) { return false; });
@@ -352,7 +340,7 @@ TEST_CASE("F8: a pot move costs at most one refresh raw, one per hop smoothed", 
         primed = true;
       }
       if (n == 48000) refreshesAt = seq.refreshes();
-      for (int g = 0; g < 64 && seq.service(); g++) {}
+      drain(seq);
       out.push_back(seq.next());
     }
     write_wav(wavpath(smoothed ? "F8_pot_smoothed.wav" : "F8_pot_raw.wav").c_str(), out);
@@ -379,7 +367,7 @@ TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does 
     uint32_t refreshesAt = 0;
     for (uint32_t n = 0; n < 48000 * 2; n++) {
       if (n == 48000) { refreshesAt = seq.refreshes(); seq.position[0] += delta; }
-      for (int g = 0; g < 64 && seq.service(); g++) {}
+      drain(seq);
       seq.next();
     }
     return seq.refreshes() - refreshesAt;
@@ -440,7 +428,7 @@ TEST_CASE("F11: a held (repeated) frame is click-free", "[finding]") {
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   std::vector<float> out;
-  for (uint32_t i = 0; i < 4096; i++) { for (int g = 0; g < 64 && seq.service(); g++) {} out.push_back(seq.next()); }
+  for (uint32_t i = 0; i < 4096; i++) { drain(seq); out.push_back(seq.next()); }
   uint32_t before = gUnderruns;
   for (uint32_t i = 0; i < 4096 * 3; i++) out.push_back(seq.next());   // starve
   write_wav(wavpath("F11_hold_path.wav").c_str(), out);

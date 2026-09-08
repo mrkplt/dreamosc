@@ -18,13 +18,13 @@ namespace {
 // A Sequencer to write into; PanelEditor needs its position[]/drift[].
 Sequencer& fresh_seq() {
   static std::vector<float> pool(SS_POOL_FLOATS);
+  static std::vector<float> srcbuf(48000, 0.0f);
   static Sequencer seq;
   static bool init = false;
   if (!init) { gTab.init(); init = true; }
-  auto srcbuf = new std::vector<float>(48000, 0.0f);   // leaked; test-scope
   static Source src;
-  src.data = srcbuf->data();
-  src.len = srcbuf->size();
+  src.data = srcbuf.data();
+  src.len = srcbuf.size();
   seq.init(&src, 48000, pool.data());
   return seq;
 }
@@ -276,11 +276,20 @@ TEST_CASE("stepAdditive: value moves by perDetent*inc, clamped") {
   REQUIRE(stepAdditive(0.49f, +1, 0.04f, 0.0f, 0.5f) == Approx(0.5f));   // clamp hi
 }
 
-TEST_CASE("stepRatio: value scales by ratio^inc, clamped; inc<0 divides") {
-  REQUIRE(stepRatio(1.0f, +1, 2.0f, 0.25f, 60.0f) == Approx(2.0f));
-  REQUIRE(stepRatio(2.0f, -1, 2.0f, 0.25f, 60.0f) == Approx(1.0f));
-  REQUIRE(stepRatio(40.0f, +1, 2.0f, 0.25f, 60.0f) == Approx(60.0f));    // clamp hi
-  REQUIRE(stepRatio(0.3f, -1, 2.0f, 0.25f, 60.0f) == Approx(0.25f));     // clamp lo
+TEST_CASE("clampf / clampi / ssClampSteps: the shared clamps") {
+  REQUIRE(clampf(0.5f, 0.0f, 1.0f) == 0.5f);
+  REQUIRE(clampf(-1.0f, 0.0f, 1.0f) == 0.0f);
+  REQUIRE(clampf(2.0f, 0.0f, 1.0f) == 1.0f);
+  REQUIRE(clampi(5, 0, 9) == 5);
+  REQUIRE(clampi(-3, 0, 9) == 0);
+  REQUIRE(clampi(12, 0, 9) == 9);
+  // Active step count: [1, SS_STEPS], the one range setSteps / the panel nav /
+  // the steps LED all share.
+  REQUIRE(ssClampSteps(0) == 1);
+  REQUIRE(ssClampSteps(-5) == 1);
+  REQUIRE(ssClampSteps(3) == 3);
+  REQUIRE(ssClampSteps(SS_STEPS) == SS_STEPS);
+  REQUIRE(ssClampSteps(SS_STEPS + 1) == SS_STEPS);
 }
 
 TEST_CASE("stepIndex: index moves by stops*inc, clamped to [0,count-1]") {
@@ -412,6 +421,129 @@ TEST_CASE("stepColor: 8 distinct colors, index clamped") {
   Rgb first = stepColor(0), last = stepColor(SS_STEPS - 1);
   REQUIRE(lo.r == Approx(first.r)); REQUIRE(lo.g == Approx(first.g)); REQUIRE(lo.b == Approx(first.b));
   REQUIRE(hi.r == Approx(last.r));  REQUIRE(hi.g == Approx(last.g));  REQUIRE(hi.b == Approx(last.b));
+}
+
+// --- encoder: detent tables, state, one detent's effect ---------------------
+// This logic lived in dreamosc.cpp (un-host-compilable) until the alpha4
+// cleanup; these are its first tests.
+
+TEST_CASE("STRETCH_STOPS: 52 strictly increasing stops from 1x to 10000x, boot at 50x") {
+  // (The firmware's old comment said 56; 10+5+6+5+8+7+4+7 = 52. Pinned here so
+  // the count is checked, not asserted in a comment.)
+  REQUIRE(STRETCH_NSTOPS == 52);
+  REQUIRE(STRETCH_STOPS[0] == 1.0f);
+  REQUIRE(STRETCH_STOPS[STRETCH_NSTOPS - 1] == 10000.0f);
+  for (int i = 1; i < STRETCH_NSTOPS; i++) REQUIRE(STRETCH_STOPS[i] > STRETCH_STOPS[i - 1]);
+  REQUIRE(stretchStop(STRETCH_DEFAULT_IDX) == 50.0f);
+  // stretchStop clamps into the table rather than reading past it.
+  REQUIRE(stretchStop(-1) == 1.0f);
+  REQUIRE(stretchStop(999) == 10000.0f);
+}
+
+TEST_CASE("FRAME_DEFAULT_IDX is derived from the core's SS_W_DEFAULT") {
+  // The firmware can no longer boot at a different window than the host suite:
+  // the index IS the core's size index of SS_W_DEFAULT.
+  REQUIRE(ssSizeW(FRAME_DEFAULT_IDX) == SS_W_DEFAULT);
+  REQUIRE(FRAME_DEFAULT_IDX == 2);            // 16384, 8192, [4096]
+  EncoderState e;
+  REQUIRE(e.page == PAGE_STRETCH);
+  REQUIRE(e.stretchIdx == STRETCH_DEFAULT_IDX);
+  REQUIRE(e.frameIdx == FRAME_DEFAULT_IDX);
+}
+
+TEST_CASE("encoderSync: boot pushes stretch 50x and window SS_W_DEFAULT into the Sequencer") {
+  Sequencer& seq = fresh_seq();
+  seq.stretch = 1.0f; seq.setFrame(SS_W);
+  EncoderState e;
+  encoderSync(e, seq);
+  REQUIRE(seq.stretch == 50.0f);
+  REQUIRE(seq.frameSize == SS_W_DEFAULT);
+}
+
+TEST_CASE("applyEncoder: stretch page steps the detent index (3/detent fast, 1 slow), clamped") {
+  Sequencer& seq = fresh_seq();
+  PanelEditor pe;
+  EncoderState e;                                  // page = stretch, idx 20 (50x)
+  encoderSync(e, seq);
+  applyEncoder(e, seq, pe, +1, /*fast=*/false);
+  REQUIRE(e.stretchIdx == 21); REQUIRE(seq.stretch == 60.0f);
+  applyEncoder(e, seq, pe, +1, /*fast=*/true);
+  REQUIRE(e.stretchIdx == 24); REQUIRE(seq.stretch == 90.0f);
+  applyEncoder(e, seq, pe, -1, /*fast=*/true);
+  REQUIRE(e.stretchIdx == 21); REQUIRE(seq.stretch == 60.0f);
+  for (int i = 0; i < 100; i++) applyEncoder(e, seq, pe, +1, true);
+  REQUIRE(e.stretchIdx == STRETCH_NSTOPS - 1); REQUIRE(seq.stretch == 10000.0f);   // clamp hi
+  for (int i = 0; i < 100; i++) applyEncoder(e, seq, pe, -1, true);
+  REQUIRE(e.stretchIdx == 0); REQUIRE(seq.stretch == 1.0f);                        // clamp lo
+  applyEncoder(e, seq, pe, 0, true);                // a zero increment is a no-op
+  REQUIRE(e.stretchIdx == 0);
+}
+
+TEST_CASE("applyEncoder: frame page walks the size index one per detent; CW shrinks") {
+  Sequencer& seq = fresh_seq();
+  PanelEditor pe;
+  EncoderState e; e.page = PAGE_FRAME;
+  encoderSync(e, seq);
+  REQUIRE(seq.frameSize == 4096);
+  applyEncoder(e, seq, pe, +1, true);              // clockwise = smaller (fast is ignored)
+  REQUIRE(e.frameIdx == 3); REQUIRE(seq.frameSize == 2048);
+  applyEncoder(e, seq, pe, -1, false);
+  applyEncoder(e, seq, pe, -1, false);
+  REQUIRE(e.frameIdx == 1); REQUIRE(seq.frameSize == 8192);
+  for (int i = 0; i < 10; i++) applyEncoder(e, seq, pe, -1, false);
+  REQUIRE(e.frameIdx == 0); REQUIRE(seq.frameSize == SS_W);         // clamp at the max
+  for (int i = 0; i < 10; i++) applyEncoder(e, seq, pe, +1, false);
+  REQUIRE(e.frameIdx == SS_NSIZES - 1); REQUIRE(seq.frameSize == SS_W_MIN);   // clamp at the min
+}
+
+TEST_CASE("applyEncoder: steps page changes the count and keeps the panel on a valid slot (#149)") {
+  Sequencer& seq = fresh_seq();
+  PanelEditor pe;
+  EncoderState e; e.page = PAGE_STEPS;
+  REQUIRE(seq.activeSteps == SS_STEPS);
+  pe.advance(); pe.advance(); pe.advance();        // parked on step 3
+  applyEncoder(e, seq, pe, -1, true);              // 8 -> 7 (fast is ignored)
+  REQUIRE(seq.activeSteps == 7);
+  REQUIRE(pe.slot() == 3);                         // still active: stays
+  for (int i = 0; i < 5; i++) applyEncoder(e, seq, pe, -1, false);   // -> 2
+  REQUIRE(seq.activeSteps == 2);
+  REQUIRE(pe.inGlobal());                          // step 3 went inactive: back to GLOBAL
+  for (int i = 0; i < 10; i++) applyEncoder(e, seq, pe, -1, false);
+  REQUIRE(seq.activeSteps == 1);                   // never 0
+  for (int i = 0; i < 20; i++) applyEncoder(e, seq, pe, +1, false);
+  REQUIRE(seq.activeSteps == SS_STEPS);            // never past 8
+}
+
+TEST_CASE("applyEncoder: fade page is additive, 0.04 fast / 0.005 slow, clamped to [0, 0.5]") {
+  Sequencer& seq = fresh_seq();
+  PanelEditor pe;
+  EncoderState e; e.page = PAGE_FADE;
+  seq.fade = 0.0f;
+  applyEncoder(e, seq, pe, +1, false); REQUIRE(seq.fade == Approx(0.005f));
+  applyEncoder(e, seq, pe, +1, true);  REQUIRE(seq.fade == Approx(0.045f));
+  applyEncoder(e, seq, pe, -1, true);  REQUIRE(seq.fade == Approx(0.005f));
+  applyEncoder(e, seq, pe, -1, true);  REQUIRE(seq.fade == Approx(0.0f));       // clamp lo
+  for (int i = 0; i < 20; i++) applyEncoder(e, seq, pe, +1, true);
+  REQUIRE(seq.fade == Approx(0.5f));                                             // clamp hi
+}
+
+TEST_CASE("pageBrightness: each page reports its own level through the per-page helper") {
+  Sequencer& seq = fresh_seq();
+  EncoderState e;
+  encoderSync(e, seq);
+  seq.fade = 0.25f; seq.setSteps(4);
+  e.page = PAGE_STRETCH; REQUIRE(pageBrightness(e, seq) == Approx(stretchBrightness(e.stretchIdx, STRETCH_NSTOPS)));
+  e.page = PAGE_FADE;    REQUIRE(pageBrightness(e, seq) == Approx(fadeBrightness(0.25f)));
+  e.page = PAGE_FRAME;   REQUIRE(pageBrightness(e, seq) == Approx(frameBrightness(e.frameIdx, SS_NSIZES)));
+  e.page = PAGE_STEPS;   REQUIRE(pageBrightness(e, seq) == Approx(stepBrightness(4)));
+  // The frame page's brightness tracks the KNOB: CW (larger idx) is brighter.
+  e.page = PAGE_FRAME;
+  float dim = pageBrightness(e, seq);
+  e.frameIdx = SS_NSIZES - 1;
+  REQUIRE(pageBrightness(e, seq) > dim);
+  // An out-of-range page falls back to the dim floor rather than garbage.
+  e.page = (EncoderPage)PAGE_COUNT;
+  REQUIRE(pageBrightness(e, seq) == Approx(levelBrightness(0.0f)));
 }
 
 // --- speed-adaptive knob quantization ---------------------------------------

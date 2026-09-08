@@ -28,9 +28,10 @@ VENDOR_STAMP = vendor_stmlib/shy_fft.h
 # so these vendor rules -- which appear before that include -- do not steal it.
 .DEFAULT_GOAL := all
 
-# `make PROFILE=1`: diagnostic build that prints per-second CPU accounting
-# (active voices, service us, per-unit us, ISR us, underruns) over USB serial.
-# See the PROFILE blocks in dreamosc.cpp. Run `make clean` when toggling it;
+# `make PROFILE=1`: diagnostic build that prints the full instrument state once
+# a second over USB serial (SET/KNOB/POS/DRF/HLTH/COST lines: controls, per-step
+# state, CPU and supply accounting, per-size render cost, stack high-water).
+# See profilePrint() in dreamosc.cpp. Run `make clean` when toggling it;
 # command-line defines are not tracked by the dependency files.
 ifdef PROFILE
 C_DEFS += -DPROFILE
@@ -57,13 +58,26 @@ vendor-check:
 
 # Pinned build dependencies (whole repos: libDaisy, DaisySP). deps/manifest.txt
 # records the exact SHA; `make deps` clones/checks-them-out, `make deps-check`
-# gates that the working clones haven't drifted (used by test/run.sh).
+# gates that the working clones haven't drifted (run it before a device build
+# after touching the clones; test/run.sh runs only the vendor check).
 DEPS_DIR = ../deps
 deps:
 	$(DEPS_DIR)/setup.sh
 
 deps-check:
 	$(DEPS_DIR)/setup.sh --check
+
+# Compile-check sd_source.h against the real libDaisy/FatFs API with the device
+# toolchain and flags. Nothing #includes it yet (the SD card path is #131, no
+# card present), so without this a GCC or libDaisy change could break it
+# silently until the card arrives. Syntax/semantics only; no object produced.
+.PHONY: sd-check
+sd-check:
+	@mkdir -p $(BUILD_DIR)
+	@printf '#include "sd_source.h"\n' > $(BUILD_DIR)/sd_check.cpp
+	$(CXX) $(MCU) $(C_DEFS) $(C_INCLUDES) $(CPP_STANDARD) -fno-exceptions -fno-rtti \
+	    -fsyntax-only -I. $(BUILD_DIR)/sd_check.cpp
+	@echo "sd_source.h compiles against libDaisy $(shell git -C $(LIBDAISY_DIR) rev-parse --short HEAD)"
 
 # Fetch vendored sources automatically if missing, so a fresh clone builds
 # without a separate manual step.
@@ -91,7 +105,7 @@ SAMPLE_SRC ?=
 
 # 0x90400000 is the third QSPI region per the bootloader's DFU descriptor
 # (0x90000000 reserved, 0x90040000 firmware images, 0x90400000 free).
-# Must match QSPI_BASE in dreamosc.cpp.
+# Must match SAMPLE_QSPI_ADDR in dreamosc.cpp.
 SAMPLE_ADDR = 0x90400000
 
 .PHONY: sample program-sample program-all

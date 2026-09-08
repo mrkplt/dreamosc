@@ -56,11 +56,23 @@ using stmlib::RotationPhasor;
 #define SS_W 16384
 #endif
 #ifndef SS_W_DEFAULT
-// Boot window. Host tests and firmware must agree (a static_assert in
-// dreamosc.cpp pins FRAME_DEFAULT_IDX to this). 4096 = the settled default.
+// Boot window. Host tests and firmware must agree: the firmware's frame index
+// is DERIVED from this (controls_core.h FRAME_DEFAULT_IDX = ssSizeIdx of it),
+// so they cannot drift apart. 4096 = the settled default.
 #define SS_W_DEFAULT 4096
 #endif
 #define SS_W_MIN 256
+static_assert(SS_W_DEFAULT >= SS_W_MIN && SS_W_DEFAULT <= SS_W
+              && (SS_W_DEFAULT & (SS_W_DEFAULT - 1)) == 0,
+              "SS_W_DEFAULT must be a power of two in [SS_W_MIN, SS_W]");
+// Render cost model seed: cost(w) ~ SS_COST_COEFF * w * log2(w) ISR samples per
+// frame. 0.003766 reproduces ~18 ms at 16384 / 48 kHz, the bench number at the
+// old 400 MHz clock (the 480 MHz bench measures ~14.5 ms; the seed is
+// deliberately conservative and is replaced by measurement as renders run).
+// ONE constant: the firmware seeds from it and the test harness's costed
+// producer charges from it, so host scheduling tests run against the cost the
+// device starts with.
+#define SS_COST_COEFF 0.003766
 #define SS_STEPS 8
 // Number of window sizes: SS_W, SS_W/2, ... SS_W_MIN. Tables are built for each.
 #define SS_NSIZES 7
@@ -129,20 +141,26 @@ extern void (*gSsTestHook)(int id, void* ctx);
 #define SS_HOOK(id, ctx) do {} while (0)
 #endif
 
-inline int ssLog2(int n) { int p = 0; while ((1 << p) < n) p++; return p; }
+// constexpr so the firmware can derive its frame-index constants from them.
+constexpr int ssLog2(int n) { int p = 0; while ((1 << p) < n) p++; return p; }
 
 // Size index: 0 = SS_W, 1 = SS_W/2, ... SS_NSIZES-1 = SS_W_MIN.
-inline int ssSizeIdx(int w) { return ssLog2(SS_W) - ssLog2(w); }
-inline int ssSizeW(int idx) { return SS_W >> idx; }
+constexpr int ssSizeIdx(int w) { return ssLog2(SS_W) - ssLog2(w); }
+constexpr int ssSizeW(int idx) { return SS_W >> idx; }
 // Offsets of size idx's tables inside the stacked arrays.
-inline int ssWinOff(int idx) { return 2 * SS_W - (2 * SS_W >> idx); }
-inline int ssHopOff(int idx) { return SS_W - (SS_W >> idx); }
+constexpr int ssWinOff(int idx) { return 2 * SS_W - (2 * SS_W >> idx); }
+constexpr int ssHopOff(int idx) { return SS_W - (SS_W >> idx); }
 // Clamp any request to a legal window: power of two in [SS_W_MIN, SS_W].
 inline int ssClampW(int w) {
   if (w < SS_W_MIN) w = SS_W_MIN;
   if (w > SS_W) w = SS_W;
   int p = 1; while (p * 2 <= w) p *= 2;
   return p;
+}
+// Clamp an active step count to [1, SS_STEPS] (#149). The one place this
+// range lives; setSteps(), the panel nav and the steps LED all use it.
+inline int ssClampSteps(int n) {
+  return n < 1 ? 1 : (n > SS_STEPS ? SS_STEPS : n);
 }
 
 // Integer hash (lowbias32) and a two-word combiner; the per-frame phase seed is
@@ -212,11 +230,6 @@ extern StretchTables gTab;
 struct Source {
   float* data = nullptr;
   uint32_t len = 0;
-  inline float at(int32_t i) const {
-    i %= (int32_t)len;
-    if (i < 0) i += len;
-    return data[i];
-  }
   void fillWindowed(int64_t start, int n, const float* win, float* dst) const {
     int64_t L = (int64_t)len;
     int64_t s = start % L;
@@ -707,11 +720,7 @@ class Sequencer {
   int   activeSteps = SS_STEPS;
 
   void setFrame(int w) { frameSize = ssClampW(w); }
-  void setSteps(int n) {
-    if (n < 1) n = 1;
-    if (n > SS_STEPS) n = SS_STEPS;
-    activeSteps = n;
-  }
+  void setSteps(int n) { activeSteps = ssClampSteps(n); }
 
   // pool: SS_POOL_FLOATS floats (SDRAM on device; plain data only).
   void init(const Source* src, float sampleRate, float* pool,
@@ -732,9 +741,9 @@ class Sequencer {
     late_ = 0;
     for (int s = 0; s < SS_NSIZES; s++) {
       int w = ssSizeW(s);
-      // Seed the cost model at ~18 ms for 16384 at 48 kHz (bench, old clock):
-      // cost ~ c * w * log2(w) samples. Conservative until measured.
-      costSamples_[s] = (uint32_t)(0.003766 * w * ssLog2(w)) + 16;
+      // Seed the cost model (SS_COST_COEFF: ~18 ms at 16384, the old-clock
+      // bench number; conservative until measured).
+      costSamples_[s] = (uint32_t)(SS_COST_COEFF * w * ssLog2(w)) + 16;
     }
     minSlack_ = 0x7fffffff;
     refreshes_ = 0;

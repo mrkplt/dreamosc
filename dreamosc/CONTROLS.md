@@ -68,7 +68,7 @@ index is also the color index, so click order = RoYG).
 | **stretch** | red | index `STRETCH_STOPS` (1×..10000×) | stretch index (low dim → max bright) |
 | **steps** | orange | active step count 1..8 → `seq.setSteps()` (one/detent) | step count (few dim → 8 bright) |
 | **fade** | yellow | crossfade overlap 0..0.5 (additive) | fade amount (0 dim → 0.5 bright) |
-| **window** (frame) | green | index `FRAME_STOPS` {16384,8192,4096,2048,1024,512,256} → `seq.setFrame()` (largest first; **CW shrinks**; **default 4096**, mid-table) | knob position (CCW dim → CW bright) |
+| **window** (frame) | green | the core's size index (`ssSizeW`: 16384, 8192, 4096, 2048, 1024, 512, 256) → `seq.setFrame()` (largest first; **CW shrinks**; **default 4096** = the core's `SS_W_DEFAULT`, derived) | knob position (CCW dim → CW bright) |
 
 - All four use `levelBrightness` (a `[floor, 1.0]` map with a dim floor so the
   bottom of a range is still lit, never off): `stretchBrightness`,
@@ -135,9 +135,11 @@ times a second and dropped most detents. Audio block is 32 samples.
 
 ## Where the logic lives
 
-All the pure decision logic (mode/pickup/drift-fold, encoder stepping, LED colors)
-is in the platform-free, host-tested **`controls_core.h`** (`PanelEditor`,
-`foldDrift`, `stepAdditive`/`stepRatio`/`stepIndex`, `pageColor`/`stepColor`).
+All the pure decision logic (mode/pickup/drift-fold, encoder stepping, the
+stretch detent table, the per-page encoder dispatch, LED colors and levels) is
+in the platform-free, host-tested **`controls_core.h`** (`PanelEditor`,
+`foldDrift`, `stepAdditive`/`stepIndex`/`stepCount`, `STRETCH_STOPS`,
+`EncoderState`/`applyEncoder`/`pageBrightness`, `pageColor`/`stepColor`).
 `dreamosc.cpp` is only the hardware glue that reads the panel and calls in. See
 the testing-culture note in `../CLAUDE.md`.
 

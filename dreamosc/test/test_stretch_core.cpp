@@ -18,50 +18,16 @@
 #include "test_support.h"
 
 using testutil::make_source;
+using testutil::make_seq;
+using testutil::drain;
+using testutil::drive;
 using testutil::render;
 using testutil::render_costed;
 using testutil::rms;
 using testutil::rms_range;
 using testutil::first_audible;
-
-namespace {
-
-void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
-              float duration, float fade = 0.0f, float drift = 0.0f,
-              uint32_t seed = 0x12345678u) {
-  static std::vector<float> pool(SS_POOL_FLOATS);
-  seq.init(src, sr, pool.data(), seed);
-  seq.stretch  = stretch;
-  seq.duration = duration;
-  seq.fade     = fade;
-  for (int i = 0; i < SS_STEPS; i++) seq.drift[i] = drift;
-}
-
-// Drive for `total` samples with a drained producer, calling `hook(n)` before
-// each sample (to poke controls mid-run). Returns the output.
-template <typename F>
-std::vector<float> drive(Sequencer& seq, uint32_t total, F hook) {
-  std::vector<float> out; out.reserve(total);
-  for (uint32_t n = 0; n < total; n++) {
-    hook(n);
-    for (int g = 0; g < 64 && seq.service(); g++) {}
-    out.push_back(seq.next());
-  }
-  return out;
-}
-
-// Longest run of 5 ms windows whose RMS is below `thresh`, after `from`.
-int silent_windows(const std::vector<float>& out, size_t from, double thresh = 1e-4) {
-  const size_t W = 240;
-  int worst = 0, run = 0;
-  for (size_t s = from; s + W <= out.size(); s += W) {
-    if (rms_range(out, s, W) < thresh) { run++; if (run > worst) worst = run; }
-    else run = 0;
-  }
-  return worst;
-}
-
-}  // namespace
+using testutil::silent_windows;
+using testutil::count_clicks;
 
 // --- seamGeom: pure seam geometry ------------------------------------------
 
@@ -248,22 +214,13 @@ TEST_CASE("no local discontinuity in head interiors (click detector)") {
     return false;
   };
 
-  const int W = 64;
-  int clicks = 0;
-  for (size_t i = W + 1; i + W < out.size(); i++) {
-    if (near_seam(i)) continue;
-    float d = std::abs(out[i] - out[i - 1]);
-    if (d < 5e-3f) continue;
-    float local = 0.0f;
-    for (int k = -W; k < W; k++) local += std::abs(out[i + k] - out[i + k - 1]);
-    local /= (2 * W);
-    if (d > 8.0f * local) {
-      if (clicks < 5)
-        UNSCOPED_INFO("click at " << i << " (" << i / 48000.0 << "s): delta "
-                      << d << " vs local " << local);
-      clicks++;
-    }
-  }
+  int reported = 0;
+  int clicks = count_clicks(out, near_seam, nullptr,
+                            [&](size_t i, float d, float local) {
+    if (reported++ < 5)
+      UNSCOPED_INFO("click at " << i << " (" << i / 48000.0 << "s): delta "
+                    << d << " vs local " << local);
+  });
   REQUIRE(clicks == 0);
 }
 
@@ -526,7 +483,7 @@ TEST_CASE("a starved head repeats its frame and counts holds") {
   auto srcbuf = make_source(2.0f, 48000);
   Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
-  for (uint32_t i = 0; i < 4096; i++) { for (int g = 0; g < 64 && seq.service(); g++) {} seq.next(); }
+  for (uint32_t i = 0; i < 4096; i++) { drain(seq); seq.next(); }
   uint32_t before = gUnderruns;
   std::vector<float> out;
   for (uint32_t i = 0; i < 4096 * 3; i++) out.push_back(seq.next());   // no service

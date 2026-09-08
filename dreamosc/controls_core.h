@@ -33,6 +33,17 @@ enum EncoderPage {
 
 struct Rgb { float r, g, b; };
 
+// The two clamps every helper below uses. One definition each; no hand-rolled
+// min/max chains.
+inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+inline int clampi(int v, int lo, int hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+// A hue at a display brightness (both LEDs scale the shared palette this way).
+inline Rgb scaleRgb(Rgb h, float b) { return {h.r * b, h.g * b, h.b * b}; }
+
 // Fold a step's per-step drift with the global drift: global drift is the FLOOR
 // -- it lifts every step to at least `global`, and a step's own per-step drift
 // only takes over when it exceeds the floor. So global sets a baseline shimmer
@@ -42,9 +53,7 @@ struct Rgb { float r, g, b; };
 // every pass -- exactly the bug a test catches). NOTE: this is max(), not add --
 // raising global no longer pushes an already-drifting step even further.
 inline float foldDrift(float perStep, float global) {
-  float eff = perStep > global ? perStep : global;
-  if (eff < 0.0f) eff = 0.0f;
-  return eff > 1.0f ? 1.0f : eff;
+  return clampf(perStep > global ? perStep : global, 0.0f, 1.0f);
 }
 
 // --- Encoder value stepping -------------------------------------------------
@@ -56,10 +65,6 @@ inline float foldDrift(float perStep, float global) {
 
 inline bool encoderFast(uint32_t gapMs, uint32_t fastThreshMs = 40) {
   return gapMs <= fastThreshMs;
-}
-
-inline float clampf(float v, float lo, float hi) {
-  return v < lo ? lo : (v > hi ? hi : v);
 }
 
 // --- Speed-adaptive pot quantization ----------------------------------------
@@ -80,7 +85,7 @@ inline bool potFast(float speed, float thresh = 0.01f) { return speed > thresh; 
 inline float snapTo(float value, float grid, float lo, float hi) {
   float v = value;
   if (grid > 0.0f) v = (float)((int)(value / grid + 0.5f)) * grid;
-  return v < lo ? lo : (v > hi ? hi : v);
+  return clampf(v, lo, hi);
 }
 
 // One knob's behavior, reusable across all pots so FEEL stays consistent as we
@@ -110,30 +115,17 @@ inline float stepAdditive(float value, int inc, float perDetent,
   return clampf(value + perDetent * (float)inc, lo, hi);
 }
 
-// Ratio step (duration): value * ratio^inc, clamped. inc<0 divides.
-inline float stepRatio(float value, int inc, float ratio, float lo, float hi) {
-  float f = powf(ratio, (float)(inc < 0 ? -inc : inc));
-  float out = inc < 0 ? value / f : value * f;
-  return clampf(out, lo, hi);
-}
-
 // Index step into a detent table (stretch): idx + stops*inc, clamped to
 // [0, count-1]. Returns the new index.
 inline int stepIndex(int idx, int inc, int stopsPerDetent, int count) {
-  int out = idx + inc * stopsPerDetent;
-  if (out < 0) out = 0;
-  if (out > count - 1) out = count - 1;
-  return out;
+  return clampi(idx + inc * stopsPerDetent, 0, count - 1);
 }
 
 // Integer count step (active step count #149): value + inc, clamped to
 // [lo, hi]. One unit per detent -- a small integer range wants no fast/coarse
 // mode. Returns the new count.
 inline int stepCount(int value, int inc, int lo, int hi) {
-  int out = value + inc;
-  if (out < lo) out = lo;
-  if (out > hi) out = hi;
-  return out;
+  return clampi(value + inc, lo, hi);
 }
 
 // One-pole knob smoothing on a raw ADC read. First read jumps to the raw value
@@ -166,9 +158,7 @@ inline Rgb hueROYGBIVW(int i) {
     {0.7f,  0.0f,  1.0f},   // 7 violet
     {1.0f,  1.0f,  1.0f},   // 8 white
   };
-  if (i < 0) i = 0;
-  if (i > SS_STEPS - 1) i = SS_STEPS - 1;
-  return table[i];
+  return table[clampi(i, 0, SS_STEPS - 1)];
 }
 
 // LED2 color for the encoder page: the page's ROYGBIVW hue (RoYG over the four
@@ -177,8 +167,7 @@ inline Rgb hueROYGBIVW(int i) {
 // encoded level -- stretch/fade/frame/steps brightness via the *Brightness
 // helpers below). So a bright LED always means "this parameter is turned up".
 inline Rgb pageColor(EncoderPage page, float b) {
-  Rgb h = hueROYGBIVW((int)page);   // pages 0..3 -> red/orange/yellow/green
-  return {h.r * b, h.g * b, h.b * b};
+  return scaleRgb(hueROYGBIVW((int)page), b);   // pages 0..3 -> red/orange/yellow/green
 }
 
 // led2 brightness convention: EVERY page's LED intensity tracks that page's
@@ -187,21 +176,19 @@ inline Rgb pageColor(EncoderPage page, float b) {
 // [floorB, 1.0] brightness -- a small floor so the bottom of the range is still
 // visibly lit rather than off. All the per-page helpers below feed this.
 inline float levelBrightness(float t, float floorB = 0.15f) {
-  if (t < 0.0f) t = 0.0f;
-  if (t > 1.0f) t = 1.0f;
-  return floorB + (1.0f - floorB) * t;
+  return floorB + (1.0f - floorB) * clampf(t, 0.0f, 1.0f);
 }
 
 // PAGE_STEPS green intensity = active step count, count in [1, SS_STEPS].
 inline float stepBrightness(int activeSteps, float floorB = 0.15f) {
-  int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
+  int n = ssClampSteps(activeSteps);
   return levelBrightness((float)(n - 1) / (float)(SS_STEPS - 1), floorB);
 }
 
 // PAGE_STRETCH red intensity = stretch detent index, idx in [0, count-1].
 inline float stretchBrightness(int idx, int count, float floorB = 0.15f) {
   if (count < 2) return 1.0f;
-  int i = idx < 0 ? 0 : (idx > count - 1 ? count - 1 : idx);
+  int i = clampi(idx, 0, count - 1);
   return levelBrightness((float)i / (float)(count - 1), floorB);
 }
 
@@ -224,8 +211,7 @@ inline float frameBrightness(int idx, int count, float floorB = 0.15f) {
 // display brightness. Draws from the shared hueROYGBIVW palette. `i` is clamped
 // to [0, SS_STEPS-1].
 inline Rgb stepColor(int i, float b = 0.6f) {
-  Rgb h = hueROYGBIVW(i);
-  return {h.r * b, h.g * b, h.b * b};
+  return scaleRgb(hueROYGBIVW(i), b);
 }
 
 // Two-knob panel editor with a mode + PICKUP everywhere.
@@ -255,7 +241,6 @@ class PanelEditor {
     r1Prev_ = r1; r2Prev_ = r2;   // so the first pass reads speed 0, not a jump
     primed_ = true;
   }
-  bool primed() const { return primed_; }
 
   int  slot() const { return slot_; }        // 0 = global, 1..SS_STEPS = step
   bool inGlobal() const { return slot_ == PE_GLOBAL; }
@@ -270,15 +255,13 @@ class PanelEditor {
   float speed2() const { return spd2_; }
   bool  fast1()  const { return potFast(spd1_); }
   bool  fast2()  const { return potFast(spd2_); }
-  float anchor1() const { return k1Anchor_; }
-  float anchor2() const { return k2Anchor_; }
 
   // button1: GLOBAL -> step1 -> ... -> stepN -> GLOBAL, where N = activeSteps
   // (#149): the nav only visits ACTIVE steps, so shrinking the sequence shrinks
   // the tour. `activeSteps` is clamped into [1, SS_STEPS]; default SS_STEPS
   // preserves the old full-tour behavior. Re-arms pickup for the slot we land on.
   void advance(int activeSteps = SS_STEPS) {
-    int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
+    int n = ssClampSteps(activeSteps);
     // Slots in play: GLOBAL (0) + steps 1..n, so (n + 1) slots, wrapping.
     goTo((slot_ + 1) % (n + 1));
   }
@@ -289,8 +272,7 @@ class PanelEditor {
   // if we're parked on a step past the new count, jump back to GLOBAL so the
   // knobs never edit an inactive step. Call after the step count changes.
   void clampToActive(int activeSteps) {
-    int n = activeSteps < 1 ? 1 : (activeSteps > SS_STEPS ? SS_STEPS : activeSteps);
-    if (slot_ > n) goTo(PE_GLOBAL);
+    if (slot_ > ssClampSteps(activeSteps)) goTo(PE_GLOBAL);
   }
 
   // One control pass. Movement is detected on the RAW knob (r1/r2) -- the
@@ -375,5 +357,105 @@ class PanelEditor {
   bool  anchorPending_ = false;
   bool  primed_ = false;
 };
+
+// --- Encoder: the detent tables, the page state, and one detent's effect ----
+// These used to live in dreamosc.cpp (un-host-compilable): the stretch table,
+// the frame-index state, the per-page dispatch and the led2 brightness switch.
+// They are pure decisions over (page, inc, fast) and belong here, tested.
+
+// Stretch is a fixed, musically-spaced DETENT TABLE rather than a continuous
+// range: PaulStretch factors are not perceptually linear, so what matters is the
+// regime (scan / drift / freeze), not the exact number. Fine 1..10, then coarser
+// as character stops changing: by 2 to 20, by 5 to 50, by 10 to 100, by 25 to
+// 300, by 100 to 1000. The encoder moves an INDEX into this table.
+constexpr float STRETCH_STOPS[] = {
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+  12, 14, 16, 18, 20,
+  25, 30, 35, 40, 45, 50,
+  60, 70, 80, 90, 100,
+  125, 150, 175, 200, 225, 250, 275, 300,
+  400, 500, 600, 700, 800, 900, 1000,
+  // Above 1000x is transient-squelch territory: 1000x still lets a sharp hit
+  // (a cymbal) punch through as a transient; ~10000x freezes it into sustained
+  // wash. By 500s through the low thousands (where the freeze character still
+  // changes), then by 1000s to 10000x.
+  1500, 2000, 2500, 3000,
+  4000, 5000, 6000, 7000, 8000, 9000, 10000,
+};
+constexpr int STRETCH_NSTOPS = (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 52
+constexpr int STRETCH_DEFAULT_IDX = 20;   // 50x
+static_assert(STRETCH_STOPS[STRETCH_DEFAULT_IDX] == 50.0f, "boot stretch is 50x");
+// The stretch factor at a detent index (clamped into the table).
+inline float stretchStop(int idx) { return STRETCH_STOPS[clampi(idx, 0, STRETCH_NSTOPS - 1)]; }
+
+// Frame/window size (#136) is the core's own size index: 0 = SS_W (16384,
+// ~0.34 s, PaulXStretch's shimmer regime) ... SS_NSIZES-1 = SS_W_MIN, i.e.
+// ssSizeW(idx). LARGEST FIRST, so a clockwise detent (inc +1) walks toward
+// SMALLER windows: turning right shrinks the frame. Smaller = grainier/more
+// articulated/wobbly on tonal material; larger = glassy/frozen shimmer. The
+// value goes to seq.setFrame(), which is LIVE: every sounding head re-renders a
+// pre-roll pair at the new size for its next hop boundary. The DEFAULT is the
+// core's SS_W_DEFAULT (4096, not the max) -- derived, so host tests and the
+// device cannot boot at different windows.
+constexpr int FRAME_DEFAULT_IDX = ssSizeIdx(SS_W_DEFAULT);
+
+// The encoder's state: which page it drives, and the two index-valued
+// parameters (stretch detent, frame size) whose VALUE lives in the Sequencer
+// but whose INDEX is the encoder's.
+struct EncoderState {
+  EncoderPage page       = PAGE_STRETCH;
+  int         stretchIdx = STRETCH_DEFAULT_IDX;
+  int         frameIdx   = FRAME_DEFAULT_IDX;
+};
+
+// Push the encoder's index-valued parameters into the Sequencer (boot sync).
+inline void encoderSync(const EncoderState& e, Sequencer& seq) {
+  seq.stretch = stretchStop(e.stretchIdx);
+  seq.setFrame(ssSizeW(e.frameIdx));
+}
+
+// One encoder detent (`inc` = +-1, `fast` from encoderFast) on the current
+// page. Stretch: 3 stops per detent on a fast spin, 1 on a slow click. Frame:
+// one size per detent. Steps (#149): one per detent (a small integer range
+// wants no fast/coarse mode), and the panel nav is kept on a valid slot if the
+// count shrank past the selected step. Fade: additive, 0.04 fast / 0.005 slow
+// per detent over 0..0.5.
+inline void applyEncoder(EncoderState& e, Sequencer& seq, PanelEditor& panel,
+                         int inc, bool fast) {
+  if (inc == 0) return;
+  switch (e.page) {
+    case PAGE_STRETCH:
+      e.stretchIdx = stepIndex(e.stretchIdx, inc, fast ? 3 : 1, STRETCH_NSTOPS);
+      seq.stretch  = stretchStop(e.stretchIdx);
+      break;
+    case PAGE_FRAME:
+      e.frameIdx = stepIndex(e.frameIdx, inc, 1, SS_NSIZES);
+      seq.setFrame(ssSizeW(e.frameIdx));
+      break;
+    case PAGE_STEPS:
+      seq.setSteps(stepCount(seq.activeSteps, inc, 1, SS_STEPS));
+      panel.clampToActive(seq.activeSteps);
+      break;
+    case PAGE_FADE:
+      seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
+      break;
+    default:
+      break;
+  }
+}
+
+// led2 brightness for the current page = that page's encoded LEVEL, so a bright
+// LED always means "this parameter is turned up":
+//   stretch -> stretch detent index, steps -> active step count,
+//   fade -> crossfade amount (0..0.5), frame -> frame-size index (CW bright).
+inline float pageBrightness(const EncoderState& e, const Sequencer& seq) {
+  switch (e.page) {
+    case PAGE_STRETCH: return stretchBrightness(e.stretchIdx, STRETCH_NSTOPS);
+    case PAGE_FADE:    return fadeBrightness(seq.fade);
+    case PAGE_FRAME:   return frameBrightness(e.frameIdx, SS_NSIZES);
+    case PAGE_STEPS:   return stepBrightness(seq.activeSteps);
+    default:           return levelBrightness(0.0f);
+  }
+}
 
 #endif  // CONTROLS_CORE_H

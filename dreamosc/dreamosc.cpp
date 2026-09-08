@@ -11,6 +11,7 @@
 #include "daisy_pod.h"
 #include "stretch_core.h"
 #include "controls_core.h"
+#include "source_core.h"
 
 using namespace daisy;
 
@@ -63,18 +64,23 @@ volatile uint32_t gClips = 0;
 // the wrap reads ~4.27e9 (the "32-bit wrap" in the old OPEN_ISSUES.md).
 // ISR time is a running total the ISR alone writes; the main loop prints the
 // delta since its last print (a shared "add then reset" was a lost update).
+#include <stdio.h>   // snprintf for the POS/DRF lines
 static volatile uint32_t profIsrTicksTotal = 0;
 static uint32_t profTicksPerUs = 1;
 static inline uint32_t profUs(uint32_t ticks) { return ticks / profTicksPerUs; }
 
 // Deepest stack use observed (bytes below _estack). The stack grows down from
-// _estack (top of DTCM); sampling MSP each main-loop pass and keeping the minimum
-// SP gives a high-water mark. This catches the pre-mortem's "hang, not underrun"
-// case: freeing DTCM (94% -> 44%) helped, but a deep 16384-path local could still
-// collide with the heap/statics below -- and that shows as a crash, not a number,
-// unless we watch it. _estack is provided by the linker (dreamosc.lds).
+// _estack (top of DTCM); keeping the minimum MSP ever seen gives a high-water
+// mark. This catches the pre-mortem's "hang, not underrun" case: freeing DTCM
+// (94% -> 44%) helped, but a deep 16384-path local could still collide with the
+// heap/statics below -- and that shows as a crash, not a number, unless we
+// watch it. Sampled from BOTH the main loop (between service() calls) and the
+// audio ISR: the ISR preempts a render at a random depth, so ITS read is what
+// actually sees the render path's stack; the main-loop sample alone never did
+// (it always ran between renders and read the same ~176 B at every frame
+// size). ISR-written, main-read: volatile. _estack comes from dreamosc.lds.
 extern "C" uint32_t _estack;
-static uint32_t profMinSp = 0xFFFFFFFFu;   // lowest SP ever seen (deepest stack)
+static volatile uint32_t profMinSp = 0xFFFFFFFFu;   // lowest SP ever seen
 static inline void profSampleStack() {
   uint32_t sp = __get_MSP();
   if (sp < profMinSp) profMinSp = sp;
@@ -84,12 +90,33 @@ static inline uint32_t profStackUsed() {
   uint32_t top = (uint32_t)&_estack;
   return (profMinSp == 0xFFFFFFFFu) ? 0 : (top - profMinSp);
 }
-// Last knob reads (raw + smoothed) for the KNOB diagnostic line.
-static float dbgR1 = 0, dbgR2 = 0, dbgK1 = 0, dbgK2 = 0;
-// Peak per-poll knob speed since the last profiler print (instantaneous speed is
-// ~0 at any given print instant; the peak catches an actual turn). *1000 in the
-// line. Used to tune the potFast threshold from board data.
-static float dbgPk1 = 0, dbgPk2 = 0;
+
+// Per-second accounting the main loop owns (the ISR only writes
+// profIsrTicksTotal and profMinSp above).
+struct Prof {
+  uint32_t busyTicks = 0, units = 0;
+  // Peak single service() duration this window: an under-fed head comes from
+  // the WORST single render, which the average hides. Watch max_us at 16384.
+  uint32_t maxTicks = 0;
+  uint32_t lastUnder = 0, lastClip = 0, lastLate = 0, lastRefresh = 0, lastIsr = 0;
+  uint32_t lastPrint = 0;
+  float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
+  // Peak per-poll knob speed since the last print (instantaneous speed is ~0
+  // at any given print instant; the peak catches an actual turn). Used to
+  // tune the potFast threshold from board data.
+  float pk1 = 0, pk2 = 0;
+};
+static Prof prof;
+
+// Scaled-integer formatting: nano-newlib printf can't do floats reliably, so
+// every float on the serial line is printed as round(v * k).
+static inline int scaled(float v, float k) { return (int)(v * k + 0.5f); }
+// Append n floats, scaled by k, space-separated, to buf; returns the new length.
+static int appendScaled(char* buf, size_t cap, int used, const float* v, int n, float k) {
+  for (int i = 0; i < n && used < (int)cap; i++)
+    used += snprintf(buf + used, cap - used, "%s%d", i ? " " : "", scaled(v[i], k));
+  return used;
+}
 #endif
 
 // --- storage ---------------------------------------------------------------
@@ -125,54 +152,28 @@ static Source   src;
 // Sample material is uploaded separately to QSPI flash (8 MB, memory-mapped at
 // 0x90000000) rather than embedded in the firmware: internal flash is only
 // 128 KB and a usable sample is hundreds of KB. Build the blob with
-// tools/wav2raw.py and upload it with `make program-sample`.
+// tools/wav2raw.py and upload it with `make program-sample`. The blob format
+// and its decode (validate, int16 -> float, wrap-pad) are source_core.h,
+// host-tested; only the address and the cast are hardware.
 //
-// Blob layout, little-endian (see tools/wav2raw.py):
-//   uint32 magic 'DRMO' | uint32 count | uint32 rate | uint32 reserved
-//   int16  samples[count]
 // QSPI layout, read from the Daisy bootloader's own DFU descriptor:
 //   0x90000000  64 x 4KB   (256 KB) bootloader-reserved
 //   0x90040000  60 x 64KB  (3.75 MB) firmware images live here
 //   0x90400000  60 x 64KB  (3.75 MB) free
 // Sample data goes in the THIRD region so it can never collide with a firmware
-// image, even under APP_TYPE=BOOT_QSPI.
-#define QSPI_BASE        0x90400000u
-#define SAMPLE_MAGIC     0x4F4D5244u   // 'DRMO'
+// image, even under APP_TYPE=BOOT_QSPI. Must match SAMPLE_ADDR in the Makefile.
+// (Not named QSPI_BASE: stm32h750xx.h already defines that as the peripheral's
+// 0x90000000 base, and redefining it was a warning on every build.)
+#define SAMPLE_QSPI_ADDR 0x90400000u
 
-struct SampleHeader {
-  uint32_t magic;
-  uint32_t count;
-  uint32_t rate;
-  uint32_t reserved;
-};
-
-// Load the QSPI sample into the SDRAM source buffer as float. Returns false if
-// no valid blob is present (never uploaded, or erased), so the caller can fall
-// back to a synthesized source rather than playing garbage.
+// Load the QSPI sample into the SDRAM source buffer as float, wrap-padded to
+// SOURCE_LEN. Returns false if no valid blob is present (never uploaded, or
+// erased), so the caller can fall back to a synthesized source rather than
+// playing garbage. The blob's sample rate is decoded but NOT applied (see the
+// NOTE in source_core.h and OPEN_ISSUES.md).
 static bool load_qspi_sample() {
-  const SampleHeader* h = (const SampleHeader*)QSPI_BASE;
-  if (h->magic != SAMPLE_MAGIC) return false;
-  if (h->count == 0 || h->count > 8u * 1024 * 1024) return false;
-
-  const int16_t* pcm = (const int16_t*)(QSPI_BASE + sizeof(SampleHeader));
-  uint32_t n = h->count > SOURCE_LEN ? SOURCE_LEN : h->count;
-  for (uint32_t i = 0; i < n; i++) sourceBuf[i] = pcm[i] / 32768.0f;
-  // Wrap-pad the remainder so the whole buffer is musical material rather than
-  // a block of silence the read heads can wander into.
-  for (uint32_t i = n; i < SOURCE_LEN; i++) sourceBuf[i] = sourceBuf[i % n];
-  src.len = SOURCE_LEN;
-  return true;
-}
-
-// Fallback when QSPI holds no sample: a spectrally-varied synthetic source, so
-// the position/stretch controls still audibly do something.
-static void fill_stub_source() {
-  for (uint32_t i = 0; i < SOURCE_LEN; i++) {
-    float t = (float)i / SAMPLE_RATE;
-    sourceBuf[i] = 0.5f * sinf(2.0f * (float)M_PI * 220.0f * t)
-                 + 0.3f * sinf(2.0f * (float)M_PI * 331.0f * t)
-                 + 0.2f * sinf(2.0f * (float)M_PI * 554.0f * t);
-  }
+  uint32_t rate = 0;
+  return decodeSampleBlob((const uint8_t*)SAMPLE_QSPI_ADDR, sourceBuf, SOURCE_LEN, rate) > 0;
 }
 
 // --- controls ---------------------------------------------------------------
@@ -192,8 +193,10 @@ static void fill_stub_source() {
 //
 // Read from the MAIN LOOP, not the audio callback: debouncing and smoothing do
 // not belong in an interrupt, and the sequencer reads these values live anyway.
-// EncoderPage enum + LED color helpers live in controls_core.h (host-tested).
-static EncoderPage encPage = PAGE_STRETCH;
+// The encoder's page + index state, the stretch detent table, the per-page
+// dispatch (applyEncoder) and the led2 level (pageBrightness) all live in
+// controls_core.h (host-tested); this is just the state instance.
+static EncoderState enc;
 
 // Global drift: a fun all-steps shimmer, the FLOOR under each step's own
 // per-step drift (knob2). Effective drift per step = max(perStep, global),
@@ -204,52 +207,6 @@ static float globalDrift = 0.0f;
 // so it is host-testable — see controls_core.h. GLOBAL mode: knobs = duration
 // + global drift. Step mode: knobs = that step's position + per-step drift.
 static PanelEditor panel;
-
-// Stretch is a fixed, musically-spaced DETENT TABLE rather than a continuous
-// range: PaulStretch factors are not perceptually linear, so what matters is the
-// regime (scan / drift / freeze), not the exact number. Fine 1..10, then coarser
-// as character stops changing: by 2 to 20, by 5 to 50, by 10 to 100, by 25 to
-// 300, by 100 to 1000. The encoder moves an INDEX into this table.
-static const float STRETCH_STOPS[] = {
-  1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-  12, 14, 16, 18, 20,
-  25, 30, 35, 40, 45, 50,
-  60, 70, 80, 90, 100,
-  125, 150, 175, 200, 225, 250, 275, 300,
-  400, 500, 600, 700, 800, 900, 1000,
-  // Above 1000x is transient-squelch territory: 1000x still lets a sharp hit
-  // (a cymbal) punch through as a transient; ~10000x freezes it into sustained
-  // wash. By 500s through the low thousands (where the freeze character still
-  // changes), then by 1000s to 10000x.
-  1500, 2000, 2500, 3000,
-  4000, 5000, 6000, 7000, 8000, 9000, 10000,
-};
-static const int STRETCH_NSTOPS =
-    (int)(sizeof(STRETCH_STOPS) / sizeof(STRETCH_STOPS[0]));   // 56
-static int stretchIdx = 20;   // start at 50x (index into STRETCH_STOPS)
-
-// Frame/window size stops (#136): powers of two from SS_W (16384 ~ 0.34 s,
-// PaulXStretch's shimmer regime) down to SS_W_MIN. Smaller = grainier/more
-// articulated/wobbly on tonal material; larger = glassy/frozen shimmer. Encoder
-// page PAGE_FRAME indexes this; the value goes to seq.setFrame(), which is LIVE:
-// every sounding head re-renders a pre-roll pair at the new size for its next
-// hop boundary.
-// LARGEST FIRST (idx 0 = SS_W): a clockwise detent (inc +1) walks toward SMALLER
-// windows, so turning right shrinks the frame. The DEFAULT is 4096 (not the max,
-// FRAME_DEFAULT_IDX), so CW from default shrinks and CCW grows toward the big
-// shimmer windows.
-static constexpr int FRAME_STOPS[] = { 16384, 8192, 4096, 2048, 1024, 512, 256 };
-static constexpr int FRAME_NSTOPS =
-    (int)(sizeof(FRAME_STOPS) / sizeof(FRAME_STOPS[0]));
-static constexpr int FRAME_DEFAULT_IDX = 2;  // 4096, the default window (not max)
-static int frameIdx = FRAME_DEFAULT_IDX;
-// The window the firmware boots at MUST equal the core's default (SS_W_DEFAULT),
-// or host tests and the device would run different windows -- the exact drift
-// that silently ran the whole host suite at 16384 once SS_W != default.
-static_assert(FRAME_STOPS[FRAME_DEFAULT_IDX] == SS_W_DEFAULT,
-              "FRAME_DEFAULT_IDX must select the core's SS_W_DEFAULT window");
-static_assert(FRAME_NSTOPS == SS_NSIZES && FRAME_STOPS[FRAME_NSTOPS - 1] == SS_W_MIN,
-              "FRAME_STOPS must cover exactly the core's table sizes");
 
 // Audio block size. The hop (>= 128 samples, 2048 at the default window) sets
 // the control-to-ear floor, so a tiny block buys nothing; 32 (0.67 ms) keeps
@@ -271,7 +228,7 @@ static void processControls() {
   pod.ProcessAllControls();
 
   // --- encoder click: cycle page (stretch/steps/fade/window) ---
-  if (pod.encoder.RisingEdge()) encPage = nextPage(encPage);
+  if (pod.encoder.RisingEdge()) enc.page = nextPage(enc.page);
 
   // --- button1: advance panel mode (GLOBAL -> step1..N -> GLOBAL) where N is
   // the active step count (#149) -- the tour only visits active steps ---
@@ -280,29 +237,14 @@ static void processControls() {
   if (pod.button2.RisingEdge()) panel.toGlobal();
 
   // --- encoder turn: the current page's parameter (stretch / frame / steps /
-  // fade) ---
-  // Speed from the detent GAP (Increment is only +-1); stepping math is pure
-  // and host-tested in controls_core.h.
+  // fade). Speed from the detent GAP (Increment is only +-1); the per-page
+  // effect is applyEncoder() in controls_core.h (host-tested). ---
   int32_t inc = pod.encoder.Increment();
   if (inc != 0) {
     uint32_t tnow = System::GetNow();
     bool fast = encoderFast(tnow - lastDetentMs);
     lastDetentMs = tnow;
-    if (encPage == PAGE_STRETCH) {
-      stretchIdx = stepIndex(stretchIdx, inc, fast ? 3 : 1, STRETCH_NSTOPS);
-      seq.stretch = STRETCH_STOPS[stretchIdx];
-    } else if (encPage == PAGE_FRAME) {
-      frameIdx = stepIndex(frameIdx, inc, 1, FRAME_NSTOPS);   // 1 stop/detent
-      seq.setFrame(FRAME_STOPS[frameIdx]);                    // recompute window
-    } else if (encPage == PAGE_STEPS) {
-      // Active step count 1..SS_STEPS (#149): one step per detent (small range,
-      // no fast/coarse mode). Keep the panel nav on a valid slot if the count
-      // shrank past the currently selected step.
-      seq.setSteps(stepCount(seq.activeSteps, inc, 1, SS_STEPS));
-      panel.clampToActive(seq.activeSteps);
-    } else {   // PAGE_FADE
-      seq.fade = stepAdditive(seq.fade, inc, fast ? 0.04f : 0.005f, 0.0f, 0.5f);
-    }
+    applyEncoder(enc, seq, panel, (int)inc, fast);
   }
 
   // --- knobs: GLOBAL mode -> duration + global drift; step mode -> that step's
@@ -315,27 +257,15 @@ static void processControls() {
   knobPrimed = true;
   panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
 #ifdef PROFILE
-  dbgR1 = r1; dbgR2 = r2; dbgK1 = k1; dbgK2 = k2;   // for the KNOB profiler line
-  if (panel.speed1() > dbgPk1) dbgPk1 = panel.speed1();   // peak since last print
-  if (panel.speed2() > dbgPk2) dbgPk2 = panel.speed2();
+  prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
+  if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
+  if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
 #endif
 
   // --- led2: encoder page color (RoYG over stretch/steps/fade/window, same
-  // ROYGBIVW palette as led1). EVERY page's brightness tracks that page's
-  // encoded LEVEL, so a bright LED always means "this parameter is turned up":
-  //   stretch -> red    = stretch detent index
-  //   steps   -> orange = active step count
-  //   fade    -> yellow = crossfade amount (0..0.5)
-  //   frame   -> green  = frame-size (window) index
-  float b2;
-  switch (encPage) {
-    case PAGE_STRETCH: b2 = stretchBrightness(stretchIdx, STRETCH_NSTOPS); break;
-    case PAGE_FADE:    b2 = fadeBrightness(seq.fade);                      break;
-    case PAGE_FRAME:   b2 = frameBrightness(frameIdx, FRAME_NSTOPS);       break;
-    case PAGE_STEPS:   b2 = stepBrightness(seq.activeSteps);               break;
-    default:           b2 = 0.15f;                                         break;
-  }
-  Rgb c2 = pageColor(encPage, b2);
+  // ROYGBIVW palette as led1) at that page's LEVEL (pageBrightness), so a
+  // bright LED always means "this parameter is turned up".
+  Rgb c2 = pageColor(enc.page, pageBrightness(enc, seq));
   pod.led2.Set(c2.r, c2.g, c2.b);
 
   // --- led1: OFF in GLOBAL mode; ROYGBIVW for the selected step otherwise ---
@@ -349,25 +279,114 @@ static void processControls() {
   pod.UpdateLeds();
 }
 
+#ifdef PROFILE
+// The once-a-second serial dump. Every variable parameter appears here (the
+// profiler directive in CLAUDE.md); the format is the bench's diagnostic
+// contract, so keep the field names stable. Lines stay under libDaisy's
+// 128-byte Logger buffer (HLTH/COST were split for exactly that reason).
+static void profilePrint() {
+  uint32_t isrTotal = profIsrTicksTotal;
+  uint32_t isr = profUs(isrTotal - prof.lastIsr);
+  prof.lastIsr = isrTotal;
+  // SETTINGS line: globals + which step is selected. Integers *1000 (or *100
+  // for stretch). gdrift_cc: global drift in units of 0.01% (hundredths of a
+  // percent) -> full scale 0..300 == 0..3% drift, so the fine 0.03% grid is
+  // visible. dur_ms IS the step length (live, unquantized). hop = the sounding
+  // head's current hop in samples (frame size as actually applied), step = the
+  // step it is playing, blk = audio block.
+  pod.seed.PrintLine(
+      "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d frame=%d hop=%d step=%d steps=%d blk=%u page=%d slot=%d",
+      scaled(seq.stretch, 100.0f), scaled(seq.duration, 1000.0f),
+      scaled(globalDrift, 10000.0f), scaled(seq.fade, 1000.0f),
+      seq.frameSize,                         // requested (live control)
+      seq.curHop(),                          // applied on the sounding head
+      seq.curStep(),
+      seq.activeSteps,                       // active step count (#149)
+      (unsigned)AUDIO_BLOCK,
+      (int)enc.page,
+      panel.slot());                         // 0 = GLOBAL, 1..N = step
+  // KNOB line: raw (r1/r2) and smoothed (k1/k2) knob reads (*1000) and whether
+  // pickup has engaged on the current slot (k1L/k2L = 1 once the pot has moved
+  // past threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
+  // the move; if k1L=1 but the value doesn't change, the write is the bug.
+  // pk1/pk2 = PEAK per-poll knob speed since last print (*1000, i.e. per-mil
+  // of full travel per poll). potFast threshold is 10 in these units (0.01).
+  // Turn a knob and read pk to see what "fast" actually measures -> tune the
+  // threshold. f1/f2 = the fast verdict at print time.
+  pod.seed.PrintLine(
+      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d",
+      scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
+      scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
+      (int)panel.k1Live(), (int)panel.k2Live(),
+      scaled(prof.pk1, 1000.0f), scaled(prof.pk2, 1000.0f),
+      (int)panel.fast1(), (int)panel.fast2(),
+      (int)pod.button1.Pressed(), (int)pod.button2.Pressed());
+  prof.pk1 = prof.pk2 = 0.0f;   // reset peak for the next window
+  // POS line: all 8 step positions (*1000). Homing every knob should make
+  // these equal; if they differ, that's why steps sound different.
+  char line[LOGGER_BUFFER];
+  int  used = snprintf(line, sizeof(line), "POS ");
+  appendScaled(line, sizeof(line), used, seq.position, SS_STEPS, 1000.0f);
+  pod.seed.PrintLine("%s", line);
+  // DRF line: per-step drift shadow (what the knob set), then the EFFECTIVE
+  // drift the DSP reads = max(perStep, global) -- global is the FLOOR, not an
+  // addend. So a step whose own drift is ABOVE the floor reads its own value
+  // (eff == shadow); a step BELOW the floor reads the floor (eff > shadow).
+  // Units are 0.01% (hundredths of a percent), *10000, so the 0..3% range
+  // reads 0..300 and the fine 0.03% grid is visible.
+  float shadow[SS_STEPS];
+  for (int i = 0; i < SS_STEPS; i++) shadow[i] = panel.perStepDrift(i);
+  used = snprintf(line, sizeof(line), "DRF s ");
+  used = appendScaled(line, sizeof(line), used, shadow, SS_STEPS, 10000.0f);
+  used += snprintf(line + used, sizeof(line) - used, " | eff ");
+  appendScaled(line, sizeof(line), used, seq.drift, SS_STEPS, 10000.0f);
+  pod.seed.PrintLine("%s", line);
+  // HEALTH line: CPU and supply accounting for this second. act = gated
+  // step heads (sounding + incoming, at most 2); arm = armed (pre-warmed)
+  // heads. du = frame HOLDS (a head repeated a frame: the producer fell
+  // behind); late = samples a seam waited for an incoming head that was not
+  // ready (the step ran long, never silent); rfr = re-renders driven by
+  // control changes; clip = output samples the +-1 clamp caught this second
+  // (the phase-randomized peaks can overrun SS_HEADROOM -> distortion, not
+  // loudness); slack = min samples to deadline at render start this second
+  // (negative = a render started past its boundary). free = FREE pool slots
+  // (a leak shows here as a steady decline). max_us = worst single render. A
+  // separate COST line carries the per-size render cost estimates in samples
+  // (16384..256) and stk (deepest stack use); it split off HLTH because the
+  // combined string overran libDaisy's 128-byte Logger buffer and truncated
+  // cost[1..6] + stk.
+  uint32_t busyUs = profUs(prof.busyTicks);
+  uint32_t late = seq.lateSamples(), rfr = seq.refreshes();
+  pod.seed.PrintLine(
+      "HLTH act=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u clip=%u slack=%d",
+      seq.activeVoices(), seq.armedHeads(), seq.freeHeads(),
+      (unsigned)prof.units, (unsigned)busyUs,
+      (unsigned)(prof.units ? busyUs / prof.units : 0), (unsigned)profUs(prof.maxTicks),
+      (unsigned)isr, (unsigned)(gUnderruns - prof.lastUnder),
+      (unsigned)(late - prof.lastLate), (unsigned)(rfr - prof.lastRefresh),
+      (unsigned)(gClips - prof.lastClip),
+      (int)seq.takeMinSlack());
+  pod.seed.PrintLine(
+      "COST 16384=%u 8192=%u 4096=%u 2048=%u 1024=%u 512=%u 256=%u stk=%u",
+      (unsigned)seq.costSamples(0), (unsigned)seq.costSamples(1),
+      (unsigned)seq.costSamples(2), (unsigned)seq.costSamples(3),
+      (unsigned)seq.costSamples(4), (unsigned)seq.costSamples(5),
+      (unsigned)seq.costSamples(6),
+      (unsigned)profStackUsed());
+  prof.lastUnder = gUnderruns; prof.lastClip = gClips;
+  prof.lastLate = late; prof.lastRefresh = rfr;
+  prof.busyTicks = prof.units = 0;
+  prof.maxTicks = 0;   // reset the per-window peak (stk is a running high-water)
+}
+#endif
+
 // --- audio -----------------------------------------------------------------
-// #129 bisection: define DEBUG_PURE_TONE to bypass the sequencer entirely and
-// emit a continuous 220 Hz sine. If THAT still clicks every second, the click is
-// in the firmware/codec path, not the sequencer/DSP.
 static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
                           AudioHandle::InterleavingOutputBuffer out,
                           size_t                                size) {
-#ifdef DEBUG_PURE_TONE
-  static float phase = 0.0f;
-  const float  inc = 2.0f * (float)M_PI * 220.0f / SAMPLE_RATE;
-  for (size_t i = 0; i < size; i += 2) {
-    float s = 0.3f * sinf(phase);
-    phase += inc;
-    if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
-    out[i] = s; out[i + 1] = s;
-  }
-#else
 #ifdef PROFILE
   uint32_t t0 = System::GetTick();
+  profSampleStack();   // sees the render this ISR preempted (see profMinSp)
 #endif
   // size is the INTERLEAVED sample count (2 * block). Render mono in chunks
   // of at most AUDIO_BLOCK (per-block constants hoisted inside), then
@@ -386,7 +405,6 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 #ifdef PROFILE
   profIsrTicksTotal += System::GetTick() - t0;   // ISR-only writer; main reads deltas
 #endif
-#endif
 }
 
 int main(void) {
@@ -401,24 +419,22 @@ int main(void) {
 #endif
 
   gTab.init();                       // ShyFFT + window/blend tables (SDRAM is up)
-  src.data = sourceBuf;
-  src.len  = SOURCE_LEN;
   // TEMPORARY (#132 testing): real material from QSPI so the controls can be
   // judged on broadband audio -- a sine has no spectral variation across the
   // buffer, so moving a read head sounds identical everywhere. Reverts to the
-  // SD-card path (#131) once the controls are sorted.
-  if (!load_qspi_sample()) fill_stub_source();
+  // SD-card path (#131) once the controls are sorted. Either way the buffer is
+  // SOURCE_LEN of material (the blob is wrap-padded to fill it).
+  if (!load_qspi_sample()) fillStubSource(sourceBuf, SOURCE_LEN, SAMPLE_RATE);
+  src.data = sourceBuf;
+  src.len  = SOURCE_LEN;
 
   seq.init(&src, pod.AudioSampleRate(), voicePool);
   // Starting values; the knobs/encoder take over from here (see processControls).
   // Pickup applies from boot: a knob takes over its parameter only after it has
   // physically moved (PanelEditor), so these hold until the pots are touched.
-  seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
+  encoderSync(enc, seq);  // stretch 50x, window 4096 (the core's SS_W_DEFAULT)
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
-  // Default window 4096 (FRAME_DEFAULT_IDX), not the 16384 max. The window page
-  // grows it toward the shimmer regime or shrinks it from here, live.
-  seq.setFrame(FRAME_STOPS[frameIdx]);
 
   pod.StartAdc();
   pod.StartAudio(AudioCallback);
@@ -431,21 +447,16 @@ int main(void) {
   // count polled the encoder only a few times a second and dropped detents.
   uint32_t lastControlMs = System::GetNow();
 #ifdef PROFILE
-  uint32_t profBusyTicks = 0, profUnits = 0, profLastUnder = 0;
-  uint32_t profLastLate = 0, profLastRefresh = 0, profLastIsr = 0, profLastClip = 0;
-  // Peak single service() duration this window: an under-fed head comes from
-  // the WORST single render, which the average hides. Watch max_us at 16384.
-  uint32_t profMaxTicks = 0;
-  uint32_t profLastPrint = System::GetNow();
+  prof.lastPrint = System::GetNow();
 #endif
   while (1) {
 #ifdef PROFILE
     uint32_t s0 = System::GetTick();
     if (seq.service()) {
       uint32_t d = System::GetTick() - s0;   // wrap-safe in raw ticks
-      profBusyTicks += d;
-      if (d > profMaxTicks) profMaxTicks = d;
-      profUnits++;
+      prof.busyTicks += d;
+      if (d > prof.maxTicks) prof.maxTicks = d;
+      prof.units++;
     }
     profSampleStack();   // stack high-water mark (deepest SP seen)
 #else
@@ -459,107 +470,9 @@ int main(void) {
     }
 #ifdef PROFILE
     uint32_t now = System::GetNow();
-    if (now - profLastPrint >= 1000) {
-      profLastPrint = now;
-      uint32_t isrTotal = profIsrTicksTotal;
-      uint32_t isr = profUs(isrTotal - profLastIsr);
-      profLastIsr = isrTotal;
-      // SETTINGS line: globals + which step is selected. Integers *1000 (or
-      // *100 for stretch) since nano-newlib printf can't do floats reliably.
-      // gdrift_cc: global drift in units of 0.01% (hundredths of a percent) ->
-      // full scale 0..300 == 0..3% drift, so the fine 0.03% grid is visible.
-      // dur_ms IS the step length (live, unquantized). hop = the sounding
-      // head's current hop in samples (frame size as actually applied), step =
-      // the step it is playing, blk = audio block.
-      pod.seed.PrintLine(
-          "SET stretch_c=%d dur_ms=%d gdrift_cc=%d fade_m=%d frame=%d hop=%d step=%d steps=%d blk=%u page=%d slot=%d",
-          (int)(seq.stretch * 100.0f + 0.5f),
-          (int)(seq.duration * 1000.0f + 0.5f),
-          (int)(globalDrift * 10000.0f + 0.5f),
-          (int)(seq.fade * 1000.0f + 0.5f),
-          seq.frameSize,                         // requested (live control)
-          seq.curHop(),                          // applied on the sounding head
-          seq.curStep(),
-          seq.activeSteps,   // active step count (#149)
-          (unsigned)AUDIO_BLOCK,
-          (int)encPage,
-          panel.slot());   // 0 = GLOBAL, 1..N = step
-      // KNOB line: raw + smoothed knob reads (*1000) and whether pickup has
-      // engaged on the current slot (k1L/k2L = 1 once the pot has moved past
-      // threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
-      // the move; if k1L=1 but the value doesn't change, the write is the bug.
-      // pk1/pk2 = PEAK per-poll knob speed since last print (*1000, i.e. per-mil
-      // of full travel per poll). potFast threshold is 10 in these units (0.01).
-      // Turn a knob and read pk to see what "fast" actually measures -> tune the
-      // threshold. f1/f2 = the fast verdict at print time.
-      pod.seed.PrintLine(
-          "KNOB r1=%d r2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d",
-          (int)(dbgR1 * 1000.0f + 0.5f), (int)(dbgR2 * 1000.0f + 0.5f),
-          (int)panel.k1Live(), (int)panel.k2Live(),
-          (int)(dbgPk1 * 1000.0f + 0.5f), (int)(dbgPk2 * 1000.0f + 0.5f),
-          (int)panel.fast1(), (int)panel.fast2(),
-          (int)pod.button1.Pressed(), (int)pod.button2.Pressed());
-      dbgPk1 = dbgPk2 = 0.0f;   // reset peak for the next window
-      // POS line: all 8 step positions (*1000). Homing every knob should make
-      // these equal; if they differ, that's why steps sound different.
-      pod.seed.PrintLine(
-          "POS %d %d %d %d %d %d %d %d",
-          (int)(seq.position[0] * 1000.0f + 0.5f), (int)(seq.position[1] * 1000.0f + 0.5f),
-          (int)(seq.position[2] * 1000.0f + 0.5f), (int)(seq.position[3] * 1000.0f + 0.5f),
-          (int)(seq.position[4] * 1000.0f + 0.5f), (int)(seq.position[5] * 1000.0f + 0.5f),
-          (int)(seq.position[6] * 1000.0f + 0.5f), (int)(seq.position[7] * 1000.0f + 0.5f));
-      // DRF line: per-step drift shadow (what the knob set), then the EFFECTIVE
-      // drift the DSP reads = max(perStep, global) -- global is the FLOOR, not an
-      // addend. So a step whose own drift is ABOVE the floor reads its own value
-      // (eff == shadow); a step BELOW the floor reads the floor (eff > shadow).
-      // Units are 0.01% (hundredths of a percent), *10000, so the 0..3% range
-      // reads 0..300 and the fine 0.03% grid is visible.
-      pod.seed.PrintLine(
-          "DRF s %d %d %d %d %d %d %d %d | eff %d %d %d %d %d %d %d %d",
-          (int)(panel.perStepDrift(0)*10000+0.5f), (int)(panel.perStepDrift(1)*10000+0.5f),
-          (int)(panel.perStepDrift(2)*10000+0.5f), (int)(panel.perStepDrift(3)*10000+0.5f),
-          (int)(panel.perStepDrift(4)*10000+0.5f), (int)(panel.perStepDrift(5)*10000+0.5f),
-          (int)(panel.perStepDrift(6)*10000+0.5f), (int)(panel.perStepDrift(7)*10000+0.5f),
-          (int)(seq.drift[0]*10000+0.5f), (int)(seq.drift[1]*10000+0.5f),
-          (int)(seq.drift[2]*10000+0.5f), (int)(seq.drift[3]*10000+0.5f),
-          (int)(seq.drift[4]*10000+0.5f), (int)(seq.drift[5]*10000+0.5f),
-          (int)(seq.drift[6]*10000+0.5f), (int)(seq.drift[7]*10000+0.5f));
-      // HEALTH line: CPU and supply accounting for this second. act = gated
-      // step heads (sounding + incoming, at most 2); arm = armed (pre-warmed)
-      // heads. du = frame HOLDS (a head repeated a frame: the producer fell
-      // behind); late = samples a seam waited for an incoming head that was not
-      // ready (the step ran long, never silent); rfr = re-renders driven by
-      // control changes; clip = output samples the +-1 clamp caught this second
-      // (the phase-randomized peaks can overrun SS_HEADROOM -> distortion, not
-      // loudness); slack = min samples to deadline at render start this second
-      // (negative = a render started past its boundary). free = FREE pool slots
-      // (a leak shows here as a steady decline). max_us = worst single render. A
-      // separate COST line carries the per-size render cost estimates in samples
-      // (16384..256) and stk (deepest stack use); it split off HLTH because the
-      // combined string overran libDaisy's 128-byte Logger buffer and truncated
-      // cost[1..6] + stk.
-      uint32_t busyUs = profUs(profBusyTicks);
-      uint32_t late = seq.lateSamples(), rfr = seq.refreshes();
-      pod.seed.PrintLine(
-          "HLTH act=%d arm=%d free=%d units=%u svc_us=%u avg_us=%u max_us=%u isr_us=%u du=%u late=%u rfr=%u clip=%u slack=%d",
-          seq.activeVoices(), seq.armedHeads(), seq.freeHeads(),
-          (unsigned)profUnits, (unsigned)busyUs,
-          (unsigned)(profUnits ? busyUs / profUnits : 0), (unsigned)profUs(profMaxTicks),
-          (unsigned)isr, (unsigned)(gUnderruns - profLastUnder),
-          (unsigned)(late - profLastLate), (unsigned)(rfr - profLastRefresh),
-          (unsigned)(gClips - profLastClip),
-          (int)seq.takeMinSlack());
-      pod.seed.PrintLine(
-          "COST 16384=%u 8192=%u 4096=%u 2048=%u 1024=%u 512=%u 256=%u stk=%u",
-          (unsigned)seq.costSamples(0), (unsigned)seq.costSamples(1),
-          (unsigned)seq.costSamples(2), (unsigned)seq.costSamples(3),
-          (unsigned)seq.costSamples(4), (unsigned)seq.costSamples(5),
-          (unsigned)seq.costSamples(6),
-          (unsigned)profStackUsed());
-      profLastUnder = gUnderruns; profLastClip = gClips;
-      profLastLate = late; profLastRefresh = rfr;
-      profBusyTicks = profUnits = 0;
-      profMaxTicks = 0;   // reset the per-window peak (stk is a running high-water)
+    if (now - prof.lastPrint >= 1000) {
+      prof.lastPrint = now;
+      profilePrint();
     }
 #endif
   }

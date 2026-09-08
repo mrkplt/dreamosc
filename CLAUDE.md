@@ -227,7 +227,8 @@ dreamosc/
                       invariants. Read before changing stretch_core.h.
   stretch_core.h      DSP core: Source, Head, Sequencer, StretchTables (portable)
   controls_core.h     Control-surface logic: PanelEditor, encoder stepping, LED
-                      colors (portable, host-tested — see CONTROLS.md)
+                      colors, encoder tables/pages (portable, host-tested — see CONTROLS.md)
+  source_core.h       QSPI sample-blob decode + stub source (portable, host-tested)
   shy_fft.h           Emilie Gillet's embedded real FFT (MIT; vendored)
   sd_source.h         Load a WAV off microSD -> SDRAM -> Source. THE source seam.
   dreamosc.cpp        Pod firmware: hardware glue (audio callback, controls, LEDs)
@@ -288,7 +289,9 @@ header and test it rather than leaving it in the firmware. This is not optional
 polish — a real bug (a drift double-add) shipped precisely because it lived in
 the un-host-compilable `dreamosc.cpp`; extracting it (`controls_core.h`) is what
 made it testable. Cores today: `stretch_core.h` (DSP), `controls_core.h`
-(control-surface logic). Run `dreamosc/test/run.sh` and keep it green; a change
+(control-surface logic, incl. the encoder's detent tables and per-page
+dispatch), `source_core.h` (sample-blob decode). Run `dreamosc/test/run.sh`
+and keep it green; a change
 to any core is not done until the suite passes. Add a test with new behavior;
 set tolerances from measurement with a written reason, never loosen one to hide
 a regression. Details in `dreamosc/test/README.md`.
@@ -406,10 +409,16 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   removed). The multi-head crossfade march is what the bench still owes — see
   `dreamosc/OPEN_ISSUES.md`. See the tag discipline above and Fizzy for what's
   next.
-- **SD reader: written and compile-checked** against the real libDaisy API
-  (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
-  stereo->mono fold). Not yet run on hardware (no card yet — Fizzy #131). Source
-  today is the QSPI sample scaffolding (see below).
+- **SD reader: written and compile-checked by `make sd-check`** (a
+  `-fsyntax-only` build of `sd_source.h` with the device toolchain and flags —
+  nothing `#include`s it yet, so this is what keeps it honest against a GCC or
+  libDaisy change) against the real libDaisy API (`SdmmcHandler` +
+  `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser, stereo->mono
+  fold). Not yet run on hardware (no card yet — Fizzy #131). Source today is
+  the QSPI sample scaffolding (see below). **Before wiring SD, decide the
+  `Source` length rule:** QSPI wrap-pads to `SOURCE_LEN` and every step
+  position was tuned against that padded scale; `sd_source.h` sets `len` to
+  the file length (OPEN_ISSUES.md).
 
 ## Key facts a future agent needs
 

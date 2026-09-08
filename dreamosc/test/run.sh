@@ -17,6 +17,7 @@ echo "== Catch2 unit tests (DSP core + vendored FFT) =="
 c++ -std=c++17 -O1 -DSS_TEST_HOOKS -I"$TEST_DIR/.." -I"$TEST_DIR" \
     "$TEST_DIR/test_stretch_core.cpp" "$TEST_DIR/test_shy_fft.cpp" \
     "$TEST_DIR/test_controls_core.cpp" "$TEST_DIR/test_findings.cpp" \
+    "$TEST_DIR/test_source_core.cpp" \
     -o "$TEST_DIR/unit_tests"
 # [!mayfail] tests document open findings (test_findings.cpp): they report as
 # "failed as expected" without failing the gate. Drop the tag when remediated.

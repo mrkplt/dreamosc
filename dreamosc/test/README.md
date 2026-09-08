@@ -35,6 +35,12 @@ scheduling). `render_costed()` gives the producer a time budget and charges
 each render `cost(w)`; plug in the bench's per-size cost to reproduce device
 scheduling on the host. The former Python golden regression is retired.
 
+Alongside: `test_controls_core.cpp` (the control surface: pickup, panel
+navigation, encoder tables and per-page dispatch, LED levels),
+`test_source_core.cpp` (the QSPI sample-blob decode), `test_findings.cpp`
+(code-review findings as regression guards) and `test_shy_fft.cpp` (the
+vendored FFT).
+
 ## Adding a test
 
 - A new DSP property → a `TEST_CASE` in `test_stretch_core.cpp`. Prefer an

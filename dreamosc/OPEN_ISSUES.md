@@ -44,6 +44,55 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
   `du` up, the refresh threshold (0.002 in position) or the minimum gap
   (4 × cost, ≥ 10 ms) is the knob.
 
+## Surfaced by the alpha4 cleanup review (open, not fixed)
+
+Found while reviewing the codebase for cleanup, deliberately NOT changed —
+each one alters what the instrument does or how it feels, so it is a decision
+and/or a bench item, not a cleanup. Recorded so they are not lost.
+
+- **The sample blob's rate is never applied.** `tools/wav2raw.py` promises
+  "the firmware reads the header and scales playback accordingly";
+  `decodeSampleBlob()` returns `rate` and `dreamosc.cpp` ignores it (and
+  `sd_source.h` returns `out_samplerate` that nothing consumes). A non-48 kHz
+  blob plays pitch-shifted. Applying it is a sound change.
+- **QSPI and SD disagree on the `Source` length rule.** QSPI wrap-pads to
+  `SOURCE_LEN` (10 s) and sets `len` to that; `sd_source.h` sets `len` to the
+  file's sample count. Position 0..1 spans different material under each, and
+  every step position tuned by ear so far is against the padded scale. Decide
+  the rule once (a shared `finishSource()` both loaders call) before wiring SD.
+- **Control poll is blocked behind renders** (`dreamosc.cpp` main loop): the
+  1 ms `processControls()` check sits between `service()` calls, so it waits
+  for the in-flight render — ~1.2 ms at 4096, 14.5 / 28.7 ms (single / pair)
+  at 16384. libDaisy's encoder debounce needs the A-phase low on two
+  consecutive calls, so a fast spin at 16384 can drop or mis-sign detents.
+  Fix: read the encoder + buttons from a 1 kHz timer IRQ below audio priority
+  into atomics. Sound-neutral. Verify with a detent counter on the KNOB line.
+- **Refresh-gap floor of one hop** (`stretch_core.h` `service()`:
+  `gap = max(4·cost, w/2, 480)`): a knob moved just after a refresh cannot
+  refresh again until a hop later, which can push the move one boundary
+  further out — worst case ~2 hops, not the 1 hop THEORY §7 states. Dropping
+  the `w/2` floor allows ≤4 refreshes/hop at 4096 (CPU has room). Depends on
+  the poll fix above. Verify `rfr` up, `du` 0, `slack` > 0.
+- **Armed-head pre-roll pairs re-render on every gap while the next step's
+  knob moves**, though only the last pair before `due` matters (28.7 ms of
+  throwaway work per gap at 16384). Defer an armed head's REFRESH until
+  `due − clock` is within ~8×cost.
+- **Tier-B refactors not done in the cleanup** (all sound-neutral by
+  construction but on the hot path; each wants a PROFILE session): pure
+  `chooseRender()` for the F5 size-change policy; `pickWork()` + a `CostModel`
+  out of `service()`; `render()` re-deriving `slack` after its F7 re-sync (a
+  hop of size-change latency in the plan/render race); snapshotting
+  `activeSteps` per block so F9's second site is dead by construction (one
+  rare input is not bit-identical — see the review); `nextOnset_` on the
+  Sequencer instead of `due_` on the Head; `gUnderruns`/`gClips` as Sequencer
+  members; `isArmedState(State)`; dead `Staged::stretchUsed/posUsed`;
+  `cosAtF` at the seam; interleaving/relocating the blend tables.
+- **Host tests run per-block housekeeping per SAMPLE** (`Sequencer::next()` =
+  `render(&s, 1)`), so they never exercise "a control landed mid-block" — the
+  window several of the items above live in. A block-32 `drive()` in the
+  harness (with `next()`/`patternSamples()` moved out of the core) is the
+  prerequisite for proving them.
+
 ## Code-review findings on the frame model (all remediated, all guarded)
 
 Each finding from the review of 6917a0a has a test in `test/test_findings.cpp`

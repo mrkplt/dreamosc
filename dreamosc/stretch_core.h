@@ -162,6 +162,11 @@ inline int ssClampW(int w) {
 inline int ssClampSteps(int n) {
   return n < 1 ? 1 : (n > SS_STEPS ? SS_STEPS : n);
 }
+// A source position in [0, 1): the last representable float below 1 keeps
+// `pos * len` inside the buffer.
+inline float ssClampPos(float p) {
+  return p < 0.0f ? 0.0f : (p >= 1.0f ? 0.999999f : p);
+}
 
 // Integer hash (lowbias32) and a two-word combiner; the per-frame phase seed is
 // hash(lifeSeed, frameIdx) so a re-render of the same frame with the same
@@ -286,9 +291,42 @@ class Head {
     int8_t   a, b;
     uint8_t  sizeIdx;
     double   travel;       // source-sample travel of the frame in `cur`
-    float    stretchUsed;
-    float    posUsed;
   };
+
+  static bool isArmedState(State s) { return s == ARMED || s == READY; }
+
+  // What to render, given where the head is and the slack it has -- the
+  // pure decision behind render(), including the F5 size-change policy:
+  //   armed            -> the pre-roll PAIR at the wanted size (travel 0:
+  //                       frame 0 sits at -hop, frame 1 at 0);
+  //   size changed     -> a PAIR at the new size if it can make this boundary
+  //                       (or nothing can: slack is already a full hop, so
+  //                       waiting gains nothing), else a SINGLE at the OLD
+  //                       size now (no hold) and the pair renders right after
+  //                       the boundary with a whole hop of slack;
+  //   otherwise        -> the next SINGLE at the current size.
+  // `stretchSafe` is the live stretch floored away from zero; the travel is
+  // half the chosen window (one hop of output) divided by it.
+  struct Choice { int8_t kind; int sizeIdx; double travel; };
+  static Choice chooseRender(bool armed, int wantSizeIdx, int curSizeIdx, double curTravel,
+                             uint32_t slack, uint32_t costNew, int hop, float stretchSafe) {
+    Choice c;
+    if (armed) {
+      c.kind = PAIR; c.sizeIdx = wantSizeIdx; c.travel = 0.0;
+      return c;
+    }
+    if (wantSizeIdx != curSizeIdx) {
+      uint32_t pairCost = 2 * costNew;
+      bool fits = slack > pairCost;
+      bool atMaxSlack = slack + 64 >= (uint32_t)hop;
+      if (fits || atMaxSlack) { c.kind = PAIR;   c.sizeIdx = wantSizeIdx; }
+      else                    { c.kind = SINGLE; c.sizeIdx = curSizeIdx; }
+    } else {
+      c.kind = SINGLE; c.sizeIdx = wantSizeIdx;
+    }
+    c.travel = curTravel + (double)(ssSizeW(c.sizeIdx) / 2) / (double)stretchSafe;
+    return c;
+  }
 
   void setBuffers(float* slice) {
     for (int i = 0; i < SS_FRAME_BUFS; i++) buf_[i] = slice + (size_t)i * SS_W;
@@ -319,7 +357,7 @@ class Head {
   // so a relaxed load is correct and avoids a DMB per head per sample.
   State stateIsr() const { return (State)state_.load(std::memory_order_relaxed); }
   bool  isFree() const { return state() == FREE; }
-  bool  isArmed() const { State s = state(); return s == ARMED || s == READY; }
+  bool  isArmed() const { return isArmedState(state()); }
   int   step() const { return step_; }
 
   // FREE -> ARMED. Drains any stale descriptors (the ISR is the queue consumer,
@@ -391,7 +429,7 @@ class Head {
     uint32_t applied = applied_.load(std::memory_order_relaxed);
     uint32_t keep = head;                // default: nothing valid, drop all
     for (uint32_t i = tail; i != head; i++) {
-      const Staged& d = q_[i & (SS_DESCQ - 1)];
+      const Staged& d = qAt(i);
       if (d.life == life && d.frameIdx == applied + 1) keep = i;
     }
     if (keep != tail) qTail_.store(keep, std::memory_order_release);
@@ -413,7 +451,7 @@ class Head {
     }
     uint32_t applied = applied_.load(std::memory_order_acquire);
     if (applied != lastApplied_) {       // the ISR consumed a staged frame
-      const Staged& d = q_[appliedSlot_.load(std::memory_order_relaxed) & (SS_DESCQ - 1)];
+      const Staged& d = qAt(appliedSlot_.load(std::memory_order_relaxed));
       curTravel_ = d.travel;
       curSizeIdx_ = d.sizeIdx;
       lastApplied_ = applied;
@@ -432,7 +470,7 @@ class Head {
     if (st == FREE) return NONE;
     syncApplied(clock);
     uint32_t applied = lastApplied_;
-    bool armed = (st == ARMED || st == READY);
+    bool armed = isArmedState(st);
     if (armed) deadline = due_.load(std::memory_order_relaxed);
     else       deadline = clock + (h_ - phase_);
     bool pending = stagedFrame_ > applied;
@@ -467,38 +505,16 @@ class Head {
     uint32_t applied = lastApplied_;
     bool pending = stagedFrame_ > applied;
     uint32_t frameIdx = pending ? stagedFrame_ : applied + 1;
-    bool armed = (st == ARMED || st == READY);
 
+    float st_ = stretch > 0.01f ? stretch : 0.01f;
+    Choice c = chooseRender(isArmedState(st), sizeIdx, curSizeIdx_, curTravel_,
+                            slack, costNew, h_, st_);
+    sizeIdx = c.sizeIdx;
     Staged d;
     d.life = life;
     d.frameIdx = frameIdx;
-    d.stretchUsed = stretch;
-    d.posUsed = pos;
-    float st_ = stretch > 0.01f ? stretch : 0.01f;
-    if (armed) {                         // pre-roll pair: frame 0 at -hop, frame 1 at 0
-      d.kind = PAIR;
-      d.travel = 0.0;
-    } else if (sizeIdx != curSizeIdx_) {
-      // Size change: a pair at the new size. If that pair cannot make this
-      // boundary but could make one from a full hop, play it safe (F5): stage
-      // a SINGLE at the OLD size now (no hold) and let the pair render right
-      // after the boundary with a whole hop of slack. If a pair cannot fit in
-      // a full hop either, waiting gains nothing: render it now.
-      uint32_t pairCost = 2 * costNew;
-      bool fits = slack > pairCost;
-      bool atMaxSlack = slack + 64 >= (uint32_t)h_;
-      if (fits || atMaxSlack) {
-        d.kind = PAIR;
-        d.travel = curTravel_ + (double)(w / 2) / (double)st_;
-      } else {
-        sizeIdx = curSizeIdx_;
-        d.kind = SINGLE;
-        d.travel = curTravel_ + (double)(ssSizeW(sizeIdx) / 2) / (double)st_;
-      }
-    } else {
-      d.kind = SINGLE;
-      d.travel = curTravel_ + (double)(w / 2) / (double)st_;
-    }
+    d.kind = c.kind;
+    d.travel = c.travel;
     d.sizeIdx = (uint8_t)sizeIdx;
     double hop = (double)(ssSizeW(sizeIdx) / 2) / (double)st_;
 
@@ -513,7 +529,7 @@ class Head {
     if (head - tail >= SS_DESCQ - 1) return 0;    // no queue room (never in practice)
     bool used[SS_FRAME_BUFS] = {false};
     for (uint32_t i = tail; i != head; i++) {
-      const Staged& q = q_[i & (SS_DESCQ - 1)];
+      const Staged& q = qAt(i);
       if (q.a >= 0) used[q.a] = true;
       if (q.b >= 0) used[q.b] = true;
     }
@@ -544,7 +560,7 @@ class Head {
     // is for a dead life. Do not publish (syncApplied resets on the next pass).
     if (life_.load(std::memory_order_acquire) != life) return 0;
     if (state() == FREE) return 0;
-    q_[head & (SS_DESCQ - 1)] = d;
+    qAt(head) = d;
     qHead_.store(head + 1, std::memory_order_release);
     // READY is a hint for the ISR (goLive validates the queue itself). CAS from
     // ARMED so a head the ISR freed meanwhile can never be marked READY.
@@ -565,12 +581,7 @@ class Head {
 
   // Live base position for this life: the step's position plus the drift
   // offset drawn at arm, clamped.
-  float basePos(float stepPos) const {
-    float p = stepPos + driftOff_;
-    if (p < 0.0f) p = 0.0f;
-    if (p >= 1.0f) p = 0.999999f;
-    return p;
-  }
+  float basePos(float stepPos) const { return ssClampPos(stepPos + driftOff_); }
 
   uint32_t holds() const { return holds_; }
   int hop() const { return h_; }
@@ -580,7 +591,7 @@ class Head {
   int  dbgCurIdx() const { return curIdx_.load(std::memory_order_relaxed); }
   int  dbgLastPick() const { return dbgLastPick_; }
   bool dbgPending() const { return stagedFrame_ > lastApplied_; }
-  int  dbgPendingKind() const { return q_[(qHead_.load(std::memory_order_relaxed) - 1) & (SS_DESCQ - 1)].kind; }
+  int  dbgPendingKind() const { return qAt(qHead_.load(std::memory_order_relaxed) - 1).kind; }
   uint32_t dbgDue() const { return due_.load(std::memory_order_relaxed); }
   uint32_t dbgQueued() const { return qHead_.load(std::memory_order_relaxed) - qTail_.load(std::memory_order_relaxed); }
   // Queued descriptors the ISR will discard (frame already applied, or a
@@ -591,20 +602,25 @@ class Head {
     uint32_t life = life_.load(std::memory_order_relaxed);
     for (uint32_t i = qTail_.load(std::memory_order_relaxed);
          i != qHead_.load(std::memory_order_relaxed); i++) {
-      const Staged& d = q_[i & (SS_DESCQ - 1)];
+      const Staged& d = qAt(i);
       if (d.life != life || d.frameIdx <= applied) n++;
     }
     return n;
   }
 #endif
-  // Would the next render at window w be a pair (two frames)? Armed heads
-  // always render a pre-roll pair; a gated head does when the size changes.
+  // Could the next render at window w be a pair (two frames)? Armed heads
+  // always render a pre-roll pair; a gated head does when the size changes
+  // (the worst case for budgeting -- chooseRender() may still fall back to a
+  // SINGLE at the old size when the slack is short).
   bool nextIsPair(int w) const {
-    State st = state();
-    return st == ARMED || st == READY || ssSizeIdx(w) != curSizeIdx_;
+    return isArmedState(state()) || ssSizeIdx(w) != curSizeIdx_;
   }
 
  private:
+  // The descriptor ring is indexed by an unbounded counter.
+  Staged&       qAt(uint32_t i)       { return q_[i & (SS_DESCQ - 1)]; }
+  const Staged& qAt(uint32_t i) const { return q_[i & (SS_DESCQ - 1)]; }
+
   // ISR: pop everything queued, apply the LAST valid descriptor for the next
   // frame (a refresh supersedes the original). Returns false if none.
   bool applyStaged(bool requirePair) {
@@ -614,7 +630,7 @@ class Head {
     uint32_t head = qHead_.load(std::memory_order_acquire);
     int pick = -1;
     for (uint32_t i = tail; i != head; i++) {
-      const Staged& d = q_[i & (SS_DESCQ - 1)];
+      const Staged& d = qAt(i);
       if (d.life != life || d.frameIdx != applied + 1) continue;
       if (requirePair && d.kind != PAIR) continue;
       pick = (int)i;
@@ -623,7 +639,7 @@ class Head {
       if (!requirePair) qTail_.store(head, std::memory_order_release);
       return false;
     }
-    const Staged& d = q_[(uint32_t)pick & (SS_DESCQ - 1)];
+    const Staged& d = qAt((uint32_t)pick);
     int sizeIdx = d.sizeIdx;
     if (d.kind == PAIR) {
       old_ = buf_[d.a]; cur_ = buf_[d.b];
@@ -706,6 +722,40 @@ class Head {
 };
 
 // ---------------------------------------------------------------------------
+// CostModel - per-size render cost, in ISR samples per frame. Seeded from
+// SS_COST_COEFF, then tracked as a recent MAX with a slow decay (an outlier
+// does not poison refreshes forever; a quiet stretch lets it relax). The
+// scheduler's slack and refresh rules are judged against it. Main-loop-owned.
+// ---------------------------------------------------------------------------
+
+struct CostModel {
+  uint32_t samples[SS_NSIZES];
+
+  void seed() {
+    for (int s = 0; s < SS_NSIZES; s++) {
+      int w = ssSizeW(s);
+      samples[s] = (uint32_t)(SS_COST_COEFF * w * ssLog2(w)) + 16;
+    }
+  }
+  uint32_t at(int sizeIdx) const { return samples[sizeIdx]; }
+  void set(int sizeIdx, uint32_t v) {
+    if (sizeIdx < 0 || sizeIdx >= SS_NSIZES) return;
+    samples[sizeIdx] = v < 16 ? 16 : v;
+  }
+  // A render of `frames` frames at `sizeIdx` took `took` ISR samples. took ==
+  // 0 means the clock did not move, i.e. no information (the host harness):
+  // leave the estimate alone.
+  void observe(int sizeIdx, uint32_t took, int frames) {
+    if (frames <= 0 || took == 0) return;
+    uint32_t per = took / (uint32_t)frames;
+    uint32_t c = samples[sizeIdx];
+    c -= c >> 6;
+    if (per > c) c = per;
+    samples[sizeIdx] = c < 16 ? 16 : c;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // Sequencer - the READ clock (ISR) and the render scheduler (main loop).
 // ---------------------------------------------------------------------------
 
@@ -740,12 +790,7 @@ class Sequencer {
     elapsed_ = 0; seamStart_ = 0; fadeLen_ = 0;
     clock_.store(0, std::memory_order_relaxed);
     late_ = 0;
-    for (int s = 0; s < SS_NSIZES; s++) {
-      int w = ssSizeW(s);
-      // Seed the cost model (SS_COST_COEFF: ~18 ms at 16384, the old-clock
-      // bench number; conservative until measured).
-      costSamples_[s] = (uint32_t)(SS_COST_COEFF * w * ssLog2(w)) + 16;
-    }
+    cost_.seed();
     minSlack_ = 0x7fffffff;
     refreshes_ = 0;
   }
@@ -789,23 +834,17 @@ class Sequencer {
   // Seed/override the per-size render cost estimate (samples per frame). The
   // firmware may seed it from bench numbers; the costed host harness pins it
   // to the cost it charges (F2), since the host ISR clock cannot measure it.
-  void setCostEstimate(int sizeIdx, uint32_t samples) {
-    if (sizeIdx < 0 || sizeIdx >= SS_NSIZES) return;
-    costSamples_[sizeIdx] = samples < 16 ? 16 : samples;
-  }
+  void setCostEstimate(int sizeIdx, uint32_t samples) { cost_.set(sizeIdx, samples); }
 
-  // One unit of work: the most urgent render. Returns the number of frames
-  // rendered (0 = nothing to do or nothing published).
-  int service() {
-    uint32_t clock = clock_.load(std::memory_order_relaxed);
-    int w = ssClampW(frameSize);
-    int bestReq = -1, bestRef = -1;
+  // The most urgent REQUIRED and REFRESH candidates, earliest deadline first
+  // (strict: on equal deadlines the lower pool index wins, which is what keeps
+  // render order -- and so the cost-model updates -- deterministic).
+  struct Work {
+    int req = -1, ref = -1;
     uint32_t reqDl = 0, refDl = 0;
-    // Refresh gap: one per hop per head, and never faster than the render
-    // itself can turn around (F8).
-    uint32_t gap = 4 * costSamples_[ssSizeIdx(w)];
-    if (gap < (uint32_t)(w / 2)) gap = (uint32_t)(w / 2);
-    if (gap < 480) gap = 480;
+  };
+  Work pickWork(uint32_t clock, int w, uint32_t gap) {
+    Work k;
     for (int i = 0; i < SS_HEADS; i++) {
       Head& h = head_[i];
       if (h.isFree()) continue;
@@ -813,56 +852,65 @@ class Sequencer {
       uint32_t dl;
       Head::Want want = h.plan(clock, w, stretch, pos, dl, gap);
       if (want == Head::REQUIRED) {
-        if (bestReq < 0 || (int32_t)(dl - reqDl) < 0) { bestReq = i; reqDl = dl; }
+        if (k.req < 0 || (int32_t)(dl - k.reqDl) < 0) { k.req = i; k.reqDl = dl; }
       } else if (want == Head::REFRESH) {
-        if (bestRef < 0 || (int32_t)(dl - refDl) < 0) { bestRef = i; refDl = dl; }
+        if (k.ref < 0 || (int32_t)(dl - k.refDl) < 0) { k.ref = i; k.refDl = dl; }
       }
     }
+    return k;
+  }
+
+  // One unit of work: the most urgent render. Returns the number of frames
+  // rendered (0 = nothing to do or nothing published).
+  int service() {
+    uint32_t clock = clock_.load(std::memory_order_relaxed);
+    int w = ssClampW(frameSize);
+    uint32_t cost = cost_.at(ssSizeIdx(w));
+    // Refresh gap: one per hop per head, and never faster than the render
+    // itself can turn around (F8).
+    uint32_t gap = 4 * cost;
+    if (gap < (uint32_t)(w / 2)) gap = (uint32_t)(w / 2);
+    if (gap < 480) gap = 480;
+    Work k = pickWork(clock, w, gap);
     // A refresh may run only with slack: the worst recent cost for this size,
     // per frame rendered, with a 2x margin. A refresh that would miss its
     // boundary is worse than none (the original frame plays; the change lands
     // next hop).
-    uint32_t cost = costSamples_[ssSizeIdx(w)];
     bool refOk = false;
-    if (bestRef >= 0) {
-      int32_t slack = (int32_t)(refDl - clock);
-      uint32_t need = cost * (head_[bestRef].nextIsPair(w) ? 2u : 1u);
+    if (k.ref >= 0) {
+      int32_t slack = (int32_t)(k.refDl - clock);
+      uint32_t need = cost * (head_[k.ref].nextIsPair(w) ? 2u : 1u);
       refOk = slack > (int32_t)(2 * need);
     }
     int pick = -1;
     bool refresh = false;
-    if (bestReq >= 0) {
+    if (k.req >= 0) {
       // A gated head's required frame always wins (its deadline is within a
       // hop). An ARMED head's pre-roll pair is due a whole dwell away; letting
       // it pre-empt a slack-valid refresh would cost the knob a hop for no
       // gain, so it yields unless its due is within a few pair-costs.
-      bool farArmed = head_[bestReq].isArmed()
-                   && (int32_t)(reqDl - clock) > (int32_t)(8 * cost);
-      if (farArmed && refOk) { pick = bestRef; refresh = true; }
-      else                    pick = bestReq;
+      bool farArmed = head_[k.req].isArmed()
+                   && (int32_t)(k.reqDl - clock) > (int32_t)(8 * cost);
+      if (farArmed && refOk) { pick = k.ref; refresh = true; }
+      else                    pick = k.req;
     } else if (refOk) {
-      pick = bestRef; refresh = true;
+      pick = k.ref; refresh = true;
     }
     if (pick < 0) return 0;
     Head& h = head_[pick];
     SS_HOOK(2, &h);
-    int32_t slack = (int32_t)((refresh ? refDl : reqDl) - clock);
+    int32_t slack = (int32_t)((refresh ? k.refDl : k.reqDl) - clock);
     if (slack < minSlack_) minSlack_ = slack;
     uint32_t t0 = clock_.load(std::memory_order_relaxed);
     int s = -1;
+    // basePos is recomputed here rather than carried from pickWork(): the ISR
+    // may free and re-arm this head (a new life, a new drift offset) between
+    // the two, and render() then publishes for the NEW life. Reading it at
+    // render time is what keeps a stale offset from ever being staged.
     int frames = h.render(clock, w, stretch, h.basePos(position[h.step()]),
                           slack < 0 ? 0u : (uint32_t)slack, cost, s);
     uint32_t took = clock_.load(std::memory_order_relaxed) - t0;
-    if (frames > 0 && took > 0) {
-      // Per-frame cost, recent max with slow decay: an outlier does not
-      // poison refreshes forever. (took == 0 means the clock did not move,
-      // i.e. no information -- the host harness; leave the estimate alone.)
-      uint32_t per = took / (uint32_t)frames;
-      uint32_t c = costSamples_[s];
-      c -= c >> 6;
-      if (per > c) c = per;
-      costSamples_[s] = c < 16 ? 16 : c;
-    }
+    cost_.observe(s, took, frames);
     if (frames > 0 && refresh) refreshes_++;
     return frames;
   }
@@ -874,10 +922,7 @@ class Sequencer {
   }
   int armedHeads() const {
     int n = 0;
-    for (int i = 0; i < SS_HEADS; i++) {
-      Head::State s = head_[i].state();
-      if (s == Head::ARMED || s == Head::READY) n++;
-    }
+    for (int i = 0; i < SS_HEADS; i++) if (head_[i].isArmed()) n++;
     return n;
   }
   uint32_t holds() const {
@@ -894,7 +939,7 @@ class Sequencer {
     return n;
   }
   uint32_t refreshes() const { return refreshes_; }
-  uint32_t costSamples(int sizeIdx) const { return costSamples_[sizeIdx]; }
+  uint32_t costSamples(int sizeIdx) const { return cost_.at(sizeIdx); }
   // Min slack (samples to deadline at render start) since last call; resets.
   int32_t takeMinSlack() { int32_t m = minSlack_; minSlack_ = 0x7fffffff; return m; }
   uint32_t clock() const { return clock_.load(std::memory_order_relaxed); }
@@ -956,8 +1001,8 @@ class Sequencer {
         elapsed_++;
       } else {
         float t = 256.0f * (float)fp / (float)fadeLen_;
-        float fin  = gTab.sinAtF(t);
-        float fout = gTab.sinAtF(256.0f + t);
+        float fin  = gTab.sinAtF(t);      // equal-power: sin in, cos out
+        float fout = gTab.cosAtF(t);
         sum = head_[inc_].tick() * fin + head_[cur_].tick() * fout;
         elapsed_++;
       }
@@ -989,9 +1034,7 @@ class Sequencer {
     }
     // Life seed from the (drift-adjusted) position at arm, so the same position
     // always yields the same phases: zero drift is a literal repeat.
-    float p = position[step] + off;
-    if (p < 0.0f) p = 0.0f;
-    if (p >= 1.0f) p = 0.999999f;
+    float p = ssClampPos(position[step] + off);
     uint32_t lifeSeed = seed_ ^ (uint32_t)(p * 4294967295.0);
     head_[h].alloc(step, lifeSeed, off, clock + samplesToNextOnset(onset));
     nxt_ = h; nxtStep_ = step;
@@ -1030,7 +1073,7 @@ class Sequencer {
   int nxtStep_ = 0;
   uint32_t late_ = 0;
   // Main-loop-owned scheduler state.
-  uint32_t costSamples_[SS_NSIZES];
+  CostModel cost_;
   int32_t  minSlack_ = 0x7fffffff;
   uint32_t refreshes_ = 0;
 };

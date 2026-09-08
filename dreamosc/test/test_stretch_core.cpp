@@ -557,3 +557,54 @@ TEST_CASE("drift perturbs position within bounds and stays reproducible") {
   REQUIRE(differs);
   for (float v : a) REQUIRE(std::isfinite(v));
 }
+
+// --- pure scheduler pieces (extracted so they can be tested directly) -------
+
+TEST_CASE("chooseRender: the F5 size-change policy as a decision table") {
+  using C = Head::Choice;
+  const int cur = ssSizeIdx(4096), want = ssSizeIdx(16384);
+  const uint32_t costNew = 880;              // ~ the 16384 seed
+  // Armed: always the pre-roll pair at the wanted size, travel 0.
+  C a = Head::chooseRender(true, want, cur, 123.0, 0, costNew, 2048, 50.0f);
+  REQUIRE(a.kind == Head::PAIR); REQUIRE(a.sizeIdx == want); REQUIRE(a.travel == 0.0);
+  // Same size: the next single, one hop of travel at the current size.
+  C s = Head::chooseRender(false, cur, cur, 100.0, 2000, 200, 2048, 50.0f);
+  REQUIRE(s.kind == Head::SINGLE); REQUIRE(s.sizeIdx == cur);
+  REQUIRE(s.travel == 100.0 + 2048.0 / 50.0);
+  // Size change with room for the pair before the boundary: pair, new size.
+  C fits = Head::chooseRender(false, want, cur, 100.0, 2 * costNew + 1, costNew, 2048, 50.0f);
+  REQUIRE(fits.kind == Head::PAIR); REQUIRE(fits.sizeIdx == want);
+  REQUIRE(fits.travel == 100.0 + 8192.0 / 50.0);
+  // Size change, pair would miss, slack short of a full hop: SINGLE at the OLD
+  // size now (no hold); the pair renders after the boundary.
+  C miss = Head::chooseRender(false, want, cur, 100.0, 2 * costNew, costNew, 2048, 50.0f);
+  REQUIRE(miss.kind == Head::SINGLE); REQUIRE(miss.sizeIdx == cur);
+  REQUIRE(miss.travel == 100.0 + 2048.0 / 50.0);
+  // Size change, pair would miss, but slack is already (within 64 of) a full
+  // hop: waiting gains nothing, render the pair now.
+  C now = Head::chooseRender(false, want, cur, 100.0, 2048 - 64, costNew, 2048, 50.0f);
+  REQUIRE(now.kind == Head::PAIR); REQUIRE(now.sizeIdx == want);
+}
+
+TEST_CASE("CostModel: seeded per size, recent max with slow decay, floored, no-info ignored") {
+  CostModel m; m.seed();
+  for (int s = 0; s < SS_NSIZES; s++) {
+    int w = ssSizeW(s);
+    REQUIRE(m.at(s) == (uint32_t)(SS_COST_COEFF * w * ssLog2(w)) + 16);
+  }
+  uint32_t seeded = m.at(2);
+  m.observe(2, 0, 1);                        // took 0: the clock did not move
+  REQUIRE(m.at(2) == seeded);
+  m.observe(2, 5, 0);                        // nothing rendered
+  REQUIRE(m.at(2) == seeded);
+  m.observe(2, 4000, 2);                     // 2000 per frame > estimate: jump up
+  REQUIRE(m.at(2) == 2000);
+  m.observe(2, 10, 1);                       // cheap render: decay by 1/64
+  REQUIRE(m.at(2) == 2000 - (2000 >> 6));
+  m.set(2, 3);                               // floor 16
+  REQUIRE(m.at(2) == 16);
+  m.set(-1, 999); m.set(SS_NSIZES, 999);     // out of range: ignored
+  REQUIRE(m.at(2) == 16);
+  m.observe(2, 1, 1);
+  REQUIRE(m.at(2) == 16);                    // decay never goes below the floor
+}

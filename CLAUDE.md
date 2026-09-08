@@ -441,7 +441,10 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   `HLTH` line (gated/armed heads, service µs, per-render `avg_us` and
   `max_us`, ISR µs, frame holds `du`, `late` samples, re-renders `rfr`, output
   `clip` count, min `slack` to deadline) plus a `COST` line (per-size render
-  `cost`, stack high-water) — split because the combined line overran
+  `cost`, stack high-water, `isr_max` = worst single audio callback, and
+  `crc` = a boot fingerprint of a fixed-config render so two firmware builds
+  can be proven sample-identical ON THE BOARD, see OPEN_ISSUES.md) — split
+  because the combined line overran
   libDaisy's 128-byte Logger buffer — all as scaled integers (nano-newlib
   printf can't do floats). Timing uses raw `GetTick()`
   deltas: `System::GetUs()` wraps every 21.5 s and poisoned the old numbers

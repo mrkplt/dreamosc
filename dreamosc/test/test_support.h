@@ -76,6 +76,32 @@ inline std::vector<float> render(Sequencer& seq, int passes = 1) {
   return drive(seq, seq.patternSamples() * passes, [](uint32_t) {});
 }
 
+// DEVICE CADENCE: drive for `total` samples in blocks of `block` (the audio
+// callback's render(buf, n)), calling `hook(n)` then `produce(n)` before each
+// block. This is the cadence the per-block ISR housekeeping (superseded-frame
+// drain, armed-head deadline, step-count shrink) actually runs at on the Pod;
+// drive() above runs it per SAMPLE and so never sees the queue hold more than
+// one descriptor between drains. Controls poked from `hook` land at block
+// boundaries, exactly as on the device (the main loop cannot preempt the ISR).
+template <typename F, typename P>
+inline std::vector<float> drive_blocks(Sequencer& seq, uint32_t total, int block,
+                                       F hook, P produce) {
+  std::vector<float> out; out.reserve(total);
+  std::vector<float> buf((size_t)block);
+  for (uint32_t n = 0; n < total; n += (uint32_t)block) {
+    hook(n);
+    produce(n);
+    int m = (int)(total - n < (uint32_t)block ? total - n : (uint32_t)block);
+    seq.render(buf.data(), m);
+    out.insert(out.end(), buf.begin(), buf.begin() + m);
+  }
+  return out;
+}
+template <typename F>
+inline std::vector<float> drive_blocks(Sequencer& seq, uint32_t total, int block, F hook) {
+  return drive_blocks(seq, total, block, hook, [&](uint32_t) { drain(seq); });
+}
+
 // COST-MODELLED producer: each FRAME rendered at window size w charges
 // cost(w) = costPerNLogN * w * log2(w) samples of main-loop time, and the
 // producer only gets `block` samples of time per `block` samples of playback.

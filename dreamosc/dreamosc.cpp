@@ -66,7 +66,18 @@ volatile uint32_t gClips = 0;
 // delta since its last print (a shared "add then reset" was a lost update).
 #include <stdio.h>   // snprintf for the POS/DRF lines
 static volatile uint32_t profIsrTicksTotal = 0;
+// Worst single audio callback since the last print (ISR writes the max, the
+// main loop reads then zeroes it; a callback landing between those two is the
+// one value that can be lost -- acceptable for a per-second diagnostic).
+static volatile uint32_t profIsrMaxTicks = 0;
 static uint32_t profTicksPerUs = 1;
+// Boot fingerprint: CRC-32 of a fixed-config render taken before audio starts
+// (renderFingerprint in stretch_core.h). Two firmware builds that print the
+// same crc render the same samples on the board; the host goldens cannot say
+// that (the M7 fuses multiply-adds). Fixed config, independent of the boot
+// values: stretch 50x, dwell 0.5 s, fade 0.5, 3 steps, window 4096, 1.5 s.
+static uint32_t profBootCrc = 0;
+static constexpr uint32_t PROF_CRC_SAMPLES = 72000;
 static inline uint32_t profUs(uint32_t ticks) { return ticks / profTicksPerUs; }
 
 // Deepest stack use observed (bytes below _estack). The stack grows down from
@@ -366,13 +377,18 @@ static void profilePrint() {
       (unsigned)(late - prof.lastLate), (unsigned)(rfr - prof.lastRefresh),
       (unsigned)(gClips - prof.lastClip),
       (int)seq.takeMinSlack());
+  // isr_max = worst single audio callback this second (the seam case: two
+  // gated heads blending); crc = the boot fingerprint (see profBootCrc).
+  uint32_t isrMax = profIsrMaxTicks;
+  profIsrMaxTicks = 0;
   pod.seed.PrintLine(
-      "COST 16384=%u 8192=%u 4096=%u 2048=%u 1024=%u 512=%u 256=%u stk=%u",
+      "COST 16384=%u 8192=%u 4096=%u 2048=%u 1024=%u 512=%u 256=%u stk=%u isr_max=%u crc=%08lx",
       (unsigned)seq.costSamples(0), (unsigned)seq.costSamples(1),
       (unsigned)seq.costSamples(2), (unsigned)seq.costSamples(3),
       (unsigned)seq.costSamples(4), (unsigned)seq.costSamples(5),
       (unsigned)seq.costSamples(6),
-      (unsigned)profStackUsed());
+      (unsigned)profStackUsed(), (unsigned)profUs(isrMax),
+      (unsigned long)profBootCrc);
   prof.lastUnder = gUnderruns; prof.lastClip = gClips;
   prof.lastLate = late; prof.lastRefresh = rfr;
   prof.busyTicks = prof.units = 0;
@@ -403,7 +419,9 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
     }
   }
 #ifdef PROFILE
-  profIsrTicksTotal += System::GetTick() - t0;   // ISR-only writer; main reads deltas
+  uint32_t d = System::GetTick() - t0;
+  profIsrTicksTotal += d;                        // ISR-only writer; main reads deltas
+  if (d > profIsrMaxTicks) profIsrMaxTicks = d;
 #endif
 }
 
@@ -429,6 +447,16 @@ int main(void) {
   src.len  = SOURCE_LEN;
 
   seq.init(&src, pod.AudioSampleRate(), voicePool);
+#ifdef PROFILE
+  // Boot fingerprint (see profBootCrc): a fixed-config render with audio still
+  // stopped, so service()/render() run strictly sequentially, exactly as the
+  // host harness does. Then init() again so the audible state is untouched.
+  seq.stretch = 50.0f; seq.duration = 0.5f; seq.fade = 0.5f;
+  seq.setSteps(3); seq.setFrame(4096);
+  profBootCrc = renderFingerprint(seq, monoBlock, (int)AUDIO_BLOCK, PROF_CRC_SAMPLES);
+  seq.init(&src, pod.AudioSampleRate(), voicePool);
+  gUnderruns = 0; gClips = 0;
+#endif
   // Starting values; the knobs/encoder take over from here (see processControls).
   // Pickup applies from boot: a knob takes over its parameter only after it has
   // physically moved (PanelEditor), so these hold until the pots are touched.

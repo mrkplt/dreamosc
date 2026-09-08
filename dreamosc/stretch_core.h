@@ -306,6 +306,7 @@ class Head {
     qTail_.store(0, std::memory_order_relaxed);
     due_.store(0, std::memory_order_relaxed);
     phase_ = 0; h_ = 0; old_ = cur_ = nullptr; A_ = C_ = nullptr;
+    holds_ = 0;
     seenLife_ = 0;
   }
 
@@ -1033,5 +1034,35 @@ class Sequencer {
   int32_t  minSlack_ = 0x7fffffff;
   uint32_t refreshes_ = 0;
 };
+
+// ---------------------------------------------------------------------------
+// Fingerprint: render `samples` of a configured Sequencer at the device
+// cadence (service() drained before every `n`-sample render(), the audio
+// callback's shape) and CRC-32 the output's bit patterns. Same build + same
+// config -> same CRC. The firmware prints it (PROFILE `crc=`) so two firmware
+// builds can be compared ON THE BOARD, where the host goldens do not apply
+// (the M7 build fuses multiply-adds; the host build does not). Leaves the
+// Sequencer mid-stream: init() it again afterwards.
+// ---------------------------------------------------------------------------
+
+inline uint32_t ssCrc32(uint32_t crc, const void* data, size_t n) {
+  const uint8_t* p = (const uint8_t*)data;
+  for (size_t i = 0; i < n; i++) {
+    crc ^= p[i];
+    for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+  }
+  return crc;
+}
+
+inline uint32_t renderFingerprint(Sequencer& seq, float* block, int n, uint32_t samples) {
+  uint32_t crc = 0xFFFFFFFFu;
+  for (uint32_t done = 0; done < samples; done += (uint32_t)n) {
+    for (int g = 0; g < 64 && seq.service(); g++) {}
+    int m = (int)(samples - done < (uint32_t)n ? samples - done : (uint32_t)n);
+    seq.render(block, m);
+    crc = ssCrc32(crc, block, (size_t)m * sizeof(float));
+  }
+  return ~crc;
+}
 
 #endif  // STRETCH_CORE_H

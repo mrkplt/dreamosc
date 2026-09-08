@@ -87,11 +87,27 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   Sequencer instead of `due_` on the Head; `gUnderruns`/`gClips` as Sequencer
   members; `isArmedState(State)`; dead `Staged::stretchUsed/posUsed`;
   `cosAtF` at the seam; interleaving/relocating the blend tables.
-- **Host tests run per-block housekeeping per SAMPLE** (`Sequencer::next()` =
-  `render(&s, 1)`), so they never exercise "a control landed mid-block" — the
-  window several of the items above live in. A block-32 `drive()` in the
-  harness (with `next()`/`patternSamples()` moved out of the core) is the
-  prerequisite for proving them.
+- ~~Host tests run per-block housekeeping per SAMPLE~~ — done:
+  `test/test_block_cadence.cpp` drives the core at the device's `render(buf,
+  32)` cadence (`drive_blocks` in `test_support.h`). Finding: after go-live the
+  block-32 and per-sample renders are **bit-identical** under a drained
+  producer (the housekeeping cadence changes when a descriptor is dropped or a
+  deadline restated, never which frame plays); the only cadence-dependent
+  moment is startup, where the first block is `late` silence because the
+  producer cannot run inside a block (go-live at sample 32 vs 1). The
+  scheduling-sensitive cases (F3, F9, the 16384 crossfade march, the
+  live-control latencies) pass at block cadence. Note there is no "control
+  landed mid-block" window on the device either: the main loop is the only
+  writer of the controls and cannot preempt the ISR, so a control is constant
+  for a whole `render()`.
+- **On-board fingerprint.** `make PROFILE=1` now prints `crc=` on the COST
+  line: a CRC-32 of a fixed-config 1.5 s render taken at boot with audio
+  stopped (`renderFingerprint()` in `stretch_core.h`, pinned to the harness by
+  a test). Two firmware builds that print the same `crc` render the same
+  samples on the board — the host goldens cannot say that (the M7 build fuses
+  multiply-adds, the host build does not). Procedure: flash the reference
+  build, read `crc`, flash the candidate, compare. `isr_max` (worst single
+  audio callback, µs) is on the same line for the seam-cost bench item above.
 
 ## Code-review findings on the frame model (all remediated, all guarded)
 

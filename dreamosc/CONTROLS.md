@@ -144,5 +144,5 @@ the testing-culture note in `../CLAUDE.md`.
 ## Diagnostics
 
 `make PROFILE=1` prints the full control + instrument state over USB serial each
-second (`SET`/`KNOB`/`POS`/`DRF`/`HLTH` lines). Every variable parameter must
+second (`SET`/`KNOB`/`POS`/`DRF`/`HLTH`/`COST` lines). Every variable parameter must
 appear there — see the profiler directive in `../CLAUDE.md`.

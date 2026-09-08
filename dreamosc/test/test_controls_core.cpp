@@ -15,7 +15,7 @@
 
 namespace {
 
-// A Sequencer to write into; StepEditor needs its position[]/drift[].
+// A Sequencer to write into; PanelEditor needs its position[]/drift[].
 Sequencer& fresh_seq() {
   static std::vector<float> pool(SS_POOL_FLOATS);
   static Sequencer seq;
@@ -156,7 +156,8 @@ TEST_CASE("pickup engages on a SLOW sweep (reference must not chase the pot)") {
 }
 
 TEST_CASE("pickup re-anchors on slot change: globals work after returning from a step") {
-  // Regression: r1Last_ (the move-detection reference) is shared across slots.
+  // Regression: the move-detection reference (now k1Anchor_, frozen at slot
+  // entry; r1Prev_ is only the per-poll speed reference) is shared across slots.
   // Without re-anchoring on a slot switch, it carried over stale -- a step left
   // the knob at 1.0, then GLOBAL compared against 1.0 and pickup never
   // re-engaged, so global duration/drift silently stopped working after
@@ -167,7 +168,7 @@ TEST_CASE("pickup re-anchors on slot change: globals work after returning from a
   pe.prime(0.0f, 0.0f);
 
   // In a STEP, drive knob1 all the way to 1.0 -- this leaves the shared move
-  // reference (r1Last_) at 1.0. (Stationary re-anchor pass, then move.)
+  // reference (k1Anchor_) at 1.0. (Stationary re-anchor pass, then move.)
   pe.advance();                                       // step 1
   pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f);  // re-anchor at 0
   pe.update(seq, &dur, &gd, 1.0f, 0.0f, 1.0f, 0.0f);  // move 0->1.0: pos -> 1.0
@@ -179,7 +180,7 @@ TEST_CASE("pickup re-anchors on slot change: globals work after returning from a
   float durBefore = dur;
   pe.update(seq, &dur, &gd, 1.0f, 0.0f, 1.0f, 0.0f);
   REQUIRE(dur == Approx(durBefore));
-  // Move the knob down to 0.5. WITHOUT the slot-change re-anchor, r1Last_ was
+  // Move the knob down to 0.5. WITHOUT the slot-change re-anchor, the anchor was
   // still 1.0 from the step, |1.0-1.0|=0 that first stationary pass updated it,
   // and the interaction left global pickup unreliable. With the fix, this
   // deliberate move engages and duration follows.

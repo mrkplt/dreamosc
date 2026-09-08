@@ -11,7 +11,7 @@ DAISYSP_DIR  = ../DaisySP
 # Built for the Daisy bootloader, which we need because the STM32 ROM bootloader
 # exposes no QSPI DFU target and sample audio has to live in QSPI (see CLAUDE.md).
 # BOOT_SRAM runs from internal SRAM: comparable speed to internal flash, 480 KB
-# limit (we use ~90 KB). Do NOT use BOOT_QSPI -- executing from QSPI is
+# limit (we use ~105 KB). Do NOT use BOOT_QSPI -- executing from QSPI is
 # "more cache-dependent" i.e. slower, a real risk for the audio callback.
 APP_TYPE = BOOT_SRAM
 

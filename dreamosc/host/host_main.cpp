@@ -1,14 +1,16 @@
 // host_main.cpp - compile stretch_core.h on a desktop compiler and render a
-// WAV, so the C++ DSP can be diffed against stretchseq.py before it ever
-// touches the Daisy. No Arduino/Daisy headers here; this is the whole point of
-// stretch_core.h having no platform dependencies.
+// WAV through the current core, for listening, for seam_probe.cpp, and for
+// golden-render comparisons before a change ever touches the Daisy. No
+// Arduino/Daisy headers here; this is the whole point of stretch_core.h having
+// no platform dependencies.
 //
 //   c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
 //   ./stretchcore in.wav out.wav [--stretch 50] [--duration 4] [--fade 0]
 //                 [--passes 1] [--seed 0x12345678]
 //
-// The step positions and the sample-by-sample drive loop mirror StretchSeq.ino
-// and the Sequencer, so what renders here is the same code path the Pod runs.
+// The sample-by-sample drive loop mirrors the device main loop (service()
+// drained, then one ISR sample), so what renders here is the same code path
+// the Pod runs.
 
 #include <cstdint>
 #include <cstdio>
@@ -19,8 +21,8 @@
 
 #include "stretch_core.h"
 
-// The three globals stretch_core.h externs. On the Pod these live in
-// StretchSeq.ino / dreamosc.cpp; on the host they live here.
+// The globals stretch_core.h externs. On the Pod these live in dreamosc.cpp;
+// on the host they live here.
 StretchTables gTab;
 float         gWork[SS_W];
 float         gSpec[SS_W];

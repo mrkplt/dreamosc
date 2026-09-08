@@ -182,7 +182,8 @@ known exactly (`h − phase`) and served earliest-deadline-first.
 - `arm-none-eabi-gcc` 15.3.1 — ARM cross-compiler (`brew install --cask gcc-arm-embedded`)
 - `dfu-util` 0.11 — flashes the H750 over USB DFU (`brew install dfu-util`)
 - `arduino-cli` 1.5.1 — present but NOT used here (we chose the native libDaisy path)
-- Host verification uses a Python venv at `dreamosc/host/.venv` (numpy)
+- Host verification is the Catch2 suite (`dreamosc/test/run.sh`); no Python
+  needed. (The old Python golden regression is retired — see `test/run.sh`.)
 
 **Path chosen: native libDaisy + Makefile, NOT DaisyDuino/Arduino.** The uploaded
 `StretchSeq.ino` was a DaisyDuino wrapper; we are porting its wiring to libDaisy.
@@ -234,8 +235,9 @@ dreamosc/
   Makefile            libDaisy build; targets ../libDaisy and ../DaisySP
   host/
     host_main.cpp     Host harness: WAV -> Sequencer -> WAV (defines the globals)
-    stretchseq.py     Python reference (origin convention; see note below)
-archive/              The original reference files, as delivered (see below)
+    seam_probe.cpp    RMS envelope around every raw-cut seam (see Host aids)
+archive/              The original reference files, as delivered (see below);
+                      the Python references (stretchseq.py, paulstretch.py) live here
 ```
 
 ## Build & flash
@@ -251,7 +253,7 @@ cd dreamosc/test && ./run.sh    # Catch2 unit tests over the *_core.h headers + 
 # Ad-hoc render (manual listening / debugging)
 cd dreamosc/host
 c++ -std=c++17 -O2 -I.. host_main.cpp -o stretchcore
-./stretchcore in.wav out.wav --stretch 50 --duration 4 --spread 1
+./stretchcore in.wav out.wav --stretch 50 --duration 4 --fade 0
 ```
 
 ### Tag discipline (hardware checkpoints)
@@ -397,12 +399,13 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   (pickup, mode navigation, drift-fold, encoder stepping, LED colors), and
   `shy_fft.h` (round-trips). Gates on exit code; the count grows with behavior —
   read it from the run, don't hardcode it here. See `dreamosc/test/README.md`.
-- **Pod firmware: WORKING on hardware through `alpha2`** (crossfade model,
-  detented stretch to 10000×, two-mode panel controls, PROFILE diagnostics).
-  The frame model (pre-roll, head pool, EDF rendering, live controls, 480 MHz,
-  block 32) is host-tested and links for the device but is NOT yet heard on
-  the bench — see `dreamosc/OPEN_ISSUES.md` for exactly what the bench owes.
-  See the tag discipline above and Fizzy for what's next.
+- **Pod firmware: WORKING on hardware through `alpha4`** (crossfade model,
+  detented stretch to 10000×, two-mode panel controls, PROFILE diagnostics,
+  and the frame model — pre-roll, head pool, EDF rendering, live controls,
+  480 MHz, block 32 — confirmed on the bench at a single sounding head, ring-out
+  removed). The multi-head crossfade march is what the bench still owes — see
+  `dreamosc/OPEN_ISSUES.md`. See the tag discipline above and Fizzy for what's
+  next.
 - **SD reader: written and compile-checked** against the real libDaisy API
   (`SdmmcHandler` + `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser,
   stereo->mono fold). Not yet run on hardware (no card yet — Fizzy #131). Source
@@ -459,7 +462,7 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   PaulXStretch's shimmer regime, #136); the runtime window is any power of two
   in `[SS_W_MIN, SS_W]` and **defaults to 4096** (`FRAME_DEFAULT_IDX`). Per Head:
   `SS_FRAME_BUFS = 6` frame buffers of `SS_W` floats (old, cur, a staged pair, a
-  refresh pair) = 384 KB; `SS_HEADS = 10` (cap 6 gated + 1 armed + slack) → the
+  refresh pair) = 384 KB; `SS_HEADS = 10` (3 live: cur + inc + armed, plus slack) → the
   head pool (~3.9 MB) lives in **SDRAM** (a plain float array `init()` carves),
   as do the **source buffer (~1.9 MB)** and the immutable tables (`gWindows`,
   `gBlendA`, `gBlendC`, ~255 KB, read sequentially so they cache well). SDRAM is
@@ -485,9 +488,11 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
 - **libDaisy + GCC 15.3 wrinkle:** `WavPlayer.h` throws a `[-Wtemplate-body]`
   error (`FileReader` vs `IReader`) when transitively included. It is upstream, not
   ours. Avoid pulling that header, or pin/patch it when building `dreamosc.cpp`.
-- **Two Pythons, one truth:** `paulstretch.py` is the older origin convention;
-  `stretchseq.py` + `stretch_core.h` are the current, matching pair. Verify against
-  `stretchseq.py`.
+- **The Python references are provenance, not a gate:** `archive/paulstretch.py`
+  is the older origin convention; `archive/stretchseq.py` is the reference the
+  C++ core was first ported from. The synthesis has since diverged to canonical
+  PaulXStretch and the Python golden regression is retired; the host truth is the
+  Catch2 suite plus the golden WAV renders from `host_main.cpp`.
 - **Host aids:** `host/host_main.cpp` renders a WAV through the current core
   (`--stretch/--duration/--fade`). `host/seam_probe.cpp` prints the RMS envelope
   around every raw-cut seam — the measurement that found the missing pre-roll;
@@ -499,4 +504,6 @@ Original reference files as delivered, kept verbatim for provenance:
 `paulstretch.py`, `stretchseq.py`, `stretchsequencerspec.md`, `stretch_core.h`,
 `shy_fft.h`, `StretchSeq.ino`. The working copies of `stretch_core.h` / `shy_fft.h`
 under `dreamosc/` are the ones the build uses; the archive copies are the untouched
-originals.
+originals. `archive/history/` holds our own superseded design/review documents
+(`PLAN_frames.md`, `REVIEW_responsiveness.md`), kept for the record; they describe
+code that no longer exists and are not current.

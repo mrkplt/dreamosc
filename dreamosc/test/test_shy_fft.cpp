@@ -1,7 +1,8 @@
 // Direct correctness tests for shy_fft.h (Emilie Gillet's real FFT), vendored
 // third-party code. No distinction from our own code for coverage purposes: it
 // runs on-device and a bug in it is a bug in the instrument. stretch_core.h only
-// ever instantiates ShyFFT<float, 4096>, which never exercises: the small-size
+// ever instantiates ShyFFT<float, SS_W (16384), RotationPhasor> and drives it
+// through the runtime-length overload, which never exercises: the small-size
 // (<=256) bit-reversal LUT path (num_passes <= 8 uses bit_rev_ instead of the
 // static 256-entry table), the DirectTransform<0/1/2> and InverseTransform<0/1/2>
 // base cases, or the Math<double> specialization. Exercise them directly here.

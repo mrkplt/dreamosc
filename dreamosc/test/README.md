@@ -9,15 +9,11 @@ hardware, test the logic on the host.**
 ## Run everything
 
 ```
-./run.sh          # from dreamosc/test/ — runs both layers, exits non-zero on failure
+./run.sh          # from dreamosc/test/ — vendor drift check + Catch2, exits non-zero on failure
 ```
 
-Needs the host venv (`dreamosc/host/.venv` with numpy) for the regression layer.
-Create it once:
-
-```
-python3 -m venv ../host/.venv && ../host/.venv/bin/pip install numpy
-```
+No Python needed: the suite is C++ only (the former Python golden regression
+is retired).
 
 ## Two layers
 
@@ -29,7 +25,7 @@ pre-roll level, no startup or single-step hole, constant loudness across fade,
 live-control latency (frame size, position, stretch reach the sounding head
 within a hop or two), scheduling under a cost-modelled producer
 (`render_costed`: each render charges its modelled cost; holds are counted and
-must never become silence), ring-out cap and expiry, drift, and renders across
+must never become silence), drift, and renders across
 44.1/48/96 kHz. Catch2 is vendored as `catch_amalgamated.hpp` (v2.13.10, single
 header — no build step, no package manager).
 
@@ -43,12 +39,14 @@ scheduling on the host. The former Python golden regression is retired.
 
 - A new DSP property → a `TEST_CASE` in `test_stretch_core.cpp`. Prefer an
   invariant (bounds, energy, length, determinism) over a magic expected number.
-- A code-review finding → a `TEST_CASE` in `test_findings.cpp` tagged
-  `[finding][!mayfail]` that reproduces it AND measures its effect on the
-  rendered audio (click detector, silent windows, first-difference sample).
-  `[!mayfail]` reports "failed as expected" without failing the gate; drop the
-  tag once the finding is remediated so the test becomes a guard. ISR
-  preemption is simulated through the `SS_HOOK` points (test build only).
+- A code-review finding → a `TEST_CASE` in `test_findings.cpp` that reproduces
+  it AND measures its effect on the rendered audio (click detector, silent
+  windows, first-difference sample). When a NEW finding is filed, tag it
+  `[finding][!mayfail]` until remediated: `[!mayfail]` reports "failed as
+  expected" without failing the gate; drop the tag once fixed so the test
+  becomes a guard. (No test carries the tag today — every finding in the file
+  is remediated.) ISR preemption is simulated through the `SS_HOOK` points
+  (test build only).
   Each test writes its audio to `/tmp/dreamosc_findings/*.wav` for listening.
 - Tolerances are set from measurement **with a written reason** (see the
   seam-continuity test's self-calibrated floor). Do not loosen a tolerance to

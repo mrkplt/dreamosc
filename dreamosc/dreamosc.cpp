@@ -183,7 +183,7 @@ static void fill_stub_source() {
 //   encoder turn   -> the current page's parameter (stretch / fade / frame / steps)
 //   encoder click  -> cycle page: stretch(red)/steps(orange)/fade(yellow)/window(green)
 //                     each page's led2 brightness encodes that page's level
-//   led2           -> encoder page color; brightness = crossfade active (fade>0)
+//   led2           -> encoder page color; brightness = that page's level
 //
 // PICKUP (soft takeover) EVERYWHERE: landing on GLOBAL or a step does NOT snap
 // its value to the pot -- a knob takes over only after it physically moves since
@@ -195,10 +195,9 @@ static void fill_stub_source() {
 // EncoderPage enum + LED color helpers live in controls_core.h (host-tested).
 static EncoderPage encPage = PAGE_STRETCH;
 
-// Global drift: a fun all-steps shimmer, added on top of each step's own
-// per-step drift (knob2). Effective drift per step = perStep + global, clamped.
-// (How these two should ultimately combine is still open; additive is the
-// simplest sensible first cut.)
+// Global drift: a fun all-steps shimmer, the FLOOR under each step's own
+// per-step drift (knob2). Effective drift per step = max(perStep, global),
+// clamped -- see foldDrift() in controls_core.h.
 static float globalDrift = 0.0f;
 
 // Panel edit state (mode/pickup/shadow) lives in the platform-free PanelEditor
@@ -280,7 +279,8 @@ static void processControls() {
   // --- button2: jump back to GLOBAL ---
   if (pod.button2.RisingEdge()) panel.toGlobal();
 
-  // --- encoder turn: stretch (index into detent table) or fade (additive) ---
+  // --- encoder turn: the current page's parameter (stretch / frame / steps /
+  // fade) ---
   // Speed from the detent GAP (Increment is only +-1); stepping math is pure
   // and host-tested in controls_core.h.
   int32_t inc = pod.encoder.Increment();
@@ -411,8 +411,8 @@ int main(void) {
 
   seq.init(&src, pod.AudioSampleRate(), voicePool);
   // Starting values; the knobs/encoder take over from here (see processControls).
-  // The knobs snap to their physical positions on the first read, so duration and
-  // drift are whatever the pots are set to within a few ms of boot.
+  // Pickup applies from boot: a knob takes over its parameter only after it has
+  // physically moved (PanelEditor), so these hold until the pots are touched.
   seq.stretch  = STRETCH_STOPS[stretchIdx];   // 50x, matches stretchIdx default
   seq.duration = 1.0f;
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade

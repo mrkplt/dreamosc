@@ -4,7 +4,7 @@ Known, unresolved issues, and what the bench owes the frame model.
 
 ## The frame model is host-tested, partially heard
 
-Everything below `REVIEW_responsiveness.md` proposed is implemented and green
+Everything below `../archive/history/REVIEW_responsiveness.md` proposed is implemented and green
 on the host and links for the device. A first bench pass (single active step,
 `steps=1`, no crossfade march) confirmed the instrument runs clean at 480 MHz
 with ring-out removed; the multi-head march cases below are still owed.
@@ -41,7 +41,7 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
 - **480 MHz** clean on the codec and QSPI paths (`pod.Init(true)`).
 - **Refresh feel:** turning position/stretch/frame on a sounding head. `rfr`
   counts re-renders; `slack` should stay positive. If a fast knob sweep drives
-  `du` up, the refresh threshold (0.001 in position) or the minimum gap
+  `du` up, the refresh threshold (0.002 in position) or the minimum gap
   (4 × cost, ≥ 10 ms) is the knob.
 
 ## Code-review findings on the frame model (all remediated, all guarded)
@@ -64,12 +64,14 @@ the fix. What the bench still owes here:
 
 ## Not measured
 
-- ShyFFT vs CMSIS-DSP `arm_rfft_fast_f32` at 16384 (the 64 KB scratch is four
-  times the D-cache; the bit-reversal and early passes miss).
 - AXI SRAM vs SDRAM for the FFT scratch (placed per ST's guidance; the speedup
   was never confirmed).
 
 ## Closed by measurement (recorded so they are not re-tried)
+
+- **ShyFFT vs CMSIS-DSP `arm_rfft_fast_f32` at 16384** — not a candidate.
+  `arm_rfft_fast_init_f32` supports 32..4096 only, in both the pinned libDaisy
+  copy and upstream `main`; it cannot serve 8192 or 16384. ShyFFT stays.
 
 - **Compiler flags `-O3` + `-fmove-loop-invariants` + `-fno-math-errno`**
   (tried 2026-09-08, commit 856fac4, reverted). Bench at 480 MHz, frame 16384,

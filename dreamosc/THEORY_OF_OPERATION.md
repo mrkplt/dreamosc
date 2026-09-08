@@ -49,8 +49,8 @@ like the material frozen in place.
 4. Inverse FFT, copy the `w`-sample periodic waveform to the head's frame
    buffer in SDRAM.
 
-Cost is `O(w log w)`; the bench number before the clock boost was ~18 ms per
-16384-point frame at 400 MHz, ~3 ms at 4096.
+Cost is `O(w log w)`; measured at 480 MHz: ~14.5 ms per 16384-point frame
+(~28.7 ms for a pre-roll pair), ~1.2 ms at 4096 (see OPEN_ISSUES.md).
 
 **Playing frames.** Each output hop is a raised-cosine blend of the previous
 frame's first half against the current frame's second half, multiplied by the
@@ -239,12 +239,13 @@ render, do it, return. Each call:
 `cur` needs a PAIR at the new size. If that pair would miss this boundary
 (`slack ≤ 2 × cost`) but could fit a full hop, a SINGLE at the old size is
 staged instead and the pair renders right after the boundary with a whole hop
-of slack. If a pair cannot fit a full hop either, it renders now. At the render
-cap, growing to 16384 is throughput-bound (six pairs are more than five old
-hops of work at the modelled cost) and produces bounded holds.
+of slack. If a pair cannot fit a full hop either, it renders now. Growing to
+16384 while cur + inc both need pairs at a seam is throughput-bound (the pairs
+are several old hops of work at the measured cost) and produces bounded holds.
 
 **Cost model.** `costSamples_[size]` is the per-frame render cost in ISR
-samples, seeded from `0.003766 · w · log2 w` (18 ms at 16384 / 48 kHz), then
+samples, seeded from `0.003766 · w · log2 w` (~18 ms at 16384 / 48 kHz, the
+old 400 MHz figure; the bench now measures ~14.5 ms at 480 MHz), then
 tracked as a recent max with slow decay (`c −= c/64` per render). It is
 measured from the ISR's sample counter across the render; a zero delta (the
 host harness) leaves it alone. `setCostEstimate()` lets the firmware seed it
@@ -364,8 +365,9 @@ in AXI SRAM.
 - ISR per sample: for each gated head, two frame reads, two table reads, the
   blend; plus the seam envelope (two LUT reads) during a seam.
 - Main loop per hop per gated head: one frame render. Steady-state load is
-  `gated × cost(w) / h`. At the modelled cost, six heads at 16384 is ~64%;
-  six at 4096 is ~35%. A size change adds one pair per head, once.
+  `gated × cost(w) / h`. At most three heads render concurrently (cur + inc +
+  armed); at the measured cost, three at 16384 is ~25%, three at 4096 is ~8%.
+  A size change adds one pair per head, once.
 - Overload degrades to holds (frame repeats) and late go-lives; both are
   counted, neither is silence.
 

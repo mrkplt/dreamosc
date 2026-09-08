@@ -177,7 +177,7 @@ inline Rgb hueROYGBIVW(int i) {
 // encoded level -- stretch/fade/frame/steps brightness via the *Brightness
 // helpers below). So a bright LED always means "this parameter is turned up".
 inline Rgb pageColor(EncoderPage page, float b) {
-  Rgb h = hueROYGBIVW((int)page);   // pages 0..4 -> red/orange/yellow/green/blue
+  Rgb h = hueROYGBIVW((int)page);   // pages 0..3 -> red/orange/yellow/green
   return {h.r * b, h.g * b, h.b * b};
 }
 
@@ -239,7 +239,7 @@ inline Rgb stepColor(int i, float b = 0.6f) {
 // value to the pot. A knob takes over its parameter for the CURRENT slot only
 // after it has physically MOVED (> moveThresh) since arriving. Each of the
 // SS_STEPS+1 slots has its own k1/k2 latch, so touring never disturbs untouched
-// values. Effective drift per step = per-step + global, clamped.
+// values. Effective drift per step = max(per-step, global), clamped (foldDrift).
 //
 // The caller owns the Sequencer and the global duration/drift floats; this class
 // owns the mode/pickup/shadow state and never touches hardware.
@@ -300,7 +300,7 @@ class PanelEditor {
   // the smoothed read only ~2% that pass), so pickup would never engage. The
   // pickup latch tracks the pot; the smoothing only de-zippers the output.
   // In GLOBAL, knobs drive *dur and *gdrift; in a step, position + per-step
-  // drift. Always folds per-step + global into seq.drift[].
+  // drift. Always folds max(per-step, global) into seq.drift[].
   void update(Sequencer& seq, float* dur, float* gdrift,
               float r1, float r2, float k1, float k2,
               float moveThresh = 0.02f, float driftMax = 0.03f,

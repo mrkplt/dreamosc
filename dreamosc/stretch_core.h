@@ -112,7 +112,8 @@ extern float gBlendA[SS_HOP_FLOATS];
 extern float gBlendC[SS_HOP_FLOATS];
 extern volatile uint32_t gUnderruns;   // frame holds (a head repeated a frame)
 extern volatile uint32_t gClips;       // output samples the +-1 clamp caught
-                                       // (a full ring-out stack can overrun
+                                       // (the phase-randomized peaks of two
+                                       // heads at a seam can overrun
                                        // SS_HEADROOM -- distortion, not density)
 
 // Test-only preemption hooks. The host suite is single-threaded, so an ISR

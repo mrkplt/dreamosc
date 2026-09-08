@@ -14,6 +14,7 @@
 
 #include <math.h>
 #include <stdint.h>
+#include <atomic>
 
 #include "stretch_core.h"   // for SS_STEPS
 
@@ -442,6 +443,89 @@ inline void applyEncoder(EncoderState& e, Sequencer& seq, PanelEditor& panel,
     default:
       break;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Digital panel events from a timer IRQ (L1). The main loop polls controls
+// between service() calls, i.e. behind whatever render is in flight (1.2 ms
+// at 4096, 14-29 ms at 16384), and libDaisy's encoder debounce needs
+// consecutive 1 ms samples, so a fast spin at 16384 dropped detents. The
+// firmware now debounces the encoder and buttons from a timer IRQ (below
+// audio priority) and pushes EVENTS, each stamped with its millisecond, into
+// this single-producer / single-consumer ring; the main loop drains it
+// whenever it gets round to it and applies the events in arrival order with
+// their ORIGINAL timing, so the fast/slow speed model is unaffected by how
+// long a render blocked the loop. Producer: the IRQ. Consumer: the main
+// loop. Only the IRQ ever touches the Encoder/Switch objects.
+// ---------------------------------------------------------------------------
+
+struct PanelEvent {
+  enum Kind : int8_t { DETENT = 0, ENC_CLICK, BUTTON1, BUTTON2 };
+  int8_t   kind;
+  int8_t   inc;    // DETENT: +-1
+  uint32_t ms;     // when it happened (System::GetNow() on the device)
+};
+
+template <int N>
+struct PanelQueue {
+  static_assert(N > 0 && (N & (N - 1)) == 0, "ring size must be a power of two");
+  PanelEvent ev[N];
+  std::atomic<uint32_t> head{0};   // producer-owned
+  std::atomic<uint32_t> tail{0};   // consumer-owned
+  std::atomic<uint32_t> dropped{0};   // events refused because the ring was full
+
+  // Producer (IRQ). Refuses, and counts, when full: a lost detent is visible
+  // on the profiler, never a stalled interrupt.
+  bool push(int8_t kind, int8_t inc, uint32_t ms) {
+    uint32_t h = head.load(std::memory_order_relaxed);
+    if (h - tail.load(std::memory_order_acquire) >= (uint32_t)N) {
+      dropped.store(dropped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+      return false;
+    }
+    ev[h & (N - 1)] = PanelEvent{kind, inc, ms};
+    head.store(h + 1, std::memory_order_release);
+    return true;
+  }
+  // Consumer (main loop).
+  bool pop(PanelEvent& out) {
+    uint32_t t = tail.load(std::memory_order_relaxed);
+    if (t == head.load(std::memory_order_acquire)) return false;
+    out = ev[t & (N - 1)];
+    tail.store(t + 1, std::memory_order_release);
+    return true;
+  }
+  uint32_t pending() const {
+    return head.load(std::memory_order_acquire) - tail.load(std::memory_order_relaxed);
+  }
+};
+
+// The main loop's side: apply every queued event in order. A detent's speed
+// is judged from the gap to the PREVIOUS detent's own timestamp
+// (`lastDetentMs`), exactly as the old in-loop poll did, so two detents that
+// arrived while a render blocked the loop still read as a fast spin if they
+// were one. A click before a detent in the queue changes the page first, so
+// the detent lands on the page the player saw. Returns the detent count.
+template <int N>
+inline int drainPanelEvents(PanelQueue<N>& q, EncoderState& enc, Sequencer& seq,
+                            PanelEditor& panel, uint32_t& lastDetentMs) {
+  PanelEvent e;
+  int detents = 0;
+  while (q.pop(e)) {
+    switch (e.kind) {
+      case PanelEvent::DETENT: {
+        bool fast = encoderFast(e.ms - lastDetentMs);
+        lastDetentMs = e.ms;
+        applyEncoder(enc, seq, panel, e.inc, fast);
+        detents++;
+        break;
+      }
+      case PanelEvent::ENC_CLICK: enc.page = nextPage(enc.page); break;
+      case PanelEvent::BUTTON1:   panel.advance(seq.activeSteps); break;
+      case PanelEvent::BUTTON2:   panel.toGlobal(); break;
+      default: break;
+    }
+  }
+  return detents;
 }
 
 // led2 brightness for the current page = that page's encoded LEVEL, so a bright

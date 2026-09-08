@@ -60,13 +60,18 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   file's sample count. Position 0..1 spans different material under each, and
   every step position tuned by ear so far is against the padded scale. Decide
   the rule once (a shared `finishSource()` both loaders call) before wiring SD.
-- **Control poll is blocked behind renders** (`dreamosc.cpp` main loop): the
-  1 ms `processControls()` check sits between `service()` calls, so it waits
-  for the in-flight render — ~1.2 ms at 4096, 14.5 / 28.7 ms (single / pair)
-  at 16384. libDaisy's encoder debounce needs the A-phase low on two
-  consecutive calls, so a fast spin at 16384 can drop or mis-sign detents.
-  Fix: read the encoder + buttons from a 1 kHz timer IRQ below audio priority
-  into atomics. Sound-neutral. Verify with a detent counter on the KNOB line.
+- ~~Control poll is blocked behind renders~~ — done (L1): the encoder and
+  buttons are debounced from a 2 kHz TIM5 IRQ (NVIC 0x0f; audio DMA is 0)
+  into a timestamped SPSC event ring (`PanelQueue`, `drainPanelEvents` in
+  `controls_core.h`, host-tested for order, fast/slow timing and overflow);
+  the main loop drains it on its 1 ms tick. Knobs/LEDs stay in the loop.
+  **Bench-only verification** (no host test can see the IRQ): at 16384, spin
+  the encoder a counted number of clicks and compare `det=` on the KNOB
+  line; `drop=` must stay 0; a click then an immediate detent must land on
+  the new page; buttons must edge-trigger exactly once per press. 2 kHz
+  rather than 1 kHz because libDaisy's debouncers self-limit to one sample
+  per `GetNow()` millisecond and a 1 kHz timer would beat against that
+  clock.
 - ~~Refresh-gap floor of one hop~~ — done (L2): `gap = max(4·cost, 480)`.
   Measured precisely before changing it: the floor cost exactly ONE extra hop
   (not ~2 as first written), and only for a second move inside the same hop

@@ -133,10 +133,20 @@ Fast = coarse step, slow = fine.
 
 ### Control polling
 
-Controls poll on a **1 ms wall-clock tick** (`System::GetNow()`), NOT every-Nth-
-`service()`: a `service()` call is one or two full FFTs (milliseconds at 4096,
-tens of ms at 16384), so a service-count gate polled the encoder only a few
-times a second and dropped most detents. Audio block is 32 samples.
+**Encoder and buttons are read from a 2 kHz timer IRQ** (TIM5, below audio
+priority), not the main loop. The main loop polls between `service()` calls,
+i.e. behind whatever render is in flight (1.2 ms at 4096, 14–29 ms at
+16384), and libDaisy's encoder debounce needs two *consecutive* 1 ms samples,
+so a fast spin at 16384 dropped or mis-signed detents (L1). The IRQ debounces
+and pushes timestamped events into a lock-free ring (`PanelQueue` /
+`drainPanelEvents` in `controls_core.h`, host-tested); the main loop drains
+the ring on its **1 ms wall-clock tick** and applies each event with its
+*original* timing, so the fast/slow speed model is unaffected by how long a
+render blocked the loop, and a click before a detent still changes the page
+first. The knobs (ADC read, smoothing, pickup) and LEDs stay on the main-loop
+tick. The IRQ owns the `Encoder`/`Switch` objects exclusively. Profiler:
+`det=` (detents applied per second — count them against the physical clicks)
+and `drop=` (ring overflows, must stay 0). Audio block is 32 samples.
 
 ## Where the logic lives
 

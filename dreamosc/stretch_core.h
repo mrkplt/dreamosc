@@ -342,7 +342,6 @@ class Head {
     appliedSlot_.store(0, std::memory_order_relaxed);
     qHead_.store(0, std::memory_order_relaxed);
     qTail_.store(0, std::memory_order_relaxed);
-    due_.store(0, std::memory_order_relaxed);
     phase_ = 0; h_ = 0; old_ = cur_ = nullptr; A_ = C_ = nullptr;
     holds_ = 0;
     seenLife_ = 0;
@@ -362,11 +361,10 @@ class Head {
 
   // FREE -> ARMED. Drains any stale descriptors (the ISR is the queue consumer,
   // so it may pop at any time) so a new life never sees the old life's frames.
-  void alloc(int step, uint32_t lifeSeed, float driftOff, uint32_t due) {
+  void alloc(int step, uint32_t lifeSeed, float driftOff) {
     step_ = step;
     lifeSeed_ = lifeSeed;
     driftOff_ = driftOff;
-    due_.store(due, std::memory_order_relaxed);
     qTail_.store(qHead_.load(std::memory_order_acquire), std::memory_order_release);
     applied_.store(0, std::memory_order_relaxed);
     oldIdx_.store(-1, std::memory_order_relaxed);
@@ -376,8 +374,6 @@ class Head {
     life_.fetch_add(1, std::memory_order_release);
     state_.store(ARMED, std::memory_order_release);
   }
-
-  void setDue(uint32_t due) { due_.store(due, std::memory_order_relaxed); }
 
   // READY -> GATED: apply the staged pre-roll pair and open the gate. Returns
   // false if no valid pair is staged yet (READY is only a hint; the queue is
@@ -461,17 +457,19 @@ class Head {
 
   // Decide what this head wants rendered. `clock` is the ISR sample counter;
   // `w` the live window; `stretch`/`pos` the live controls. Fills `deadline`
-  // (absolute sample). `minRefreshGap`: at most one control-driven refresh per
-  // this many samples per head (the caller passes one hop, so a creeping knob
-  // costs one render per hop, never more -- F8).
+  // (absolute sample): the next hop boundary for a gated head, `armedDue`
+  // (the sequencer's next go-live) for an armed one. `minRefreshGap`: at most
+  // one control-driven refresh per this many samples per head (the caller
+  // passes one hop, so a creeping knob costs one render per hop, never more
+  // -- F8).
   Want plan(uint32_t clock, int w, float stretch, float pos, uint32_t& deadline,
-            uint32_t minRefreshGap) {
+            uint32_t minRefreshGap, uint32_t armedDue) {
     State st = state();
     if (st == FREE) return NONE;
     syncApplied(clock);
     uint32_t applied = lastApplied_;
     bool armed = isArmedState(st);
-    if (armed) deadline = due_.load(std::memory_order_relaxed);
+    if (armed) deadline = armedDue;
     else       deadline = clock + (h_ - phase_);
     bool pending = stagedFrame_ > applied;
     if (!pending) return REQUIRED;
@@ -592,7 +590,6 @@ class Head {
   int  dbgLastPick() const { return dbgLastPick_; }
   bool dbgPending() const { return stagedFrame_ > lastApplied_; }
   int  dbgPendingKind() const { return qAt(qHead_.load(std::memory_order_relaxed) - 1).kind; }
-  uint32_t dbgDue() const { return due_.load(std::memory_order_relaxed); }
   uint32_t dbgQueued() const { return qHead_.load(std::memory_order_relaxed) - qTail_.load(std::memory_order_relaxed); }
   // Queued descriptors the ISR will discard (frame already applied, or a
   // stale life): each one was a wasted render.
@@ -694,7 +691,6 @@ class Head {
   std::atomic<int>      oldIdx_{-1}, curIdx_{-1};
   std::atomic<uint32_t> applied_{0}, appliedSlot_{0};
   std::atomic<uint32_t> qTail_{0};
-  std::atomic<uint32_t> due_{0};
   int      step_ = 0;
   uint32_t lifeSeed_ = 0;
   float    driftOff_ = 0.0f;
@@ -789,6 +785,7 @@ class Sequencer {
     nxtStep_ = 0;
     elapsed_ = 0; seamStart_ = 0; fadeLen_ = 0;
     clock_.store(0, std::memory_order_relaxed);
+    nextOnset_.store(0, std::memory_order_relaxed);
     late_ = 0;
     cost_.seed();
     minSlack_ = 0x7fffffff;
@@ -807,25 +804,32 @@ class Sequencer {
 
   // ---- ISR: audio ----------------------------------------------------------
 
+  // The live controls a block is rendered against. The main loop is the only
+  // writer of duration/fade/activeSteps and cannot preempt the ISR, so they
+  // are constant across one render() anyway; snapshotting them makes that a
+  // property of the code rather than of the caller, and is why tick() needs
+  // no per-sample re-check of the step count.
+  struct Block { SeamGeom g; int steps; };
+
   // Render n mono samples. Per-block constants are hoisted; the per-sample
   // work is the seam decision and the gated heads' blends.
   void render(float* out, int n) {
-    uint32_t dur = durSamples();
-    SeamGeom g = seamGeom(dur, fade);
+    Block b{seamGeom(durSamples(), fade), activeSteps};
     uint32_t c = clock_.load(std::memory_order_relaxed);
     // Per-block ISR housekeeping: drop superseded staged frames (F4), keep the
     // armed head's deadline honest against live duration/fade changes (F3),
     // and re-arm now if the step count shrank under the armed head (F9) so
-    // the seam is not late.
+    // the seam is not late. armNext() always arms a step below b.steps, so
+    // after this check nxtStep_ < b.steps holds for the whole block.
     for (int i = 0; i < SS_HEADS; i++)
       if (head_[i].stateIsr() != Head::FREE) head_[i].isrDrainSuperseded();
-    if (nxt_ >= 0 && nxtStep_ >= activeSteps) {
+    if (nxt_ >= 0 && nxtStep_ >= b.steps) {
       head_[nxt_].free(); nxt_ = -1;
       int from = inc_ >= 0 ? inc_ : cur_;
-      if (from >= 0) armNext(c, g.onset, (head_[from].step() + 1) % activeSteps);
+      if (from >= 0) armAfter(c, b, from);
     }
-    if (nxt_ >= 0) head_[nxt_].setDue(c + samplesToNextOnset(g.onset));
-    for (int i = 0; i < n; i++) out[i] = tick(g);
+    if (nxt_ >= 0) nextOnset_.store(c + samplesToNextOnset(b.g.onset), std::memory_order_relaxed);
+    for (int i = 0; i < n; i++) out[i] = tick(b);
   }
   inline float next() { float s; render(&s, 1); return s; }
 
@@ -845,12 +849,13 @@ class Sequencer {
   };
   Work pickWork(uint32_t clock, int w, uint32_t gap) {
     Work k;
+    uint32_t armedDue = nextOnset_.load(std::memory_order_relaxed);
     for (int i = 0; i < SS_HEADS; i++) {
       Head& h = head_[i];
       if (h.isFree()) continue;
       float pos = h.basePos(position[h.step()]);
       uint32_t dl;
-      Head::Want want = h.plan(clock, w, stretch, pos, dl, gap);
+      Head::Want want = h.plan(clock, w, stretch, pos, dl, gap, armedDue);
       if (want == Head::REQUIRED) {
         if (k.req < 0 || (int32_t)(dl - k.reqDl) < 0) { k.req = i; k.reqDl = dl; }
       } else if (want == Head::REFRESH) {
@@ -947,19 +952,20 @@ class Sequencer {
   Head& dbgHead(int i) { return head_[i]; }
   int   dbgCur() const { return cur_; }
   int   dbgNxt() const { return nxt_; }
+  uint32_t dbgNextOnset() const { return nextOnset_.load(std::memory_order_relaxed); }
 #endif
 
  private:
-  inline float tick(const SeamGeom& g) {
+  inline float tick(const Block& b) {
     float sum = 0.0f;
     uint32_t c = clock_.load(std::memory_order_relaxed);
 
     if (cur_ < 0) {                       // startup: first head not live yet
-      if (nxt_ < 0) armNext(c, g.onset, 0);
+      if (nxt_ < 0) armNext(c, b.g.onset, 0);
       if (nxt_ >= 0 && head_[nxt_].goLive()) {
         cur_ = nxt_; nxt_ = -1;
         elapsed_ = 0;
-        armNext(c, g.onset, (head_[cur_].step() + 1) % activeSteps);
+        armAfter(c, b, cur_);
       } else {
         late_++;
         clock_.store(c + 1, std::memory_order_relaxed);
@@ -968,23 +974,17 @@ class Sequencer {
     }
 
     // Seam: the incoming head goes live at onset once it is ready. If it is not
-    // ready the outgoing head keeps sounding (late, never silent).
-    if (inc_ < 0 && elapsed_ >= g.onset) {
-      if (nxt_ >= 0 && nxtStep_ >= activeSteps) {   // steps shrank under the arm
-        head_[nxt_].free(); nxt_ = -1;
-      }
-      if (nxt_ < 0) armNext(c, g.onset, (head_[cur_].step() + 1) % activeSteps);
+    // ready the outgoing head keeps sounding (late, never silent). (A step
+    // count shrunk under the armed head was already re-armed at block top.)
+    if (inc_ < 0 && elapsed_ >= b.g.onset) {
+      if (nxt_ < 0) armAfter(c, b, cur_);
       if (nxt_ >= 0 && head_[nxt_].goLive()) {
-        inc_ = nxt_; nxt_ = -1;
-        fadeLen_ = g.fadeLen;
+        int live = nxt_;
+        inc_ = live; nxt_ = -1;
+        fadeLen_ = b.g.fadeLen;
         seamStart_ = elapsed_;
-        int after = (head_[inc_].step() + 1) % activeSteps;
-        if (fadeLen_ == 0) {              // raw cut: outgoing stops now
-          head_[cur_].free();
-          cur_ = inc_; inc_ = -1;
-          elapsed_ = 0;
-        }
-        armNext(c, g.onset, after);
+        if (fadeLen_ == 0) retireOutgoing();   // raw cut: outgoing stops now
+        armAfter(c, b, live);
       } else {
         late_++;
       }
@@ -993,10 +993,8 @@ class Sequencer {
     // Read the seam.
     if (inc_ >= 0) {
       uint32_t fp = (uint32_t)(elapsed_ - seamStart_);
-      if (fp >= fadeLen_) {               // seam complete: retire outgoing
-        head_[cur_].free();
-        cur_ = inc_; inc_ = -1;
-        elapsed_ = 0;                     // this sample is the new dwell's first
+      if (fp >= fadeLen_) {               // seam complete
+        retireOutgoing();                 // this sample is the new dwell's first
         sum = head_[cur_].tick();
         elapsed_++;
       } else {
@@ -1018,9 +1016,23 @@ class Sequencer {
     return out;
   }
 
+  // The incoming head becomes the sounding one; the outgoing head stops (a
+  // raw cut or the end of a crossfade -- spectral, not amplitude).
+  void retireOutgoing() {
+    head_[cur_].free();
+    cur_ = inc_; inc_ = -1;
+    elapsed_ = 0;
+  }
+
+  // Arm the step after head `h`'s (wrapping within the block's step count).
+  void armAfter(uint32_t clock, const Block& b, int h) {
+    armNext(clock, b.g.onset, (head_[h].step() + 1) % b.steps);
+  }
+
   // Allocate and arm the head for `step`. Called the moment a step goes live
   // (with the step after the one that just went live), so the pre-warm lead is
-  // the whole dwell.
+  // the whole dwell. Stamps the sequencer's next go-live (the armed head's
+  // deadline); render() restates it every block against the live controls.
   void armNext(uint32_t clock, uint32_t onset, int step) {
     int h = allocHead();
     if (h < 0) return;                    // retry next tick
@@ -1036,7 +1048,8 @@ class Sequencer {
     // always yields the same phases: zero drift is a literal repeat.
     float p = ssClampPos(position[step] + off);
     uint32_t lifeSeed = seed_ ^ (uint32_t)(p * 4294967295.0);
-    head_[h].alloc(step, lifeSeed, off, clock + samplesToNextOnset(onset));
+    head_[h].alloc(step, lifeSeed, off);
+    nextOnset_.store(clock + samplesToNextOnset(onset), std::memory_order_relaxed);
     nxt_ = h; nxtStep_ = step;
   }
 
@@ -1066,6 +1079,10 @@ class Sequencer {
   uint32_t seed_ = 0, driftRng_ = 1;
   // ISR-owned clock state.
   std::atomic<uint32_t> clock_{0};
+  // The armed head's deadline: absolute sample of the next go-live. There is
+  // exactly one armed head at a time (nxt_), so this is sequencer state, not
+  // head state. Written at arm and restated per block (F3); read by plan().
+  std::atomic<uint32_t> nextOnset_{0};
   uint64_t elapsed_ = 0;         // samples the current dwell has sounded
   uint64_t seamStart_ = 0;       // elapsed_ at which the current seam began
   uint32_t fadeLen_ = 0;

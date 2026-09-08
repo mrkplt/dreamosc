@@ -174,7 +174,7 @@ TEST_CASE("F3: armed head's deadline reads 'now' during a crossfade seam", "[fin
     int32_t s = seq.takeMinSlack();
     if (s < minSlack) minSlack = s;
     if (seq.dbgNxt() >= 0) {
-      int32_t d = (int32_t)(seq.dbgHead(seq.dbgNxt()).dbgDue() - seq.clock());
+      int32_t d = (int32_t)(seq.dbgNextOnset() - seq.clock());
       if ((uint32_t)d < minDue) minDue = (uint32_t)d;
     }
     out.push_back(seq.next());

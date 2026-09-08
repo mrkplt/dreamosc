@@ -77,16 +77,20 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   knob moves**, though only the last pair before `due` matters (28.7 ms of
   throwaway work per gap at 16384). Defer an armed head's REFRESH until
   `due − clock` is within ~8×cost.
-- **Tier-B refactors not done in the cleanup** (all sound-neutral by
-  construction but on the hot path; each wants a PROFILE session): pure
-  `chooseRender()` for the F5 size-change policy; `pickWork()` + a `CostModel`
-  out of `service()`; `render()` re-deriving `slack` after its F7 re-sync (a
-  hop of size-change latency in the plan/render race); snapshotting
-  `activeSteps` per block so F9's second site is dead by construction (one
-  rare input is not bit-identical — see the review); `nextOnset_` on the
-  Sequencer instead of `due_` on the Head; `gUnderruns`/`gClips` as Sequencer
-  members; `isArmedState(State)`; dead `Staged::stretchUsed/posUsed`;
-  `cosAtF` at the seam; interleaving/relocating the blend tables.
+- **Tier-B refactors** — done as bit-identical commits (host goldens 4/4,
+  suite green, device symbols smaller): `chooseRender()`, `pickWork()` +
+  `CostModel`, `isArmedState`, `qAt`, `ssClampPos`, `cosAtF`, dead `Staged`
+  fields (676d4a7); per-block `Block{seamGeom, steps}` snapshot with F9's
+  seam-time re-check removed, `nextOnset_` on the Sequencer instead of `due_`
+  on every Head, `retireOutgoing()`/`armAfter()` in `tick()` (next commit).
+  Correction to the review: the `activeSteps` snapshot IS bit-identical for
+  every input — the main loop is the only writer and cannot preempt the ISR,
+  so the value is constant across a `render()` on the device, and the host
+  runs the block-top check before every sample; the seam-time re-check was
+  dead in both. Still open: `render()` re-deriving `slack` after its F7
+  re-sync (a latency item, below); `gUnderruns`/`gClips` as Sequencer members
+  (three platform files of churn for no latency value — skipped);
+  interleaving/relocating the blend tables (wait for `isr_max` bench data).
 - ~~Host tests run per-block housekeeping per SAMPLE~~ — done:
   `test/test_block_cadence.cpp` drives the core at the device's `render(buf,
   32)` cadence (`drive_blocks` in `test_support.h`). Finding: after go-live the

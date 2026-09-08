@@ -100,8 +100,10 @@ floats in SDRAM. The ISR side holds:
 | `A_`, `C_` | the blend/correction tables for `h_` |
 | `state_` | FREE / ARMED / READY / GATED |
 | `life_` | bumped at every allocation; tags everything the main loop publishes |
-| `due_` | absolute sample at which this head is expected to go live (ARMED) |
 | `step_`, `lifeSeed_`, `driftOff_` | which step, the phase seed, the drift offset drawn at arm |
+
+(The armed head's deadline is not head state: there is exactly one armed head
+at a time, so the Sequencer holds it as `nextOnset_`, section 6.)
 
 `Head::tick()` produces one sample and advances the phase. At the boundary it
 applies the next staged frame (section 4); if nothing is staged it **holds**:
@@ -123,7 +125,7 @@ the empty-ring gap, and the single-step and startup holes of the previous
 design.
 
 ```
-FREE ──ISR alloc(step, seed, drift, due, life++)──▶ ARMED
+FREE ──ISR alloc(step, seed, drift, life++)──▶ ARMED
 ARMED ──main loop stages the pre-roll pair──▶ READY          (a hint; see below)
 READY ──ISR goLive(): apply the pair, phase 0──▶ GATED
 GATED ──ISR end of dwell──▶ FREE
@@ -132,7 +134,8 @@ GATED ──ISR end of dwell──▶ FREE
 Single-writer rules:
 
 - The ISR writes every transition except ARMED→READY, and owns `old_`,
-  `cur_`, `phase_`, `h_`, `due_`, `applied_`, `qTail_`.
+  `cur_`, `phase_`, `h_`, `applied_`, `qTail_` (and the Sequencer's
+  `nextOnset_`).
 - The main loop writes ARMED→READY (by compare-and-swap from ARMED, so a head
   the ISR freed and re-allocated meanwhile can never be marked READY by a stale
   render), the descriptors, and `qHead_`.
@@ -159,7 +162,7 @@ The main loop hands frames to the ISR through a per-head ring of `SS_DESCQ`
 descriptors. A descriptor says what to apply at the next boundary:
 
 ```
-Staged { life, frameIdx, kind (SINGLE | PAIR), a, b, sizeIdx, travel, stretchUsed, posUsed }
+Staged { life, frameIdx, kind (SINGLE | PAIR), a, b, sizeIdx, travel }
 SINGLE: old ← cur, cur ← buf[a]              (the ordinary next frame)
 PAIR:   old ← buf[a], cur ← buf[b], h ← w/2   (pre-roll at go-live, or a size change)
 ```
@@ -206,8 +209,8 @@ ISR-side reads of state use relaxed loads because the ISR is the writer of
 every transition it acts on. On the single-core M7 the ISR preempts the main
 loop and never the reverse, so the only torn-read hazard is a main-loop read
 of a multi-word value the ISR writes; none is read that way (travel comes
-from a descriptor the main loop wrote; `due_` and the indices are single
-words).
+from a descriptor the main loop wrote; `nextOnset_` and the indices are
+single words).
 
 ---
 
@@ -216,9 +219,11 @@ words).
 `Sequencer::service()` is the main loop's whole DSP job: pick the most urgent
 render, do it, return. Each call:
 
-1. For every non-free head, `plan()` reports what it wants and its deadline:
+1. For every non-free head (`pickWork()`), `plan()` reports what it wants and
+   its deadline:
    - **REQUIRED**: no frame staged for `applied + 1`. Deadline: for a gated
-     head, `clock + (h − phase)`; for an armed head, its `due`.
+     head, `clock + (h − phase)`; for an armed head, the sequencer's
+     `nextOnset_`.
    - **REFRESH**: a frame is staged but the controls it used differ from live
      (size index or stretch differ, or position moved by more than 0.002), the
      queue has room, and at least one hop (or `4 × cost`, or 10 ms) has passed
@@ -232,8 +237,9 @@ render, do it, return. Each call:
 3. A REFRESH runs only with slack: `deadline − clock > 2 × cost × frames`. A
    refresh that would miss its boundary is worse than none.
 4. `render()` re-syncs with the ISR (so a boundary between plan and render
-   cannot stage an already-played frame), chooses SINGLE or PAIR, picks free
-   buffers, renders, publishes.
+   cannot stage an already-played frame), chooses SINGLE or PAIR
+   (`chooseRender()`, a pure function), picks free buffers, renders,
+   publishes.
 
 **Size change.** A gated head whose live window differs from the size of its
 `cur` needs a PAIR at the new size. If that pair would miss this boundary
@@ -243,7 +249,7 @@ of slack. If a pair cannot fit a full hop either, it renders now. Growing to
 16384 while cur + inc both need pairs at a seam is throughput-bound (the pairs
 are several old hops of work at the measured cost) and produces bounded holds.
 
-**Cost model.** `costSamples_[size]` is the per-frame render cost in ISR
+**Cost model.** `CostModel` holds the per-frame render cost per size in ISR
 samples, seeded from `0.003766 · w · log2 w` (~18 ms at 16384 / 48 kHz, the
 old 400 MHz figure; the bench now measures ~14.5 ms at 480 MHz), then
 tracked as a recent max with slow decay (`c −= c/64` per render). It is
@@ -255,10 +261,14 @@ from bench numbers and lets the costed host harness pin it.
 
 ## 6. The sequencer clock
 
-The ISR owns time. Per block, `Sequencer::render()` hoists the constants
-(dwell length `round(duration · sr)`, seam geometry), does the per-block
-housekeeping (queue drains, the armed head's due, a re-arm if the step count
-shrank under the armed head), then ticks samples.
+The ISR owns time. Per block, `Sequencer::render()` snapshots the live
+controls into a `Block` (dwell length `round(duration · sr)`, seam geometry,
+the active step count), does the per-block housekeeping (queue drains, the
+armed head's deadline, a re-arm if the step count shrank under the armed
+head), then ticks samples against that snapshot. The main loop is the only
+writer of the controls and cannot preempt the ISR, so they are constant across
+a block anyway; the snapshot makes that a property of the code, and is why
+`tick()` has no per-sample step-count check.
 
 **Dwell and seam.** `seamGeom(dur, fade)` gives `fadeLen = dur · fade` (fade
 clamped to 0..0.5) and `onset = dur − fadeLen`. A dwell runs `elapsed_` from 0.
@@ -273,11 +283,11 @@ the outgoing head stops, the incoming starts at full level (pre-rolled), the
 spectrum changes, the amplitude does not.
 
 **Arming.** The moment a head goes live, the *next* step's head is allocated
-and armed (`armNext`), so the pre-warm lead is the whole dwell. Its `due` is
-`clock + samplesToNextOnset()`: the rest of this dwell up to onset, or, inside
-a seam, the rest of the fade plus the incoming head's dwell up to its onset.
-`due` is re-stamped every block so a live duration or fade change keeps it
-honest.
+and armed (`armNext`), so the pre-warm lead is the whole dwell. Its deadline
+is the Sequencer's `nextOnset_ = clock + samplesToNextOnset()`: the rest of
+this dwell up to onset, or, inside a seam, the rest of the fade plus the
+incoming head's dwell up to its onset. It is re-stamped every block so a live
+duration or fade change keeps it honest.
 
 **Late, never silent.** If the incoming head is not READY at onset (only
 possible when duration is cranked below the time a pre-roll pair takes to

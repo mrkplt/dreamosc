@@ -36,6 +36,16 @@ ifdef PROFILE
 C_DEFS += -DPROFILE
 endif
 
+# Optimization level. libDaisy's core Makefile defaults to `OPT ?= -O2`; -O3
+# additionally unrolls loops and inlines more, which on the M7 (no float SIMD)
+# buys lower loop overhead and more pairable instructions for the dual-issue
+# pipeline in the FFT butterflies and the per-bin magnitude loop. Code size is
+# not a constraint here (~110 KB of 480 KB SRAM). Set BEFORE the include so the
+# `?=` sees it. Sound-neutral by construction (no reassociation; see the
+# CPPFLAGS note below for what is deliberately NOT enabled), but a hypothesis
+# until PROFILE `COST`/`max_us` confirm it -- see OPEN_ISSUES.md.
+OPT = -O3
+
 # Linker script: OURS, not libDaisy's. dreamosc.lds began as a copy of
 # libDaisy/core/STM32H750IB_sram.lds (a starter template -- linker scripts are
 # project-owned on STM32) and adds an .axisram_bss section. Set LDSCRIPT before
@@ -47,6 +57,26 @@ LDSCRIPT = dreamosc.lds
 # Core location, and generic Makefile.
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile
+
+# Compiler flags on top of libDaisy's, appended AFTER the include so they come
+# later on the command line and win. All of the DSP is C++ (stretch_core.h is
+# compiled through dreamosc.cpp), so these go in CPPFLAGS.
+#   -fmove-loop-invariants  libDaisy's CPPFLAGS carry -fno-move-loop-invariants,
+#                           inherited from ST's CubeMX Makefile template with
+#                           no stated reason. It disables the RTL-level
+#                           loop-invariant hoisting pass for every C++ file.
+#                           Re-enable it.
+#   -fno-math-errno         sqrtf() no longer has to set errno on a negative
+#                           argument, so GCC emits the bare vsqrt.f32 without
+#                           the NaN check-and-call-libm branch after it. Our
+#                           argument (re^2 + im^2) is never negative, so the
+#                           result is bit-identical.
+# Deliberately NOT enabled: -ffast-math (or -fassociative-math etc.). Those let
+# the compiler reorder floating-point sums, which changes rounding and so the
+# rendered audio -- a sound change by this project's rules, bench-only.
+# (-ffp-contract=fast, i.e. FMA fusion, is already GCC's default under gnu++14
+# and is why device and host renders are not bit-identical today.)
+CPPFLAGS += -fmove-loop-invariants -fno-math-errno
 
 .PHONY: vendor vendor-check deps deps-check
 vendor:

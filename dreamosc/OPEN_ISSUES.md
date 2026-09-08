@@ -27,6 +27,16 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
 
 ### Still owed
 
+- **Compiler flags (`-O3`, `-fmove-loop-invariants`, `-fno-math-errno`)** —
+  `dreamosc/Makefile`, host-tested build only. Sound-neutral by construction
+  (no FP reassociation; `-ffast-math` deliberately off) but the speedup is a
+  hypothesis. Compare `COST` and `max_us` against the alpha4 numbers above
+  (4096: 128 / ~1177 µs; 16384: 672–673 / ~14500 µs single, 28721 µs pair)
+  and confirm `du=0 late=0 clip=0` at both sizes. Code grew 107,360 →
+  111,288 B (SRAM 48.5% → 49.3%). Note `stk` cannot see render-depth stack
+  growth from the extra inlining: `profSampleStack()` samples MSP between
+  `service()` calls, never inside a render, so `stk` never sees render depth
+  (a profiler gap in its own right). Watch for a hang rather than a number.
 - **Raw cut level by ear** at fade 0, 4096 and 16384. Host measurement: the
   first 5 ms after a cut now sits within the material's own wander (deepest
   −2 to −9 dB in 5 ms windows) instead of −34/−62 dB.

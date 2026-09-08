@@ -104,9 +104,14 @@ index is also the color index, so click order = RoYG).
 - **Pot smoothing and refreshes** (finding F8): position is written from the
   RAW pot (snapped by the fast-move grid), not the one-pole smoothed read, so
   a turn is a few discrete updates rather than a ~250 ms creep that would cost
-  a re-render per hop. The core also caps refreshes at one per hop per head and
-  ignores position deltas under 0.2%. Duration and drift keep the smoother.
-  Refreshes land at hop boundaries; they do not click.
+  a re-render per hop. The core also spaces refreshes per head at 4× the
+  measured render cost (≥ 10 ms; there is no one-hop floor any more, so a
+  second move within the same hop lands at that hop's boundary — L2) and
+  ignores position deltas under 0.2%. The NEXT step's pre-warmed head only
+  re-renders its pair once go-live is within 8× cost (L3), so turning its
+  knob all dwell long costs one pair, not one per gap, and it still goes live
+  at the latest position. Duration and drift keep the smoother. Refreshes
+  land at hop boundaries; they do not click.
 - **Duration is now LIVE and UNQUANTIZED** (#155). The step dwell is exactly
   `round(duration·sr)` samples, independent of frame size — so frame size no
   longer bends step timing (the old model quantized the dwell to the analysis-hop

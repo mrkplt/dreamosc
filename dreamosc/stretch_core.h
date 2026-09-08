@@ -460,8 +460,8 @@ class Head {
   // (absolute sample): the next hop boundary for a gated head, `armedDue`
   // (the sequencer's next go-live) for an armed one. `minRefreshGap`: at most
   // one control-driven refresh per this many samples per head (the caller
-  // passes one hop, so a creeping knob costs one render per hop, never more
-  // -- F8).
+  // passes 4 x the render cost, so a creeping knob costs a bounded number of
+  // renders per hop -- F8, L2).
   Want plan(uint32_t clock, int w, float stretch, float pos, uint32_t& deadline,
             uint32_t minRefreshGap, uint32_t armedDue) {
     State st = state();
@@ -847,7 +847,7 @@ class Sequencer {
     int req = -1, ref = -1;
     uint32_t reqDl = 0, refDl = 0;
   };
-  Work pickWork(uint32_t clock, int w, uint32_t gap) {
+  Work pickWork(uint32_t clock, int w, uint32_t gap, uint32_t cost) {
     Work k;
     uint32_t armedDue = nextOnset_.load(std::memory_order_relaxed);
     for (int i = 0; i < SS_HEADS; i++) {
@@ -856,6 +856,13 @@ class Sequencer {
       float pos = h.basePos(position[h.step()]);
       uint32_t dl;
       Head::Want want = h.plan(clock, w, stretch, pos, dl, gap, armedDue);
+      // An ARMED head's pre-roll pair only matters as it stands at go-live, so
+      // its control-driven refresh waits until go-live is within 8 x cost:
+      // the knob on the next step can turn all dwell long without a pair
+      // re-render per gap (28 ms each at 16384), and the pair still renders
+      // with the latest position (L3). The REQUIRED first pair is unaffected.
+      if (want == Head::REFRESH && h.isArmed()
+          && (int32_t)(dl - clock) > (int32_t)(8 * cost)) want = Head::NONE;
       if (want == Head::REQUIRED) {
         if (k.req < 0 || (int32_t)(dl - k.reqDl) < 0) { k.req = i; k.reqDl = dl; }
       } else if (want == Head::REFRESH) {
@@ -871,12 +878,14 @@ class Sequencer {
     uint32_t clock = clock_.load(std::memory_order_relaxed);
     int w = ssClampW(frameSize);
     uint32_t cost = cost_.at(ssSizeIdx(w));
-    // Refresh gap: one per hop per head, and never faster than the render
-    // itself can turn around (F8).
+    // Refresh gap per head: never faster than the render itself can turn
+    // around (4 x its measured cost), and at least 10 ms (F8). There is no
+    // one-hop floor any more (L2): a knob moved again shortly after a refresh
+    // can refresh again within the same hop, so the move lands at the coming
+    // boundary instead of the one after.
     uint32_t gap = 4 * cost;
-    if (gap < (uint32_t)(w / 2)) gap = (uint32_t)(w / 2);
     if (gap < 480) gap = 480;
-    Work k = pickWork(clock, w, gap);
+    Work k = pickWork(clock, w, gap, cost);
     // A refresh may run only with slack: the worst recent cost for this size,
     // per frame rendered, with a 2x margin. A refresh that would miss its
     // boundary is worse than none (the original frame plays; the change lands

@@ -67,16 +67,31 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   consecutive calls, so a fast spin at 16384 can drop or mis-sign detents.
   Fix: read the encoder + buttons from a 1 kHz timer IRQ below audio priority
   into atomics. Sound-neutral. Verify with a detent counter on the KNOB line.
-- **Refresh-gap floor of one hop** (`stretch_core.h` `service()`:
-  `gap = max(4·cost, w/2, 480)`): a knob moved just after a refresh cannot
-  refresh again until a hop later, which can push the move one boundary
-  further out — worst case ~2 hops, not the 1 hop THEORY §7 states. Dropping
-  the `w/2` floor allows ≤4 refreshes/hop at 4096 (CPU has room). Depends on
-  the poll fix above. Verify `rfr` up, `du` 0, `slack` > 0.
-- **Armed-head pre-roll pairs re-render on every gap while the next step's
-  knob moves**, though only the last pair before `due` matters (28.7 ms of
-  throwaway work per gap at 16384). Defer an armed head's REFRESH until
-  `due − clock` is within ~8×cost.
+- ~~Refresh-gap floor of one hop~~ — done (L2): `gap = max(4·cost, 480)`.
+  Measured precisely before changing it: the floor cost exactly ONE extra hop
+  (not ~2 as first written), and only for a second move inside the same hop
+  in the window `[t1 + 4·cost, boundary − 2·cost)`; at 16384 on the bench
+  (cost 672, hop 8192) that window is most of the hop, i.e. 170 ms of
+  latency on a second move. Test `L2` fails on the old core, passes now.
+  Cost: F8's legacy smoothed-feed count went 7 → 10 refreshes per creep
+  (bounded at 12 with the reason); F5b (16384 crossfade growth) still 0
+  holds under the costed harness. Bench: `rfr` up on a sweep, `du` 0,
+  `slack` > 0 — especially at 16384 with two heads.
+- ~~Armed-head pre-roll pairs re-render on every gap~~ — done (L3): an
+  ARMED head's REFRESH is deferred until `nextOnset − clock ≤ 8·cost`
+  (`pickWork()`). A 30-step sweep of the next step's knob across a 2 s dwell
+  now costs 1 pre-roll pair instead of 30, and the head still goes live at
+  the final position (test `L3`; F4 unchanged). Worst-case staleness at
+  go-live is unchanged from before (the old one-hop floor gave the same
+  bound); the saving is the throwaway pairs (28.7 ms each at 16384).
+- **`render()` re-deriving `slack` after its F7 re-sync — NOT done, measured
+  moot.** Test `F7b` injects a boundary between `plan()` and `render()` with
+  a size change pending under a late producer: the stale slack does stage a
+  SINGLE at the old size, but the next `service()` in the same burst sees the
+  size mismatch and refreshes it to the pair with the real slack, so the new
+  size lands at the very next boundary anyway. Cost: one wasted single
+  render in a race that needs an already-late producer. Not worth a racy
+  read of the ISR's phase inside `render()`. F7b guards the outcome.
 - **Tier-B refactors** — done as bit-identical commits (host goldens 4/4,
   suite green, device symbols smaller): `chooseRender()`, `pickWork()` +
   `CostModel`, `isArmedState`, `qAt`, `ssClampPos`, `cosAtF`, dead `Staged`

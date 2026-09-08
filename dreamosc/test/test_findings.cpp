@@ -351,8 +351,13 @@ TEST_CASE("F8: a pot move costs at most one refresh raw, one per hop smoothed", 
   WARN("F8: refreshes in the second after one 30% pot move: raw feed " << raw
        << ", smoothed feed " << smoothed << " (cap: one per hop while it creeps).");
   REQUIRE(raw <= 2);
-  // Smoothed: the creep lasts ~250 ms = ~6 hops at 4096; the cap holds it there.
-  REQUIRE(smoothed <= 8);
+  // Smoothed (the feed the panel no longer uses): the creep lasts ~250 ms and
+  // the gap is 4 x cost = 804 samples (16.7 ms) at the host's seeded 4096
+  // cost since L2 dropped the one-hop floor, so up to ~15 refreshes could fit;
+  // measured 10 (the 0.002 threshold ends the creep early). Was 7 under the
+  // one-hop floor. This is the policy's cost on a creeping feed, bounded here
+  // so it cannot grow unnoticed; the raw feed above is what the panel does.
+  REQUIRE(smoothed <= 12);
 }
 
 TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does not", "[finding]") {
@@ -436,4 +441,144 @@ TEST_CASE("F11: a held (repeated) frame is click-free", "[finding]") {
   int clicks = count_clicks(out, [](size_t) { return false; });
   WARN("F11: holds " << (gUnderruns - before) << ", clicks " << clicks);
   REQUIRE(clicks == 0);
+}
+
+// ---------------------------------------------------------------------------
+// F7b: render() re-syncs across a boundary (F7) but is still handed the
+// slack the scheduler measured BEFORE it -- a hop stale. The cleanup review
+// expected that, with a size change pending, the stale slack would choose a
+// SINGLE at the old size ("the pair would not fit") when the real slack was a
+// whole hop, and cost a hop of size-change latency. Measured here: it does
+// stage that SINGLE, but the next service() in the same burst sees the size
+// mismatch and REFRESHES it to the pair with the real slack, so the new size
+// still lands at the very next boundary. The cost is one wasted single render
+// in a race that needs an already-late producer; re-deriving the slack inside
+// render() (a racy read of the ISR's phase) was judged not worth it. This test
+// guards the outcome. PASSED from the start.
+// ---------------------------------------------------------------------------
+namespace {
+void hook_rotate_cur_head_always(int id, void* ctx) {
+  if (id != gHook.id || gHook.fired) return;
+  Head* h = (Head*)ctx;
+  Sequencer& seq = *gHook.seq;
+  if (seq.dbgCur() < 0 || h != &seq.dbgHead(seq.dbgCur())) return;
+  int o = h->dbgOldIdx();
+  int guard = 0;
+  while (h->dbgOldIdx() == o && guard++ < SS_W) gHook.out->push_back(seq.next());
+  gHook.fired = true;
+  gHook.firedAt = gHook.out->size();
+}
+}  // namespace
+
+TEST_CASE("F7b: a boundary between plan and render with a size change stages the PAIR",
+          "[finding]") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+  std::vector<float> out;
+  gHook = HookCtx(); gHook.seq = &seq; gHook.out = &out; gHook.id = 2;
+  gSsTestHook = nullptr;
+  // A LATE producer: it only gets to run in the last 200 samples of each hop,
+  // so every REQUIRED render is picked with ~200 samples of slack.
+  auto late_service = [&]() {
+    uint32_t phase = (seq.clock() - 1) % 2048;               // go-live at sample 1
+    if (phase >= 2048 - 200) for (int g = 0; g < 8 && seq.service(); g++) {}
+  };
+  for (uint32_t n = 0; n < 2048 * 6; n++) { late_service(); out.push_back(seq.next()); }
+  REQUIRE(seq.curHop() == 2048);
+  int kind = -1, hopAfter = 0;
+  seq.setFrame(8192);
+  gSsTestHook = hook_rotate_cur_head_always;                  // arm the boundary injection
+  size_t firedAt = 0;
+  for (uint32_t n = 0; n < 2048 * 4 && hopAfter != 4096; n++) {
+    late_service();
+    if (gHook.fired && kind < 0) {
+      Head& h = seq.dbgHead(seq.dbgCur());
+      kind = h.dbgPendingKind();
+      firedAt = gHook.firedAt;
+    }
+    out.push_back(seq.next());
+    if (seq.curHop() == 4096) hopAfter = 4096;
+  }
+  gSsTestHook = nullptr;
+  write_wav(wavpath("F7b_stale_slack_size_change.wav").c_str(), out);
+  REQUIRE(gHook.fired);
+  WARN("F7b: after the injected boundary the render staged kind " << kind
+       << " (1 = PAIR at the new size, 0 = SINGLE at the old size); the new size was playing "
+       << (out.size() - firedAt) << " samples after the boundary");
+  REQUIRE(kind == Head::PAIR);
+  REQUIRE(out.size() - firedAt <= 2048 + 64);                 // by the very next boundary
+}
+
+// ---------------------------------------------------------------------------
+// L2: the refresh gap had a floor of one hop (w/2), so a knob moved again
+// within the same hop after a refresh could not refresh until the next hop,
+// and that move landed one boundary later than it could have. The floor is
+// gone; the gap is 4 x the measured render cost (>= 10 ms). Worked geometry
+// at 4096 on the host (cost 201 -> gap 804, slack margin 2 x 201 = 402, hop
+// boundaries at 1 + 2048 k): a refresh at t1 can be followed by another in
+// [t1 + 804, boundary - 402); the floor pushed it to t1 + 2048, past the
+// boundary. At 16384 on the bench (cost 672, hop 8192) that window is most
+// of the hop, i.e. the floor cost a second move 170 ms.
+// ---------------------------------------------------------------------------
+TEST_CASE("L2: a second position move within the same hop lands at that hop's boundary",
+          "[finding]") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  const uint32_t t1 = 22600, t2 = 23500, boundary = 24577;   // t2 in [t1+804, b-402)
+  auto run = [&](bool twoMoves) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
+    return drive(seq, 48000, [&](uint32_t n) {
+      if (n == t1) seq.position[0] = twoMoves ? 0.4f : 0.7f;
+      if (n == t2 && twoMoves) seq.position[0] = 0.7f;
+    });
+  };
+  auto a = run(true), b = run(false);
+  // The frame applied at `boundary` is the 0.7 frame in both runs if the
+  // second refresh got in; the old frame under it predates both moves. So
+  // from that boundary on the two runs must be identical.
+  size_t lastDiff = 0;
+  for (size_t i = boundary + 64; i < a.size(); i++) if (a[i] != b[i]) lastDiff = i;
+  WARN("L2: last sample at which the two-move run still differs from the direct move: "
+       << (lastDiff ? (long)lastDiff - (long)boundary : -1) << " samples after the boundary");
+  REQUIRE(lastDiff == 0);
+}
+
+// ---------------------------------------------------------------------------
+// L3: an ARMED head's pre-roll pair re-rendered on every refresh gap while the
+// next step's position knob kept moving, though only the last pair before
+// go-live matters. Its refresh is now deferred until go-live is within
+// 8 x cost; F4 (the last turn reaches the pre-roll) still holds.
+// ---------------------------------------------------------------------------
+TEST_CASE("L3: an armed head refreshes near its go-live, not on every gap", "[finding]") {
+  gTab.init();
+  auto srcbuf = make_source(3.0f, 48000);
+  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  auto run = [&](bool sweep, uint32_t* refreshes, size_t* live) {
+    Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, 0.0f);
+    *live = 0;
+    auto out = drive(seq, 48000 * 3, [&](uint32_t n) {
+      // Sweep step 1's position 0.30 -> 0.60 in 30 steps over 1.5 s of step
+      // 0's 2 s dwell (a slow knob turn); the direct run sits at 0.60.
+      if (sweep && n >= 12000 && n < 84000 && n % 2400 == 0)
+        seq.position[1] = 0.30f + 0.01f * (float)((n - 12000) / 2400 + 1);
+      if (!sweep && n == 12000) seq.position[1] = 0.60f;
+      if (*live == 0 && seq.curStep() == 1) *live = n;
+    });
+    *refreshes = seq.refreshes();
+    return out;
+  };
+  uint32_t rSweep, rDirect; size_t liveS, liveD;
+  auto a = run(true, &rSweep, &liveS);
+  auto b = run(false, &rDirect, &liveD);
+  REQUIRE(liveS == liveD);
+  size_t firstDiff = a.size();
+  for (size_t i = liveS; i < a.size(); i++) if (a[i] != b[i]) { firstDiff = i; break; }
+  WARN("L3: pre-roll refreshes during the sweep: " << rSweep << " (direct move: " << rDirect
+       << "); step 1 first differs from the direct run " << (long)firstDiff - (long)liveS
+       << " samples after go-live (none = the final position reached the pre-roll)");
+  REQUIRE(firstDiff == a.size());                 // F4 still holds: last turn wins
+  REQUIRE(rSweep <= 3);                           // one near go-live, not one per gap
 }

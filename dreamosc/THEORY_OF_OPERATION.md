@@ -226,8 +226,12 @@ render, do it, return. Each call:
      `nextOnset_`.
    - **REFRESH**: a frame is staged but the controls it used differ from live
      (size index or stretch differ, or position moved by more than 0.002), the
-     queue has room, and at least one hop (or `4 × cost`, or 10 ms) has passed
-     since this head's last refresh.
+     queue has room, and at least `4 × cost` (≥ 10 ms) has passed since this
+     head's last refresh. There is no one-hop floor: a second move within the
+     same hop can refresh again and land at that hop's boundary (L2). An
+     ARMED head's refresh is further deferred until its go-live is within
+     `8 × cost` — only the pair standing at go-live matters, so a knob on the
+     next step does not cost a pre-roll pair per gap (L3).
    - **NONE**: nothing to do.
 2. Pick the REQUIRED render with the earliest deadline (wrap-safe signed
    compare). Exception: an ARMED head's pre-roll pair whose due is more than

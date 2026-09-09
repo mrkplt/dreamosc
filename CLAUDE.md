@@ -402,13 +402,15 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   (pickup, mode navigation, drift-fold, encoder stepping, LED colors), and
   `shy_fft.h` (round-trips). Gates on exit code; the count grows with behavior —
   read it from the run, don't hardcode it here. See `dreamosc/test/README.md`.
-- **Pod firmware: WORKING on hardware through `alpha4`** (crossfade model,
+- **Pod firmware: WORKING on hardware through `alpha5`** (crossfade model,
   detented stretch to 10000×, two-mode panel controls, PROFILE diagnostics,
-  and the frame model — pre-roll, head pool, EDF rendering, live controls,
-  480 MHz, block 32 — confirmed on the bench at a single sounding head, ring-out
-  removed). The multi-head crossfade march is what the bench still owes — see
-  `dreamosc/OPEN_ISSUES.md`. See the tag discipline above and Fizzy for what's
-  next.
+  the frame model — pre-roll, head pool, EDF rendering, live controls,
+  480 MHz, block 32 — ring-out removed; then the alpha4 cleanup tranche: the
+  bit-identical scheduler extractions, the L2/L3 refresh-latency policy, the
+  block-cadence harness and on-board `crc=` fingerprint, and the whole panel
+  read in the audio callback, heard clean on the bench with two gated heads
+  at `isr_max` 24 µs). See `dreamosc/OPEN_ISSUES.md` for what the bench still
+  owes, the tag discipline above, and Fizzy for what's next.
 - **SD reader: written and compile-checked by `make sd-check`** (a
   `-fsyntax-only` build of `sd_source.h` with the device toolchain and flags —
   nothing `#include`s it yet, so this is what keeps it honest against a GCC or

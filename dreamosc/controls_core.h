@@ -528,6 +528,25 @@ inline int drainPanelEvents(PanelQueue<N>& q, EncoderState& enc, Sequencer& seq,
   return detents;
 }
 
+// The control IRQ's liveness rule. There is no such thing as a dead-controls
+// boot: no controls, no instrument. So the main loop watches the IRQ's tick
+// counter on every poll, and if it has not advanced for `limit` consecutive
+// polls (polls are >= 1 ms apart; the IRQ ticks at 2 kHz) the loop takes
+// the panel over itself, for good. This is the rule; the takeover is in
+// dreamosc.cpp. The first cut of the IRQ path shipped with a timer that did
+// not fire for 18 s after reset -- this is what makes that a profiler line
+// instead of a dead instrument.
+struct TickWatchdog {
+  uint32_t seen = 0;
+  int      stale = 0;
+  // Called once per poll with the IRQ's tick count. True once the IRQ is
+  // judged dead (stays true: the caller switches paths and stops calling).
+  bool dead(uint32_t ticks, int limit) {
+    if (ticks != seen) { seen = ticks; stale = 0; return false; }
+    return ++stale >= limit;
+  }
+};
+
 // led2 brightness for the current page = that page's encoded LEVEL, so a bright
 // LED always means "this parameter is turned up":
 //   stretch -> stretch detent index, steps -> active step count,

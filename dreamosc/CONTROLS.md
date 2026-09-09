@@ -144,9 +144,19 @@ the ring on its **1 ms wall-clock tick** and applies each event with its
 *original* timing, so the fast/slow speed model is unaffected by how long a
 render blocked the loop, and a click before a detent still changes the page
 first. The knobs (ADC read, smoothing, pickup) and LEDs stay on the main-loop
-tick. The IRQ owns the `Encoder`/`Switch` objects exclusively. Profiler:
-`det=` (detents applied per second — count them against the physical clicks)
-and `drop=` (ring overflows, must stay 0). Audio block is 32 samples.
+tick. The IRQ owns the `Encoder`/`Switch` objects exclusively.
+
+**There is no dead-controls boot.** No controls, no instrument. The main loop
+watches the IRQ's tick counter on every poll (`TickWatchdog`, host-tested);
+if it stops advancing for 50 consecutive polls the loop stops the timer and
+runs the same debounce/queue code itself from then on — the panel is then
+read at the loop's cadence (behind renders), which is the pre-L1 behaviour,
+never nothing. (The first cut of the IRQ path had a timer that did not fire
+for 18 s after reset; this is what turns that into a profiler line.)
+Profiler: `det=` (detents applied per second — count them against the
+physical clicks), `drop=` (ring overflows, must stay 0), `tick=` (control
+ticks per second, ~2000 from the IRQ) and `ctrl=` (1 = IRQ, 0 = the main
+loop took over). Audio block is 32 samples.
 
 ## Where the logic lives
 

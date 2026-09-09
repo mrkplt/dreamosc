@@ -668,3 +668,22 @@ TEST_CASE("drainPanelEvents: every queued button press is applied, in order") {
   drainPanelEvents(q, e, seq, pe, lastMs);
   REQUIRE(pe.slot() == 1);                         // to GLOBAL, then step 1
 }
+
+TEST_CASE("TickWatchdog: a ticking IRQ never trips; a stalled one trips after `limit` polls") {
+  TickWatchdog w;
+  uint32_t ticks = 0;
+  for (int i = 0; i < 1000; i++) { ticks += 2; REQUIRE_FALSE(w.dead(ticks, 50)); }   // alive
+  for (int i = 0; i < 49; i++) REQUIRE_FALSE(w.dead(ticks, 50));                    // 49 stale polls
+  REQUIRE(w.dead(ticks, 50));                                                         // the 50th
+  // A stall that recovers before the limit is forgiven.
+  TickWatchdog v;
+  v.dead(7, 50);
+  for (int i = 0; i < 30; i++) REQUIRE_FALSE(v.dead(7, 50));
+  REQUIRE_FALSE(v.dead(8, 50));
+  for (int i = 0; i < 49; i++) REQUIRE_FALSE(v.dead(8, 50));
+  REQUIRE(v.dead(8, 50));
+  // Boot: a counter that never leaves zero trips too.
+  TickWatchdog b;
+  for (int i = 0; i < 49; i++) REQUIRE_FALSE(b.dead(0, 50));
+  REQUIRE(b.dead(0, 50));
+}

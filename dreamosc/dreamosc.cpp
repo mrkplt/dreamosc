@@ -288,9 +288,32 @@ static void startControlTimer() {
 static uint32_t profDetents = 0;   // detents applied since the last print
 #endif
 
+// There is no such thing as a dead-controls boot: no controls, no
+// instrument. If the IRQ's tick counter stops advancing for 50 consecutive
+// polls (>= 50 ms; it should tick 100 times in that span) the main loop
+// stops the timer and runs ControlTick() itself on every poll from then on:
+// same debounce, same queue, same drain -- the panel just gets read at the
+// loop's cadence (behind renders) instead of the IRQ's. The rule is the
+// host-tested TickWatchdog; `ctrl=` on the PROFILE KNOB line says which path
+// is live (1 = IRQ, 0 = main loop) so a silent takeover is never silent.
+static TickWatchdog controlWatch;
+static bool         controlsFromIrq = true;
+static constexpr int CONTROL_STALL_POLLS = 50;
+
+static void pollControlsFromLoopIfIrqDead() {
+  if (!controlsFromIrq) { ControlTick(nullptr); return; }
+  if (controlWatch.dead(controlTicks, CONTROL_STALL_POLLS)) {
+    controlTimer.Stop();          // never two debouncers on one encoder
+    controlsFromIrq = false;
+    ControlTick(nullptr);
+  }
+}
+
 static void processControls() {
-  // --- encoder detents / click, buttons: whatever the IRQ queued since the
-  // last pass, in order, with their own timing (drainPanelEvents). ---
+  // --- encoder detents / click, buttons: from the IRQ, or from here if the
+  // IRQ is not ticking (pollControlsFromLoopIfIrqDead); either way they land
+  // in panelQ and are applied in order with their own timing. ---
+  pollControlsFromLoopIfIrqDead();
   int det = drainPanelEvents(panelQ, enc, seq, panel, lastDetentMs);
 #ifdef PROFILE
   profDetents += (uint32_t)det;
@@ -368,11 +391,13 @@ static void profilePrint() {
   // threshold. f1/f2 = the fast verdict at print time. det = encoder detents
   // applied this second (count them against the physical clicks: the L1
   // bench check), drop = panel events the IRQ queue refused, ever (must stay
-  // 0), tick = control-IRQ fires this second (must read ~2000; 0 means the
-  // timer is not running). b1/b2 = buttons held, as the IRQ last saw them.
+  // 0), tick = control ticks this second (~2000 from the IRQ; the main-loop
+  // poll rate once it has taken over), ctrl = which path reads the panel
+  // (1 = IRQ, 0 = the main loop took over because the IRQ stopped ticking).
+  // b1/b2 = buttons held, as the last tick saw them.
   uint32_t ticks = controlTicks;
   pod.seed.PrintLine(
-      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u drop=%u tick=%u",
+      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u drop=%u tick=%u ctrl=%d",
       scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
       scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
       (int)panel.k1Live(), (int)panel.k2Live(),
@@ -380,7 +405,7 @@ static void profilePrint() {
       (int)panel.fast1(), (int)panel.fast2(),
       (int)(buttonsPressed & 1), (int)((buttonsPressed >> 1) & 1),
       (unsigned)profDetents, (unsigned)panelQ.dropped.load(),
-      (unsigned)(ticks - prof.lastTicks));
+      (unsigned)(ticks - prof.lastTicks), (int)controlsFromIrq);
   prof.lastTicks = ticks;
   prof.pk1 = prof.pk2 = 0.0f;   // reset peak for the next window
   profDetents = 0;

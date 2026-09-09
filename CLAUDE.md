@@ -346,17 +346,34 @@ showing `[0483:df11] ... @Internal Flash /0x08000000` before flashing.
 STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
 `File downloaded successfully` line above it means the flash landed.
 
-### Sample audio: QSPI (temporary scaffolding)
+### Sample audio: microSD first, QSPI blob as the fallback
 
-**Why:** internal flash is only 128 KB, so real sample material (hundreds of KB)
-cannot be embedded. QSPI is 8 MB and memory-mapped, so the firmware reads samples
-in place with no copy.
+**Boot order (`load_source_at_boot` in `dreamosc.cpp`, Fizzy #131):**
+1. **microSD**: the first `*.wav` in the card's root directory — *first* means
+   alphabetical, case-insensitive (FAT directory order is write order, so it is
+   the only stable meaning); dotfiles are skipped (macOS writes an AppleDouble
+   `._name.wav` twin next to every file on a FAT card). 16-bit PCM only, mono
+   or multichannel folded to mono by the mean, truncated to `SOURCE_LEN`
+   (10 s at 48 kHz). All of that logic is `source_core.h` (host-tested over a
+   memory reader); `sd_source.h` is only SDMMC/FatFs glue, compile-checked by
+   `make sd-check`. `USE_FATFS = 1` in the Makefile pulls in FatFs's
+   `option/ccsbcs.c`, which `libdaisy.a` lacks.
+2. **QSPI blob** (the scaffolding below), if no card / no usable file.
+3. **A synthesized tone**, so the instrument always makes sound.
 
-**This is temporary.** It exists so the controls can be judged on broadband
-material — a sine has no spectral variation across the buffer, so moving a read
-head sounds identical everywhere and the controls appear to do nothing. The
-intended long-term source is the SD card path (Fizzy #131, `sd_source.h`, already
-written); swap to it once a card is present.
+The PROFILE `SRC` line shows which stage won, the material's rate and length,
+the file name, and the reason each earlier stage fell through. **`src.len` is
+the material length under every loader** (position 0..1 spans the file). **The
+material's sample rate is reported but NOT applied**: a 44.1 kHz file plays
+about 9% fast/sharp at the 48 kHz codec. The amen break in QSPI is 44.1 kHz,
+so every bench judgment so far was made that way; changing it is a sound
+decision (OPEN_ISSUES.md).
+
+**QSPI blob — why it exists:** internal flash is only 128 KB, so real sample
+material (hundreds of KB) cannot be embedded, and before a card was present
+the controls had to be judged on broadband material (a sine has no spectral
+variation across the buffer). The current blob is a mono fold of
+`cw_amen13_173.wav` (rhythm-lab.com amen vol. 1; 5.55 s, 44.1 kHz).
 
 ```
 make sample SAMPLE_SRC=/path/to.wav   # WAV -> tools/wav2raw.py blob
@@ -411,24 +428,23 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   read in the audio callback, heard clean on the bench with two gated heads
   at `isr_max` 24 µs). See `dreamosc/OPEN_ISSUES.md` for what the bench still
   owes, the tag discipline above, and Fizzy for what's next.
-- **SD reader: written and compile-checked by `make sd-check`** (a
-  `-fsyntax-only` build of `sd_source.h` with the device toolchain and flags —
-  nothing `#include`s it yet, so this is what keeps it honest against a GCC or
-  libDaisy change) against the real libDaisy API (`SdmmcHandler` +
-  `FatFSInterface`, mount at `"/"`, chunk-walking WAV parser, stereo->mono
-  fold). Not yet run on hardware (no card yet — Fizzy #131). Source today is
-  the QSPI sample scaffolding (see below). **Before wiring SD, decide the
-  `Source` length rule:** QSPI wrap-pads to `SOURCE_LEN` and every step
-  position was tuned against that padded scale; `sd_source.h` sets `len` to
-  the file length (OPEN_ISSUES.md).
+- **SD source: wired at boot (#131), host-tested, NOT yet heard on hardware.**
+  `load_source_at_boot()` tries the card, then the QSPI blob, then the stub.
+  The WAV parser, the stereo fold and the "first WAV" rule are in
+  `source_core.h` with tests (canonical / LIST-before-data / odd chunks /
+  lying data length / 24-bit and EXTENSIBLE refused); `sd_source.h` is glue
+  and `make sd-check` keeps it compiling against libDaisy. Bench owes: boot
+  with no card falls back within about a second; a card with the amen WAV
+  prints `SRC kind=2 rate=44100 len=244716`; a 24-bit-only card falls back
+  with `sd_err=7`.
 
 ## Key facts a future agent needs
 
 - **Source is source-agnostic by design.** `Source { float* data; uint32_t len; }`
-  with wrapping reads. `sd_source.h::load_source()` is the ONE seam that decides
-  where audio comes from. Today: SD card at boot (card not present yet — stub with
-  a test tone until one is). This SD path is reused in later projects, so it was
-  built for real, not faked.
+  with wrapping reads. `load_source_at_boot()` in `dreamosc.cpp` is the ONE
+  seam that decides where audio comes from: the microSD's first WAV, else the
+  QSPI blob, else a test tone. This SD path is reused in later projects, so it
+  was built for real, not faked.
 - **Controls → see `dreamosc/CONTROLS.md`** for the full, current mapping (two
   knob modes global/step via button1, encoder pages stretch/fade/frame, pickup,
   the ROYGBIVW step LED, the speed model, and the hard-won pickup/polling facts).

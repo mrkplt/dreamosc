@@ -1,18 +1,16 @@
-// sd_source.h - load a WAV file off the Pod's microSD into an SDRAM buffer and
-// hand it to the DSP core as a Source.
+// sd_source.h - load the first WAV off the Pod's microSD into an SDRAM buffer
+// and hand it to the DSP core as a Source (Fizzy #131).
 //
-// This is the one place that knows where source audio comes from. stretch_core.h
-// stays source-agnostic (Source is just a float* + length); everything upstream
-// of load_source() is finished and only the body here changes if the origin ever
-// does. The signature is the seam:
+// This is the hardware edge of the source path and nothing more: SDMMC bring-
+// up, FatFs mount, a root-directory walk, and a FIL adapter for the reader
+// interface. Every decision -- which entry counts as "the first WAV", the
+// chunk walk, the format check, the stereo fold -- is in source_core.h and
+// host-tested (CLAUDE.md: as little as sensibly possible in the un-host-
+// compilable edge). `make sd-check` compiles this header against the real
+// libDaisy/FatFs API with the device toolchain.
 //
-//     bool load_source(Source& src, float* dst, uint32_t dst_capacity,
-//                      const char* path, uint32_t& out_samplerate);
-//
-// Reads 16-bit PCM WAV (mono or stereo), folds stereo to mono to match the
-// single-channel Source the host harness was verified against, and normalizes
-// nothing (the sequencer's power-sum compensation handles level). Returns false
-// on any failure so the caller can fall back to a stub/test tone.
+// Returns false on any failure and says why in `info` (the PROFILE SRC line),
+// leaving `src` untouched so the caller falls back (QSPI blob, then stub).
 
 #ifndef SD_SOURCE_H
 #define SD_SOURCE_H
@@ -20,166 +18,96 @@
 #include <cstdint>
 #include <cstring>
 
-// daisy_seed.h pulls in SdmmcHandler, FatFSInterface, and FatFs (ff.h).
+// daisy_seed.h pulls in SdmmcHandler, FatFSInterface and FatFs (ff.h).
 #include "daisy_seed.h"
 #include "stretch_core.h"
+#include "source_core.h"
 
 namespace stretchsd {
 
-// Minimal canonical-WAV header fields we care about. We parse chunks rather than
-// assuming a fixed 44-byte header, because real files interleave LIST/fact/etc.
-struct WavFmt {
-  uint16_t audio_format   = 1;   // 1 = PCM
-  uint16_t num_channels   = 1;
-  uint32_t sample_rate    = 48000;
-  uint16_t bits_per_sample = 16;
+// The reader interface (source_core.h) over an open FatFs file.
+struct FilReader {
+  FIL* f;
+  explicit FilReader(FIL* fil) : f(fil) {}
+  bool read(void* dst, uint32_t n, uint32_t& got) {
+    UINT br = 0;
+    FRESULT r = f_read(f, dst, n, &br);
+    got = br;
+    return r == FR_OK;
+  }
+  bool seek(uint32_t pos) { return f_lseek(f, pos) == FR_OK; }
+  uint32_t tell() const { return (uint32_t)f_tell(f); }
+  uint32_t size() const { return (uint32_t)f_size(f); }
 };
 
-// Read a little-endian u16/u32 from a 4-byte-aligned-agnostic byte pointer.
-static inline uint16_t rd_u16(const uint8_t* p) {
-  return (uint16_t)(p[0] | (p[1] << 8));
-}
-static inline uint32_t rd_u32(const uint8_t* p) {
-  return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24));
-}
-
-// Parse the WAV header from an open FatFs file, leaving the read cursor at the
-// first sample of the data chunk. Fills fmt and data_bytes. Returns false if the
-// file is not a 16-bit PCM WAV we can read.
-static bool parse_wav_header(FIL* fp, WavFmt& fmt, uint32_t& data_bytes) {
-  uint8_t hdr[12];
-  UINT    br = 0;
-  if (f_read(fp, hdr, 12, &br) != FR_OK || br != 12) return false;
-  if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) return false;
-
-  bool have_fmt = false;
+// Walk the root directory once and keep the candidate that sorts first
+// (pickFirstWav). Returns false if there is none.
+inline bool findFirstWav(char* best, size_t cap) {
+  best[0] = '\0';
+  DIR dir;
+  if (f_opendir(&dir, "/") != FR_OK) return false;
+  FILINFO fno;
   for (;;) {
-    uint8_t ch[8];
-    if (f_read(fp, ch, 8, &br) != FR_OK || br != 8) return false;  // ran out
-    uint32_t id  = rd_u32(ch);
-    uint32_t len = rd_u32(ch + 4);
-
-    if (id == 0x20746d66u) {  // "fmt "
-      uint8_t f[16];
-      uint32_t take = len < 16 ? len : 16;
-      if (f_read(fp, f, take, &br) != FR_OK || br != take) return false;
-      fmt.audio_format    = rd_u16(f + 0);
-      fmt.num_channels    = rd_u16(f + 2);
-      fmt.sample_rate     = rd_u32(f + 4);
-      fmt.bits_per_sample = rd_u16(f + 14);
-      have_fmt = true;
-      // Skip any bytes of the fmt chunk beyond the 16 we consumed, plus pad.
-      uint32_t rest = (len > 16 ? len - 16 : 0) + (len & 1);
-      if (rest) f_lseek(fp, f_tell(fp) + rest);
-    } else if (id == 0x61746164u) {  // "data"
-      if (!have_fmt) return false;
-      if (fmt.audio_format != 1 || fmt.bits_per_sample != 16) return false;
-      data_bytes = len;
-      return true;  // cursor is now at the first sample
-    } else {
-      // Skip an unknown chunk (LIST, fact, etc.), honoring the pad byte.
-      if (f_lseek(fp, f_tell(fp) + len + (len & 1)) != FR_OK) return false;
-    }
+    if (f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == '\0') break;
+    pickFirstWav(fno.fname, (fno.fattrib & AM_DIR) != 0, best, cap);
   }
+  f_closedir(&dir);
+  return best[0] != '\0';
 }
 
-// Fill dst[0..out_count) with mono float samples from the WAV. Reads in blocks
-// so we never need a second big buffer; stereo is folded to mono on the fly.
-// dst_capacity is in samples (floats), sized for SOURCE_SECONDS * sample_rate.
-static bool read_wav_mono(FIL* fp, const WavFmt& fmt, uint32_t data_bytes,
-                          float* dst, uint32_t dst_capacity, uint32_t& out_count) {
-  const uint16_t ch          = fmt.num_channels ? fmt.num_channels : 1;
-  const uint32_t frame_bytes = 2u * ch;                 // 16-bit per channel
-  const uint32_t total_frames = data_bytes / frame_bytes;
-  const uint32_t want         = total_frames < dst_capacity ? total_frames
-                                                            : dst_capacity;
-
-  static uint8_t block[4096];
-  const uint32_t frames_per_block = sizeof(block) / frame_bytes;
-
-  uint32_t written = 0;
-  while (written < want) {
-    uint32_t frames_now = want - written;
-    if (frames_now > frames_per_block) frames_now = frames_per_block;
-    uint32_t bytes_now = frames_now * frame_bytes;
-
-    UINT br = 0;
-    if (f_read(fp, block, bytes_now, &br) != FR_OK) return false;
-    if (br == 0) break;
-    uint32_t got_frames = br / frame_bytes;
-
-    for (uint32_t f = 0; f < got_frames; f++) {
-      const uint8_t* p = block + f * frame_bytes;
-      if (ch == 1) {
-        dst[written] = (int16_t)rd_u16(p) / 32768.0f;
-      } else {
-        int32_t acc = 0;
-        for (uint16_t c = 0; c < ch; c++) acc += (int16_t)rd_u16(p + 2 * c);
-        dst[written] = (float)acc / (ch * 32768.0f);
-      }
-      written++;
-    }
-    if (got_frames < frames_now) break;  // short read = EOF
-  }
-  out_count = written;
-  return written > 0;
-}
-
-// The seam. Mounts the SD card, opens `path`, loads it into dst (an SDRAM
-// buffer of dst_capacity floats), and points src at it. On any failure returns
-// false and leaves src untouched so the caller can substitute a stub.
-//
-// hw is the already-initialized DaisySeed (we need it for the SDMMC pins /
-// clock config libDaisy sets up).
-inline bool load_source(daisy::DaisySeed& hw, Source& src, float* dst,
-                        uint32_t dst_capacity, const char* path,
-                        uint32_t& out_samplerate) {
+// The seam. Mounts the card, loads the first WAV into dst (an SDRAM buffer of
+// `cap` floats, so a file longer than that is truncated) and points src at
+// it: src.len is the MATERIAL length, so position 0..1 spans the file.
+inline bool load_source(Source& src, float* dst, uint32_t cap, SourceInfo& info) {
   using namespace daisy;
+  info.sdErr = SE_OK;
+  info.name[0] = '\0';
 
-  // Bring up the SD peripheral in 4-bit, standard-speed mode. FAST is available
-  // but standard is the safe default for the first bring-up.
+  // 4-bit, standard speed (25 MHz): the safe first-bring-up setting.
   static SdmmcHandler  sdmmc;
   SdmmcHandler::Config sd_cfg;
   sd_cfg.Defaults();
   sd_cfg.speed = SdmmcHandler::Speed::STANDARD;
   sd_cfg.width = SdmmcHandler::BusWidth::BITS_4;
-  if (sdmmc.Init(sd_cfg) != SdmmcHandler::Result::OK) return false;
+  if (sdmmc.Init(sd_cfg) != SdmmcHandler::Result::OK) { info.sdErr = SE_NO_CARD; return false; }
 
-  // Bind FatFs to the SD media and mount at "/", as the WavParser example does.
   static FatFSInterface fsi;
-  if (fsi.Init(FatFSInterface::Config::Media::MEDIA_SD) != FatFSInterface::Result::OK)
-    return false;
-  if (f_mount(&fsi.GetSDFileSystem(), "/", 1) != FR_OK) return false;
-
-  // Build a full path against the "/" mount (e.g. "/source.wav").
-  char full[128];
-  {
-    size_t n = 0;
-    full[n++] = '/';
-    for (const char* q = path; *q && n < sizeof(full) - 1; ++q) full[n++] = *q;
-    full[n] = '\0';
+  if (fsi.Init(FatFSInterface::Config::Media::MEDIA_SD) != FatFSInterface::Result::OK
+      || f_mount(&fsi.GetSDFileSystem(), "/", 1) != FR_OK) {
+    info.sdErr = SE_NO_FS; return false;
   }
+
+  char name[sizeof(info.name)];
+  if (!findFirstWav(name, sizeof(name))) { f_mount(nullptr, "/", 0); info.sdErr = SE_NO_WAV; return false; }
+
+  char full[sizeof(name) + 1];
+  full[0] = '/';
+  memcpy(full + 1, name, strlen(name) + 1);
 
   FIL fil;
   if (f_open(&fil, full, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
-    f_mount(nullptr, "/", 0);
-    return false;
+    f_mount(nullptr, "/", 0); info.sdErr = SE_OPEN; return false;
   }
 
-  WavFmt   fmt;
-  uint32_t data_bytes = 0;
-  bool     ok = parse_wav_header(&fil, fmt, data_bytes);
-  uint32_t count = 0;
-  if (ok) ok = read_wav_mono(&fil, fmt, data_bytes, dst, dst_capacity, count);
-
+  FilReader rd(&fil);
+  WavInfo   w;
+  SourceErr err = parseWav(rd, w);
+  uint32_t  count = 0;
+  if (err == SE_OK) {
+    static uint8_t block[4096];
+    count = readWavMono(rd, w, dst, cap, block, sizeof(block), err);
+  }
   f_close(&fil);
   f_mount(nullptr, "/", 0);
 
-  if (!ok || count == 0) return false;
+  memcpy(info.name, name, strlen(name) + 1);
+  info.rate = w.rate;
+  if (err != SE_OK || count == 0) { info.sdErr = err == SE_OK ? SE_EMPTY : err; return false; }
 
-  src.data        = dst;
-  src.len         = count;
-  out_samplerate  = fmt.sample_rate;
+  src.data  = dst;
+  src.len   = count;
+  info.kind = SRC_SD;
+  info.len  = count;
   return true;
 }
 

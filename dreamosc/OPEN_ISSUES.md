@@ -50,16 +50,23 @@ Found while reviewing the codebase for cleanup, deliberately NOT changed —
 each one alters what the instrument does or how it feels, so it is a decision
 and/or a bench item, not a cleanup. Recorded so they are not lost.
 
-- **The sample blob's rate is never applied.** `tools/wav2raw.py` promises
-  "the firmware reads the header and scales playback accordingly";
-  `decodeSampleBlob()` returns `rate` and `dreamosc.cpp` ignores it (and
-  `sd_source.h` returns `out_samplerate` that nothing consumes). A non-48 kHz
-  blob plays pitch-shifted. Applying it is a sound change.
-- **QSPI and SD disagree on the `Source` length rule.** QSPI wrap-pads to
-  `SOURCE_LEN` (10 s) and sets `len` to that; `sd_source.h` sets `len` to the
-  file's sample count. Position 0..1 spans different material under each, and
-  every step position tuned by ear so far is against the padded scale. Decide
-  the rule once (a shared `finishSource()` both loaders call) before wiring SD.
+- **The material's sample rate is never applied — and the amen break is
+  44.1 kHz.** `tools/wav2raw.py` promises "the firmware reads the header and
+  scales playback accordingly"; nothing does. The QSPI blob is a mono fold of
+  `cw_amen13_173.wav` at 44,100 Hz, so through alpha5 the instrument has been
+  playing it at 48 kHz: ~9% fast and ~1.5 semitones sharp, and every bench
+  judgment so far was made on that. The SD path now REPORTS the rate on the
+  PROFILE `SRC` line but still does not apply it. Resampling at load (or a
+  read-rate ratio in `fillWindowed`) is a sound change: its own card and its
+  own bench session.
+- ~~QSPI and SD disagree on the `Source` length rule~~ — decided with #131:
+  **`src.len` is the material length under every loader** (the file's sample
+  count, capped at `SOURCE_LEN`), so position 0..1 spans the file. The QSPI
+  fallback therefore changed: the amen used to be wrap-padded to 10 s (about
+  1.8 copies) with `len = 10 s`; it is now 5.55 s once. Every step position
+  tuned against the padded scale reads differently on the fallback. One line
+  flips it back (`out.len = SOURCE_LEN` in `load_qspi_sample`); the padding
+  `decodeSampleBlob` writes is inert because reads wrap modulo `len`.
 - ~~Control poll is blocked behind renders~~ — done (L1), after a detour.
   **Where the panel is read is now the audio callback**: `processControls()`
   runs at the top of every callback, before `render()`, for the encoder,

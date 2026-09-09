@@ -12,6 +12,7 @@
 #include "stretch_core.h"
 #include "controls_core.h"
 #include "source_core.h"
+#include "sd_source.h"
 
 using namespace daisy;
 
@@ -177,14 +178,37 @@ static Source   src;
 // 0x90000000 base, and redefining it was a warning on every build.)
 #define SAMPLE_QSPI_ADDR 0x90400000u
 
-// Load the QSPI sample into the SDRAM source buffer as float, wrap-padded to
-// SOURCE_LEN. Returns false if no valid blob is present (never uploaded, or
-// erased), so the caller can fall back to a synthesized source rather than
-// playing garbage. The blob's sample rate is decoded but NOT applied (see the
-// NOTE in source_core.h and OPEN_ISSUES.md).
-static bool load_qspi_sample() {
+// Where the source came from at boot (SD / QSPI / stub), its rate and length,
+// and why an earlier stage fell through -- printed as the PROFILE SRC line.
+// The boot crc= renders this material, so crc is comparable only between
+// builds whose SRC lines match.
+static SourceInfo srcInfo;
+
+// Load the QSPI sample into the SDRAM source buffer as float. Returns false
+// if no valid blob is present (never uploaded, or erased), so the caller can
+// fall back to a synthesized source rather than playing garbage. The blob's
+// sample rate is decoded and reported but NOT applied (see the NOTE in
+// source_core.h and OPEN_ISSUES.md).
+static bool load_qspi_sample(Source& out) {
   uint32_t rate = 0;
-  return decodeSampleBlob((const uint8_t*)SAMPLE_QSPI_ADDR, sourceBuf, SOURCE_LEN, rate) > 0;
+  uint32_t n = decodeSampleBlob((const uint8_t*)SAMPLE_QSPI_ADDR, sourceBuf, SOURCE_LEN, rate);
+  if (n == 0) { srcInfo.qspiErr = SE_NO_BLOB; return false; }
+  out.data = sourceBuf; out.len = n;
+  srcInfo.kind = SRC_QSPI; srcInfo.rate = rate; srcInfo.len = n;
+  return true;
+}
+
+// Source length rule (decided for #131, recorded in OPEN_ISSUES.md): src.len
+// is the MATERIAL length under every loader, so position 0..1 spans the
+// file. The QSPI blob used to be wrap-padded to SOURCE_LEN (10 s) with len =
+// SOURCE_LEN; reads wrap modulo len anyway, so the padding decodeSampleBlob
+// still writes is inert.
+static void load_source_at_boot(Source& out) {
+  if (stretchsd::load_source(out, sourceBuf, SOURCE_LEN, srcInfo)) return;
+  if (load_qspi_sample(out)) return;
+  fillStubSource(sourceBuf, SOURCE_LEN, SAMPLE_RATE);
+  out.data = sourceBuf; out.len = SOURCE_LEN;
+  srcInfo.kind = SRC_STUB; srcInfo.rate = SAMPLE_RATE; srcInfo.len = SOURCE_LEN;
 }
 
 // --- controls ---------------------------------------------------------------
@@ -345,6 +369,15 @@ static void profilePrint() {
       (unsigned)AUDIO_BLOCK,
       (int)enc.page,
       panel.slot());                         // 0 = GLOBAL, 1..N = step
+  // SRC line: where the material came from (0 = synthesized stub, 1 = QSPI
+  // blob, 2 = SD), its own sample rate (reported, NOT applied: a 44.1 kHz
+  // file plays 9% fast at the 48 kHz codec), its length in samples, the SD
+  // file name, and why the SD / QSPI stages fell through (SourceErr codes in
+  // source_core.h; 0 = ok). crc= is comparable only between builds with the
+  // same SRC line.
+  pod.seed.PrintLine("SRC kind=%d rate=%u len=%u sd_err=%d qspi_err=%d file=%s",
+                     (int)srcInfo.kind, (unsigned)srcInfo.rate, (unsigned)srcInfo.len,
+                     (int)srcInfo.sdErr, (int)srcInfo.qspiErr, srcInfo.name);
   // KNOB line: raw (r1/r2) and smoothed (k1/k2) knob reads (*1000) and whether
   // pickup has engaged on the current slot (k1L/k2L = 1 once the pot has moved
   // past threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
@@ -475,14 +508,12 @@ int main(void) {
 #endif
 
   gTab.init();                       // ShyFFT + window/blend tables (SDRAM is up)
-  // TEMPORARY (#132 testing): real material from QSPI so the controls can be
-  // judged on broadband audio -- a sine has no spectral variation across the
-  // buffer, so moving a read head sounds identical everywhere. Reverts to the
-  // SD-card path (#131) once the controls are sorted. Either way the buffer is
-  // SOURCE_LEN of material (the blob is wrap-padded to fill it).
-  if (!load_qspi_sample()) fillStubSource(sourceBuf, SOURCE_LEN, SAMPLE_RATE);
-  src.data = sourceBuf;
-  src.len  = SOURCE_LEN;
+  // Source material, before audio starts (#131): the first WAV on the microSD
+  // (alphabetically, root directory, 16-bit PCM, stereo folded to mono, up to
+  // SOURCE_LEN samples); else the QSPI blob (the control-testing scaffolding,
+  // now the fallback); else a synthesized tone so the instrument always makes
+  // sound. Card init plus the read is the audible boot delay.
+  load_source_at_boot(src);
 
   seq.init(&src, pod.AudioSampleRate(), voicePool);
 #ifdef PROFILE

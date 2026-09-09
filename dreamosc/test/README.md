@@ -37,7 +37,9 @@ scheduling on the host. The former Python golden regression is retired.
 
 Alongside: `test_controls_core.cpp` (the control surface: pickup, panel
 navigation, encoder tables and per-page dispatch, LED levels),
-`test_source_core.cpp` (the QSPI sample-blob decode), `test_findings.cpp`
+`test_source_core.cpp` (the QSPI sample-blob decode, the WAV chunk walk and
+stereo fold over a memory reader, the "first WAV on the card" rule),
+`test_findings.cpp`
 (code-review findings as regression guards), `test_block_cadence.cpp` (the
 device's `render(buf, 32)` cadence via `drive_blocks`: the per-block
 housekeeping runs once per 32 samples there, not per sample; also pins the

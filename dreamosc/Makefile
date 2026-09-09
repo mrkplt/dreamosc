@@ -15,6 +15,12 @@ DAISYSP_DIR  = ../DaisySP
 # "more cache-dependent" i.e. slower, a real risk for the audio callback.
 APP_TYPE = BOOT_SRAM
 
+# FatFs for the microSD source (#131, sd_source.h). libdaisy.a already carries
+# ff.c/diskio.c, but NOT option/ccsbcs.c (ff_convert/ff_wtoupper, needed with
+# long-file-name support on); USE_FATFS=1 makes libDaisy's core Makefile add
+# the FatFs sources to this build -- the same wiring the DaisyExamples use.
+USE_FATFS = 1
+
 # --- Vendored third-party sources -------------------------------------------
 # Pinned to exact upstream commits in ../vendor/manifest.txt and fetched by
 # ../vendor/fetch.sh. Vendored files are NEVER edited in place: `make

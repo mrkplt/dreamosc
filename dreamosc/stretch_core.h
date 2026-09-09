@@ -804,11 +804,12 @@ class Sequencer {
 
   // ---- ISR: audio ----------------------------------------------------------
 
-  // The live controls a block is rendered against. The main loop is the only
-  // writer of duration/fade/activeSteps and cannot preempt the ISR, so they
-  // are constant across one render() anyway; snapshotting them makes that a
-  // property of the code rather than of the caller, and is why tick() needs
-  // no per-sample re-check of the step count.
+  // The live controls a block is rendered against. On the device the audio
+  // callback writes the controls (from the panel) and then calls render(),
+  // and the main loop never writes them, so they are constant across one
+  // render() anyway; snapshotting them makes that a property of the code
+  // rather than of the caller, and is why tick() needs no per-sample
+  // re-check of the step count.
   struct Block { SeamGeom g; int steps; };
 
   // Render n mono samples. Per-block constants are hoisted; the per-sample

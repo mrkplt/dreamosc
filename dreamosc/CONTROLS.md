@@ -133,30 +133,29 @@ Fast = coarse step, slow = fine.
 
 ### Control polling
 
-**Encoder and buttons are read from a 2 kHz timer IRQ** (TIM5, below audio
-priority), not the main loop. The main loop polls between `service()` calls,
-i.e. behind whatever render is in flight (1.2 ms at 4096, 14–29 ms at
-16384), and libDaisy's encoder debounce needs two *consecutive* 1 ms samples,
-so a fast spin at 16384 dropped or mis-signed detents (L1). The IRQ debounces
-and pushes timestamped events into a lock-free ring (`PanelQueue` /
-`drainPanelEvents` in `controls_core.h`, host-tested); the main loop drains
-the ring on its **1 ms wall-clock tick** and applies each event with its
-*original* timing, so the fast/slow speed model is unaffected by how long a
-render blocked the loop, and a click before a detent still changes the page
-first. The knobs (ADC read, smoothing, pickup) and LEDs stay on the main-loop
-tick. The IRQ owns the `Encoder`/`Switch` objects exclusively.
+**The whole panel — encoder, buttons, knobs and LEDs — is read in the AUDIO
+CALLBACK**, at the top of every callback before the block is rendered
+(`processControls()` in `dreamosc.cpp`; 1.5 kHz at block 32). That is where
+Electrosmith's own Pod examples read it, and it is the only placement that
+works here: the main loop is busy with non-preemptible 1.2–29 ms FFT renders,
+and libDaisy's encoder debounce needs two *consecutive* 1 ms samples, so a
+poll that can only run between renders drops or mis-signs detents on a fast
+spin at 16384 (and the OLED, #141, would block the loop further). The
+callback therefore **owns every control value the Sequencer reads**; the
+main loop is a pure producer that only reads them to render frames (see
+THEORY §6). A display goes in the main loop, never the callback (a 128×64
+I²C frame is ~10 ms of bus time).
 
-**There is no dead-controls boot.** No controls, no instrument. The main loop
-watches the IRQ's tick counter on every poll (`TickWatchdog`, host-tested);
-if it stops advancing for 50 consecutive polls the loop stops the timer and
-runs the same debounce/queue code itself from then on — the panel is then
-read at the loop's cadence (behind renders), which is the pre-L1 behaviour,
-never nothing. (The first cut of the IRQ path had a timer that did not fire
-for 18 s after reset; this is what turns that into a profiler line.)
+Rates inside the callback: libDaisy's debouncers self-limit to one sample
+per millisecond (edges are valid only on the call that sampled them; the
+pure `applyDigitalControls()` in `controls_core.h` applies click-then-detent
+in that same call). The **knobs are sampled once per millisecond on purpose**:
+the smoother and the pickup speed detector are per-call filters tuned at
+1 kHz, and sampling them at 1.5 kHz would change how duration and drift feel.
+The LEDs are libDaisy software PWM and want the steady callback rate.
 Profiler: `det=` (detents applied per second — count them against the
-physical clicks), `drop=` (ring overflows, must stay 0), `tick=` (control
-ticks per second, ~2000 from the IRQ) and `ctrl=` (1 = IRQ, 0 = the main
-loop took over). Audio block is 32 samples.
+physical clicks); `isr_max` on the COST line includes the panel read. Audio
+block is 32 samples.
 
 ## Where the logic lives
 

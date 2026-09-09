@@ -594,96 +594,51 @@ TEST_CASE("applyKnob: one behavior, ranges differ per spec") {
   REQUIRE(applyKnob(dur, 0.5f, 0.0f) == Approx(0.25f + (60.0f - 0.25f) * 0.5f));
 }
 
-// --- panel event queue (the timer-IRQ control path, L1) --------------------
+// --- one debounce sample of the digital panel, applied (audio-callback path) --
 
-TEST_CASE("PanelQueue: single-producer ring keeps order, counts drops when full") {
-  PanelQueue<4> q;
-  REQUIRE(q.pending() == 0);
-  REQUIRE(q.push(PanelEvent::DETENT, +1, 10));
-  REQUIRE(q.push(PanelEvent::ENC_CLICK, 0, 11));
-  REQUIRE(q.push(PanelEvent::DETENT, -1, 12));
-  REQUIRE(q.push(PanelEvent::BUTTON1, 0, 13));
-  REQUIRE(q.pending() == 4);
-  REQUIRE_FALSE(q.push(PanelEvent::BUTTON2, 0, 14));   // full: refused, counted
-  REQUIRE(q.dropped.load() == 1);
-  PanelEvent e;
-  REQUIRE(q.pop(e)); REQUIRE(e.kind == PanelEvent::DETENT); REQUIRE(e.inc == 1); REQUIRE(e.ms == 10);
-  REQUIRE(q.pop(e)); REQUIRE(e.kind == PanelEvent::ENC_CLICK);
-  REQUIRE(q.pop(e)); REQUIRE(e.kind == PanelEvent::DETENT); REQUIRE(e.inc == -1);
-  REQUIRE(q.pop(e)); REQUIRE(e.kind == PanelEvent::BUTTON1);
-  REQUIRE_FALSE(q.pop(e));
-  REQUIRE(q.push(PanelEvent::BUTTON2, 0, 15));          // room again after pops
-  REQUIRE(q.pop(e)); REQUIRE(e.kind == PanelEvent::BUTTON2);
-}
-
-TEST_CASE("drainPanelEvents: detents keep their own timing (fast/slow) however late they drain") {
+TEST_CASE("applyDigitalControls: detent speed comes from the gap to the previous detent") {
   Sequencer& seq = fresh_seq();
   PanelEditor pe;
   EncoderState e;                                  // stretch page, idx 20 (50x)
   encoderSync(e, seq);
-  PanelQueue<16> q;
   uint32_t lastMs = 0;
-  // Three detents 100 ms, then 5 ms, then 5 ms apart, all drained at once
-  // 30 ms after the last (a render blocked the loop): slow, fast, fast.
-  q.push(PanelEvent::DETENT, +1, 1000);
-  q.push(PanelEvent::DETENT, +1, 1005);
-  q.push(PanelEvent::DETENT, +1, 1010);
-  REQUIRE(drainPanelEvents(q, e, seq, pe, lastMs) == 3);
-  REQUIRE(e.stretchIdx == 20 + 1 + 3 + 3);         // slow (1) + fast (3) + fast (3)
+  // 1000 ms after "never": slow (+1 stop); then 5 ms later: fast (+3); 5 ms
+  // later again: fast (+3).
+  REQUIRE(applyDigitalControls(e, seq, pe, false, +1, false, false, 1000, lastMs) == 1);
+  REQUIRE(applyDigitalControls(e, seq, pe, false, +1, false, false, 1005, lastMs) == 1);
+  REQUIRE(applyDigitalControls(e, seq, pe, false, +1, false, false, 1010, lastMs) == 1);
+  REQUIRE(e.stretchIdx == 20 + 1 + 3 + 3);
   REQUIRE(lastMs == 1010);
-  REQUIRE(q.pending() == 0);
-  // Nothing queued: a no-op.
-  REQUIRE(drainPanelEvents(q, e, seq, pe, lastMs) == 0);
+  // A sample with nothing on it is a no-op and does not disturb the timing.
+  REQUIRE(applyDigitalControls(e, seq, pe, false, 0, false, false, 1011, lastMs) == 0);
   REQUIRE(e.stretchIdx == 27);
+  REQUIRE(lastMs == 1010);
 }
 
-TEST_CASE("drainPanelEvents: a click ahead of a detent moves the page before the detent lands") {
+TEST_CASE("applyDigitalControls: a click in the same sample as a detent moves the page first") {
   Sequencer& seq = fresh_seq();
   PanelEditor pe;
   EncoderState e;
   encoderSync(e, seq);
-  PanelQueue<16> q;
   uint32_t lastMs = 0;
-  q.push(PanelEvent::ENC_CLICK, 0, 500);           // stretch -> steps
-  q.push(PanelEvent::DETENT, -1, 600);
-  drainPanelEvents(q, e, seq, pe, lastMs);
-  REQUIRE(e.page == PAGE_STEPS);
+  applyDigitalControls(e, seq, pe, /*click=*/true, -1, false, false, 500, lastMs);
+  REQUIRE(e.page == PAGE_STEPS);                   // stretch -> steps
   REQUIRE(seq.activeSteps == SS_STEPS - 1);        // the detent hit the steps page
   REQUIRE(e.stretchIdx == STRETCH_DEFAULT_IDX);    // not the stretch page
 }
 
-TEST_CASE("drainPanelEvents: every queued button press is applied, in order") {
+TEST_CASE("applyDigitalControls: buttons advance / return to GLOBAL, one edge per sample") {
   Sequencer& seq = fresh_seq();
   PanelEditor pe;
   EncoderState e;
-  PanelQueue<16> q;
   uint32_t lastMs = 0;
-  q.push(PanelEvent::BUTTON1, 0, 1);
-  q.push(PanelEvent::BUTTON1, 0, 2);
-  q.push(PanelEvent::BUTTON1, 0, 3);
-  drainPanelEvents(q, e, seq, pe, lastMs);
+  for (int i = 0; i < 3; i++) applyDigitalControls(e, seq, pe, false, 0, true, false, i, lastMs);
   REQUIRE(pe.slot() == 3);                         // three advances: GLOBAL -> step 3
-  q.push(PanelEvent::BUTTON2, 0, 4);
-  q.push(PanelEvent::BUTTON1, 0, 5);
-  drainPanelEvents(q, e, seq, pe, lastMs);
-  REQUIRE(pe.slot() == 1);                         // to GLOBAL, then step 1
-}
-
-TEST_CASE("TickWatchdog: a ticking IRQ never trips; a stalled one trips after `limit` polls") {
-  TickWatchdog w;
-  uint32_t ticks = 0;
-  for (int i = 0; i < 1000; i++) { ticks += 2; REQUIRE_FALSE(w.dead(ticks, 50)); }   // alive
-  for (int i = 0; i < 49; i++) REQUIRE_FALSE(w.dead(ticks, 50));                    // 49 stale polls
-  REQUIRE(w.dead(ticks, 50));                                                         // the 50th
-  // A stall that recovers before the limit is forgiven.
-  TickWatchdog v;
-  v.dead(7, 50);
-  for (int i = 0; i < 30; i++) REQUIRE_FALSE(v.dead(7, 50));
-  REQUIRE_FALSE(v.dead(8, 50));
-  for (int i = 0; i < 49; i++) REQUIRE_FALSE(v.dead(8, 50));
-  REQUIRE(v.dead(8, 50));
-  // Boot: a counter that never leaves zero trips too.
-  TickWatchdog b;
-  for (int i = 0; i < 49; i++) REQUIRE_FALSE(b.dead(0, 50));
-  REQUIRE(b.dead(0, 50));
+  applyDigitalControls(e, seq, pe, false, 0, false, true, 4, lastMs);
+  REQUIRE(pe.inGlobal());
+  applyDigitalControls(e, seq, pe, false, 0, true, false, 5, lastMs);
+  REQUIRE(pe.slot() == 1);
+  // Both in one sample: button1 then button2, so GLOBAL wins.
+  applyDigitalControls(e, seq, pe, false, 0, true, true, 6, lastMs);
+  REQUIRE(pe.inGlobal());
 }

@@ -60,18 +60,33 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   file's sample count. Position 0..1 spans different material under each, and
   every step position tuned by ear so far is against the padded scale. Decide
   the rule once (a shared `finishSource()` both loaders call) before wiring SD.
-- ~~Control poll is blocked behind renders~~ — done (L1): the encoder and
-  buttons are debounced from a 2 kHz TIM5 IRQ (NVIC 0x0f; audio DMA is 0)
-  into a timestamped SPSC event ring (`PanelQueue`, `drainPanelEvents` in
-  `controls_core.h`, host-tested for order, fast/slow timing and overflow);
-  the main loop drains it on its 1 ms tick. Knobs/LEDs stay in the loop.
-  **Bench-only verification** (no host test can see the IRQ): at 16384, spin
-  the encoder a counted number of clicks and compare `det=` on the KNOB
-  line; `drop=` must stay 0; a click then an immediate detent must land on
-  the new page; buttons must edge-trigger exactly once per press. 2 kHz
-  rather than 1 kHz because libDaisy's debouncers self-limit to one sample
-  per `GetNow()` millisecond and a 1 kHz timer would beat against that
-  clock.
+- ~~Control poll is blocked behind renders~~ — done (L1), after a detour.
+  **Where the panel is read is now the audio callback**: `processControls()`
+  runs at the top of every callback, before `render()`, for the encoder,
+  buttons, knobs and LEDs; the main loop is a pure producer. That is
+  Electrosmith's own convention (every Pod example with audio does it) and
+  the same shape as Mutable Instruments' 1 kHz UI tick, and it makes the ISR
+  the single owner of every control value (THEORY §6). The detour: a 2 kHz
+  TIM5 IRQ was tried first (e343806); its period was configured after
+  `Init()` and libDaisy's auto-reload preload made it wait ~18 s (3e30c05),
+  which then needed a watchdog and a main-loop fallback (e649509) to be safe
+  — a timer, a queue and a fallback for something the audio ISR already
+  provides. All of that is gone. Note for the record: the main-loop poll's
+  failure mode (a detent's whole Gray cycle inside one 14–29 ms render) was
+  a code-review finding never reproduced on the bench; the Daisy forum has
+  the same failure from an OLED refresh blocking the loop, which is exactly
+  what #141 would add. **Bench-only verification** (no host test can see the
+  callback): at 16384, spin the encoder a counted number of clicks and
+  compare `det=` on the KNOB line; a click then an immediate detent must land
+  on the new page; buttons must edge-trigger exactly once per press; knobs,
+  pickup and LEDs must feel as before (the smoother still samples at 1 kHz);
+  `isr_max` on the COST line now includes the panel read (expected: well
+  under 1 µs more).
+- **A display (#141) must go in the main loop, never the callback.** One
+  128×64 frame over I²C at 1 MHz is ~1 KB ≈ 10 ms of bus time and libDaisy's
+  SSD130x driver sends it blocking: inside a 0.67 ms callback that is 15
+  dropped blocks per refresh. In the main loop it is harmless now that the
+  panel is no longer read there.
 - ~~Refresh-gap floor of one hop~~ — done (L2): `gap = max(4·cost, 480)`.
   Measured precisely before changing it: the floor cost exactly ONE extra hop
   (not ~2 as first written), and only for a second move inside the same hop
@@ -104,10 +119,11 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   seam-time re-check removed, `nextOnset_` on the Sequencer instead of `due_`
   on every Head, `retireOutgoing()`/`armAfter()` in `tick()` (next commit).
   Correction to the review: the `activeSteps` snapshot IS bit-identical for
-  every input — the main loop is the only writer and cannot preempt the ISR,
-  so the value is constant across a `render()` on the device, and the host
-  runs the block-top check before every sample; the seam-time re-check was
-  dead in both. Still open: `render()` re-deriving `slack` after its F7
+  every input — the controls are written before `render()` in the same
+  callback (and were written by a main loop that cannot preempt the ISR
+  before that), so the value is constant across a `render()` on the device,
+  and the host runs the block-top check before every sample; the seam-time
+  re-check was dead in both. Still open: `render()` re-deriving `slack` after its F7
   re-sync (a latency item, below); `gUnderruns`/`gClips` as Sequencer members
   (three platform files of churn for no latency value — skipped);
   interleaving/relocating the blend tables (wait for `isr_max` bench data).
@@ -121,8 +137,8 @@ and/or a bench item, not a cleanup. Recorded so they are not lost.
   producer cannot run inside a block (go-live at sample 32 vs 1). The
   scheduling-sensitive cases (F3, F9, the 16384 crossfade march, the
   live-control latencies) pass at block cadence. Note there is no "control
-  landed mid-block" window on the device either: the main loop is the only
-  writer of the controls and cannot preempt the ISR, so a control is constant
+  landed mid-block" window on the device either: the controls are written at
+  the top of the audio callback, before `render()`, so a control is constant
   for a whole `render()`.
 - **On-board fingerprint.** `make PROFILE=1` now prints `crc=` on the COST
   line: a CRC-32 of a fixed-config 1.5 s render taken at boot with audio

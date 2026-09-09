@@ -269,10 +269,24 @@ The ISR owns time. Per block, `Sequencer::render()` snapshots the live
 controls into a `Block` (dwell length `round(duration · sr)`, seam geometry,
 the active step count), does the per-block housekeeping (queue drains, the
 armed head's deadline, a re-arm if the step count shrank under the armed
-head), then ticks samples against that snapshot. The main loop is the only
-writer of the controls and cannot preempt the ISR, so they are constant across
-a block anyway; the snapshot makes that a property of the code, and is why
-`tick()` has no per-sample step-count check.
+head), then ticks samples against that snapshot.
+
+**Who writes the controls.** The audio callback does. On the device the
+panel (encoder, buttons, knobs) is read at the top of every audio callback,
+before `render()` (`processControls` in `dreamosc.cpp`), so the ISR is the
+single owner of every control value the Sequencer reads: `stretch`,
+`position[]`, `duration`, `fade`, `frameSize`, `activeSteps`. They are
+therefore settled before a block is rendered against them; the `Block`
+snapshot makes that a property of the code, and is why `tick()` has no
+per-sample step-count check. The main loop only *reads* them, in
+`service()`, to render frames. A control can change between a main-loop
+`plan()` and its `render()` (the ISR ran in between); that is safe by
+construction: `render()` re-reads position, a frame rendered with the newer
+value is simply the better frame, and the next `plan()` sees no further
+change. (The host harness writes the controls from the same thread that
+calls `render()`, so it models the same ordering.) The knobs' smoother and
+pickup speed detector sample once per millisecond inside the callback, the
+rate they were tuned at.
 
 **Dwell and seam.** `seamGeom(dur, fade)` gives `fadeLen = dur · fade` (fade
 clamped to 0..0.5) and `onset = dur − fadeLen`. A dwell runs `elapsed_` from 0.

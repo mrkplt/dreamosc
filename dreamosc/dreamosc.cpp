@@ -110,7 +110,6 @@ struct Prof {
   // the WORST single render, which the average hides. Watch max_us at 16384.
   uint32_t maxTicks = 0;
   uint32_t lastUnder = 0, lastClip = 0, lastLate = 0, lastRefresh = 0, lastIsr = 0;
-  uint32_t lastTicks = 0;
   uint32_t lastPrint = 0;
   float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
   // Peak per-poll knob speed since the last print (instantaneous speed is ~0
@@ -203,10 +202,10 @@ static bool load_qspi_sample() {
 // arriving. So you can tour steps (and hop to global) without disturbing values
 // you don't touch. All the mode/pickup logic is the host-tested PanelEditor.
 //
-// Read from the MAIN LOOP, not the audio callback: debouncing and smoothing do
-// not belong in an interrupt, and the sequencer reads these values live anyway.
-// The encoder's page + index state, the stretch detent table, the per-page
-// dispatch (applyEncoder) and the led2 level (pageBrightness) all live in
+// Read from the AUDIO CALLBACK (see processControls below), which then owns
+// every control value the Sequencer reads. The encoder's page + index state,
+// the stretch detent table, the per-page dispatch (applyDigitalControls /
+// applyEncoder) and the led2 level (pageBrightness) all live in
 // controls_core.h (host-tested); this is just the state instance.
 static EncoderState enc;
 
@@ -233,110 +232,75 @@ static bool  knobPrimed    = false;
 
 // Timestamp of the last encoder detent, for the shared fast/slow speed
 // detection (encoderFast). Carried across page changes (a click then a quick
-// detent on the new page reads as fast, as it did with the in-loop poll).
+// detent on the new page reads as fast).
 static uint32_t lastDetentMs = 0;
 
-// --- digital controls: a timer IRQ, not the main loop (L1) ------------------
-// The main loop polls between service() calls, i.e. behind whatever render is
-// in flight (1.2 ms at 4096, 14-29 ms at 16384), and libDaisy's encoder
-// debounce needs the A phase low on two CONSECUTIVE 1 ms samples, so a fast
-// spin at 16384 dropped or mis-signed detents. TIM5 now fires ControlTick at
-// 2 kHz (libDaisy's timer IRQs sit at NVIC priority 0x0f, the audio DMA at 0,
-// so audio always preempts it; the tick is a few GPIO reads). The Encoder and
-// Switch objects belong to the IRQ from here on -- the main loop never
-// touches them; it drains the event queue (controls_core.h, host-tested) and
-// applies the events with their original timestamps. 2 kHz, not 1 kHz: the
-// libDaisy debouncers rate-limit themselves to once per GetNow() millisecond,
-// and a 1 kHz timer would beat against that clock and skip samples.
-// TIM2 is System's tick source; TIM5 is the other 32-bit timer.
-static PanelQueue<32> panelQ;
-static TimerHandle    controlTimer;
-static volatile uint8_t  buttonsPressed = 0;   // bit0 = button1, bit1 = button2 (PROFILE)
-static volatile uint32_t controlTicks   = 0;   // IRQ fires, ever (PROFILE prints the rate)
-static constexpr uint32_t CONTROL_TICK_HZ = 2000;
-
-static void ControlTick(void*) {
-  controlTicks++;
-  pod.ProcessDigitalControls();
-  uint32_t ms = System::GetNow();
-  int32_t inc = pod.encoder.Increment();
-  if (inc != 0)                panelQ.push(PanelEvent::DETENT, (int8_t)inc, ms);
-  if (pod.encoder.RisingEdge()) panelQ.push(PanelEvent::ENC_CLICK, 0, ms);
-  if (pod.button1.RisingEdge()) panelQ.push(PanelEvent::BUTTON1, 0, ms);
-  if (pod.button2.RisingEdge()) panelQ.push(PanelEvent::BUTTON2, 0, ms);
-  buttonsPressed = (uint8_t)((pod.button1.Pressed() ? 1 : 0) | (pod.button2.Pressed() ? 2 : 0));
-}
-
-static void startControlTimer() {
-  TimerHandle::Config cfg;
-  cfg.periph     = TimerHandle::Config::Peripheral::TIM_5;
-  cfg.dir        = TimerHandle::Config::CounterDir::UP;
-  cfg.enable_irq = true;
-  // The period MUST be in the Config, not applied with SetPeriod() after
-  // Init(): libDaisy inits the timer with auto-reload PRELOAD enabled, so a
-  // later ARR write is only latched at the next update event -- which, from
-  // the Config's default period of 0xffffffff, is 2^32 ticks away (~18 s at
-  // 240 MHz). That is how the first cut of this shipped with dead controls.
-  // Tick rate is 2 x PCLK1 with prescaler 0 (libDaisy's own GetFreq()).
-  cfg.period = (System::GetPClk1Freq() * 2) / CONTROL_TICK_HZ;
-  controlTimer.Init(cfg);
-  controlTimer.SetCallback(ControlTick);
-  controlTimer.Start();
-}
-
+// --- the panel is read from the AUDIO CALLBACK -------------------------------
+// processControls() runs at the top of every audio callback (1.5 kHz at block
+// 32), before render(). That is where Electrosmith's own Pod examples read the
+// panel, and for this firmware it is the only placement that works: the main
+// loop is busy with non-preemptible 1.2-29 ms FFT renders, and libDaisy's
+// encoder debounce needs the A phase low on two CONSECUTIVE 1 ms samples, so a
+// poll that can only run between renders drops or mis-signs detents (the
+// Daisy forum has the same failure with an OLED refresh blocking the loop).
+// A timer IRQ was the first fix; it needed a watchdog and a fallback to be
+// safe, and reading the panel where the audio already runs needs neither:
+// if the audio ISR is not running there is no instrument anyway.
+//
+// Consequence: the ISR owns EVERY control value the Sequencer reads
+// (stretch, position[], duration, fade, frameSize, activeSteps), written here
+// before render() so they are constant across a block; the main loop only
+// reads them to render frames (THEORY_OF_OPERATION.md, section 6).
+//
+// Rates. The debouncers self-limit to one sample per GetNow() millisecond, so
+// calling them at 1.5 kHz is exactly right (never a skipped ms, edges valid
+// on this call only). The knobs are sampled once per ms too, on purpose: the
+// smoother (smoothKnob) and the pickup speed detector (potFast) are per-call
+// filters tuned at 1 kHz; sampling them at the callback rate would change how
+// duration and drift feel under the hand. The LEDs are libDaisy SOFTWARE PWM
+// (Led::Update steps a ramp per call) and want the steady callback rate.
+// Cost: a handful of GPIO reads and float ops; isr_max on the COST line is
+// the measurement.
+static uint32_t lastKnobMs = 0;
 #ifdef PROFILE
-static uint32_t profDetents = 0;   // detents applied since the last print
+static volatile uint32_t profDetents = 0;   // detents applied since the last print
 #endif
 
-// There is no such thing as a dead-controls boot: no controls, no
-// instrument. If the IRQ's tick counter stops advancing for 50 consecutive
-// polls (>= 50 ms; it should tick 100 times in that span) the main loop
-// stops the timer and runs ControlTick() itself on every poll from then on:
-// same debounce, same queue, same drain -- the panel just gets read at the
-// loop's cadence (behind renders) instead of the IRQ's. The rule is the
-// host-tested TickWatchdog; `ctrl=` on the PROFILE KNOB line says which path
-// is live (1 = IRQ, 0 = main loop) so a silent takeover is never silent.
-static TickWatchdog controlWatch;
-static bool         controlsFromIrq = true;
-static constexpr int CONTROL_STALL_POLLS = 50;
-
-static void pollControlsFromLoopIfIrqDead() {
-  if (!controlsFromIrq) { ControlTick(nullptr); return; }
-  if (controlWatch.dead(controlTicks, CONTROL_STALL_POLLS)) {
-    controlTimer.Stop();          // never two debouncers on one encoder
-    controlsFromIrq = false;
-    ControlTick(nullptr);
-  }
-}
-
 static void processControls() {
-  // --- encoder detents / click, buttons: from the IRQ, or from here if the
-  // IRQ is not ticking (pollControlsFromLoopIfIrqDead); either way they land
-  // in panelQ and are applied in order with their own timing. ---
-  pollControlsFromLoopIfIrqDead();
-  int det = drainPanelEvents(panelQ, enc, seq, panel, lastDetentMs);
+  // --- encoder click / turn, buttons: one debounce sample per ms; the edge
+  // flags are valid only on this call, and the pure decision logic applies
+  // them in the same order the old poll did (click before detent). ---
+  pod.ProcessDigitalControls();
+  uint32_t ms = System::GetNow();
+  int det = applyDigitalControls(enc, seq, panel,
+                                 pod.encoder.RisingEdge(), (int)pod.encoder.Increment(),
+                                 pod.button1.RisingEdge(), pod.button2.RisingEdge(),
+                                 ms, lastDetentMs);
 #ifdef PROFILE
   profDetents += (uint32_t)det;
 #else
   (void)det;
 #endif
 
-  pod.ProcessAnalogControls();
-
-  // --- knobs: GLOBAL mode -> duration + global drift; step mode -> that step's
-  // position + per-step drift. PICKUP everywhere (a knob takes over only after
-  // it moves since arriving on a slot). All decision logic is host-tested
-  // (controls_core.h). seq.duration is written by PanelEditor via &seq.duration.
-  float r1 = pod.knob1.Value(), r2 = pod.knob2.Value();   // raw (move detect)
-  float k1 = smoothKnob(knobSmooth[0], r1, knobPrimed);   // smoothed (value)
-  float k2 = smoothKnob(knobSmooth[1], r2, knobPrimed);
-  knobPrimed = true;
-  panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
+  // --- knobs, once per ms: GLOBAL mode -> duration + global drift; step mode
+  // -> that step's position + per-step drift. PICKUP everywhere (a knob takes
+  // over only after it moves since arriving on a slot). All decision logic is
+  // host-tested (controls_core.h). seq.duration is written by PanelEditor via
+  // &seq.duration. ---
+  if (ms != lastKnobMs) {
+    lastKnobMs = ms;
+    pod.ProcessAnalogControls();
+    float r1 = pod.knob1.Value(), r2 = pod.knob2.Value();   // raw (move detect)
+    float k1 = smoothKnob(knobSmooth[0], r1, knobPrimed);   // smoothed (value)
+    float k2 = smoothKnob(knobSmooth[1], r2, knobPrimed);
+    knobPrimed = true;
+    panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
 #ifdef PROFILE
-  prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
-  if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
-  if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
+    prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
+    if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
+    if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
 #endif
+  }
 
   // --- led2: encoder page color (RoYG over stretch/steps/fade/window, same
   // ROYGBIVW palette as led1) at that page's LEVEL (pageBrightness), so a
@@ -391,22 +355,17 @@ static void profilePrint() {
   // threshold. f1/f2 = the fast verdict at print time. det = encoder detents
   // applied this second (count them against the physical clicks: the L1
   // bench check), drop = panel events the IRQ queue refused, ever (must stay
-  // 0), tick = control ticks this second (~2000 from the IRQ; the main-loop
-  // poll rate once it has taken over), ctrl = which path reads the panel
-  // (1 = IRQ, 0 = the main loop took over because the IRQ stopped ticking).
-  // b1/b2 = buttons held, as the last tick saw them.
-  uint32_t ticks = controlTicks;
+  // bench check). b1/b2 = buttons held, as the last debounce sample saw them
+  // (a single-byte read of ISR-owned state; diagnostics only).
   pod.seed.PrintLine(
-      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u drop=%u tick=%u ctrl=%d",
+      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u",
       scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
       scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
       (int)panel.k1Live(), (int)panel.k2Live(),
       scaled(prof.pk1, 1000.0f), scaled(prof.pk2, 1000.0f),
       (int)panel.fast1(), (int)panel.fast2(),
-      (int)(buttonsPressed & 1), (int)((buttonsPressed >> 1) & 1),
-      (unsigned)profDetents, (unsigned)panelQ.dropped.load(),
-      (unsigned)(ticks - prof.lastTicks), (int)controlsFromIrq);
-  prof.lastTicks = ticks;
+      (int)pod.button1.Pressed(), (int)pod.button2.Pressed(),
+      (unsigned)profDetents);
   prof.pk1 = prof.pk2 = 0.0f;   // reset peak for the next window
   profDetents = 0;
   // POS line: all 8 step positions (*1000). Homing every knob should make
@@ -480,6 +439,9 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
   uint32_t t0 = System::GetTick();
   profSampleStack();   // sees the render this ISR preempted (see profMinSp)
 #endif
+  // The panel first, so every control value is settled before this block is
+  // rendered against it (see processControls).
+  processControls();
   // size is the INTERLEAVED sample count (2 * block). Render mono in chunks
   // of at most AUDIO_BLOCK (per-block constants hoisted inside), then
   // duplicate to L/R. Chunking means a larger-than-expected block can never
@@ -546,17 +508,13 @@ int main(void) {
   seq.setSteps(SS_STEPS);
 
   pod.StartAdc();
-  startControlTimer();       // encoder + buttons: TIM5 IRQ from here on (L1)
-  pod.StartAudio(AudioCallback);
+  pod.StartAudio(AudioCallback);   // the panel is read in the callback from here on
 
-  // Main loop: render staged frames (earliest deadline first) and read the
-  // panel. The knobs (ADC smoothing, pickup) and LEDs are handled here on a
-  // WALL-CLOCK 1 ms tick, not every-Nth-service(): a single service() call is
-  // one or two full FFTs. The encoder and buttons are no longer polled here
-  // at all -- the timer IRQ queues their events and processControls() drains
-  // the queue, so a render can delay when a detent is APPLIED (by at most one
-  // render) but never whether it is SEEN.
-  uint32_t lastControlMs = System::GetNow();
+  // Main loop: a pure producer. Render staged frames (earliest deadline
+  // first), nothing else; the panel, the LEDs and every control value belong
+  // to the audio callback (processControls), so a 29 ms render here never
+  // delays a detent or a knob. A display, when it comes (#141), goes HERE:
+  // its I2C frame is ~10 ms of bus time and cannot sit in the callback.
 #ifdef PROFILE
   prof.lastPrint = System::GetNow();
 #endif
@@ -573,12 +531,6 @@ int main(void) {
 #else
     seq.service();
 #endif
-    // Poll the panel on the 1 ms wall clock (see lastControlMs above).
-    uint32_t nowMs = System::GetNow();
-    if (nowMs != lastControlMs) {
-      lastControlMs = nowMs;
-      processControls();
-    }
 #ifdef PROFILE
     uint32_t now = System::GetNow();
     if (now - prof.lastPrint >= 1000) {

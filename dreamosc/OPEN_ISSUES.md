@@ -192,6 +192,18 @@ the fix. What the bench still owes here:
   at 16384 may include some two-head cache eviction, but the +11% at 4096
   cannot. libDaisy's `-O2` stands. `-ffast-math` was never tried and must
   not be: FP reassociation changes the rendered audio.
+  **Second caveat (2026-09-09): the `COST` percentages above are not
+  trustworthy; the `max_us` pair figure is.** `COST` is a recent-max with a
+  1/64 decay per render *at that size*, seeded at boot from the formula
+  (879 at 16384, 417 at 8192, 201 at 4096). It only converges once enough
+  frames have rendered at that size: 879 decays through 723, 712, 701 … at
+  renders 13, 14, 15 and stops falling only when it meets the measured
+  per-frame cost. A `COST 16384=704` read shortly after visiting 16384 is a
+  seed still decaying, not a measurement (a bench pass on a188dea printed
+  exactly that after ~15 renders). To measure a render cost, park at the
+  size until `COST` stops falling, or read `max_us`/`avg_us` (direct timer).
+  The flags comparison's `max_us` 30,047 vs 28,721 µs (+4.6%) stands; its
+  `COST`-based +5–11% does not.
 
 ## Closed by construction (recorded so they are not re-opened)
 

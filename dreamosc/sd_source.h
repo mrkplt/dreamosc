@@ -95,7 +95,8 @@ inline bool load_source(Source& src, float* dst, uint32_t cap, SourceInfo& info)
   uint32_t  count = 0;
   if (err == SE_OK) {
     static uint8_t block[4096];
-    count = readWavMono(rd, w, dst, cap, block, sizeof(block), err);
+    uint32_t want = w.frames < cap ? w.frames : cap;
+    count = readWavFrames(rd, w, 0, want, dst, block, sizeof(block), 512, err);
   }
   f_close(&fil);
   f_mount(nullptr, "/", 0);

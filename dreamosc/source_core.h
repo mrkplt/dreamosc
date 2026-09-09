@@ -95,7 +95,7 @@ enum SourceErr : uint8_t {
   SE_OPEN,           // the chosen file would not open
   SE_NOT_RIFF,       // not a RIFF/WAVE file
   SE_NO_FMT,         // no fmt chunk before the data chunk
-  SE_BAD_FORMAT,     // not 16-bit PCM (24-bit, float, EXTENSIBLE ...)
+  SE_BAD_FORMAT,     // not PCM 8/16/24/32 or float 32 (compressed, ADPCM, 64-bit float ...)
   SE_NO_DATA,        // no data chunk
   SE_IO,             // a read/seek failed mid-file
   SE_EMPTY,          // the file had no samples
@@ -151,9 +151,9 @@ inline bool pickFirstWav(const char* name, bool isDir, char* best, size_t cap) {
 }
 
 // ---------------------------------------------------------------------------
-// WAV: chunk-walking header parse and 16-bit PCM read with stereo->mono fold,
-// over a minimal reader interface so the same code runs on a FatFs FIL (the
-// device) and a memory buffer (the tests):
+// WAV: chunk-walking header parse and PCM decode over a minimal reader
+// interface, so the same code runs on a FatFs FIL (the device) and a memory
+// buffer (the tests):
 //   bool     read(void* dst, uint32_t n, uint32_t& got);   // false = I/O error
 //   bool     seek(uint32_t pos);
 //   uint32_t tell() const;
@@ -162,14 +162,26 @@ inline bool pickFirstWav(const char* name, bool isDir, char* best, size_t cap) {
 // (streaming writers) lie about the data length, so the walk skips unknown
 // chunks with their pad byte and clamps the data length to what the file
 // actually holds.
+//
+// Formats: PCM 8 (unsigned), 16, 24 (packed), 32-bit; IEEE float 32; either
+// plain or wrapped in WAVE_FORMAT_EXTENSIBLE. Channel 0 (left) only, by
+// design for now -- the instrument is mono and a fold was a choice nobody
+// asked for. Scaling is by the CONTAINER width (a 20-in-24 file scales by
+// 2^23 like any 24-bit file), so full scale is always +-1.
 // ---------------------------------------------------------------------------
 
+enum WavCodec : uint8_t { WAV_U8 = 0, WAV_S16, WAV_S24, WAV_S32, WAV_F32 };
+
 struct WavInfo {
-  uint16_t format   = 0;       // 1 = PCM
-  uint16_t channels = 0;
-  uint32_t rate     = 0;
-  uint16_t bits     = 0;
-  uint32_t dataBytes = 0;      // clamped to the file
+  uint16_t format     = 0;     // 1 = PCM, 3 = IEEE float (EXTENSIBLE resolved to these)
+  uint16_t channels   = 0;
+  uint32_t rate       = 0;
+  uint16_t bits       = 0;     // container bits per sample
+  uint16_t blockAlign = 0;     // bytes per frame (all channels)
+  uint32_t dataOffset = 0;     // absolute byte offset of the first frame
+  uint32_t dataBytes  = 0;     // clamped to the file
+  uint32_t frames     = 0;     // dataBytes / blockAlign
+  WavCodec codec      = WAV_S16;
 };
 
 inline uint16_t wavU16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -177,7 +189,23 @@ inline uint32_t wavU32(const uint8_t* p) {
   return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24));
 }
 
-// Parse the header, leaving the reader at the first sample of `data`.
+// The decoder for a (format, bits) pair, or false if unsupported.
+inline bool wavCodecFor(uint16_t format, uint16_t bits, WavCodec& c) {
+  if (format == 1) {
+    switch (bits) {
+      case 8:  c = WAV_U8;  return true;
+      case 16: c = WAV_S16; return true;
+      case 24: c = WAV_S24; return true;
+      case 32: c = WAV_S32; return true;
+      default: return false;
+    }
+  }
+  if (format == 3 && bits == 32) { c = WAV_F32; return true; }
+  return false;
+}
+
+// Parse the header. On success the reader is positioned at the first frame
+// and w.dataOffset records where that is.
 template <class R>
 inline SourceErr parseWav(R& r, WavInfo& w) {
   uint8_t hdr[12]; uint32_t got = 0;
@@ -190,19 +218,29 @@ inline SourceErr parseWav(R& r, WavInfo& w) {
     if (got != 8) return haveFmt ? SE_NO_DATA : SE_NO_FMT;
     uint32_t id = wavU32(ch), len = wavU32(ch + 4);
     if (id == 0x20746d66u) {                                  // "fmt "
-      uint8_t f[16]; uint32_t take = len < 16 ? len : 16;
+      uint8_t f[40]; uint32_t take = len < sizeof(f) ? len : (uint32_t)sizeof(f);
       if (!r.read(f, take, got)) return SE_IO;
       if (got != take || take < 16) return SE_NO_FMT;
       w.format = wavU16(f); w.channels = wavU16(f + 2);
-      w.rate = wavU32(f + 4); w.bits = wavU16(f + 14);
+      w.rate = wavU32(f + 4); w.blockAlign = wavU16(f + 12); w.bits = wavU16(f + 14);
+      if (w.format == 0xFFFE) {                               // WAVE_FORMAT_EXTENSIBLE
+        // cbSize at 16, validBits at 18, channelMask at 20, SubFormat GUID
+        // at 24: its first two bytes are the wrapped format tag.
+        if (take < 26) return SE_BAD_FORMAT;
+        w.format = wavU16(f + 24);
+      }
       haveFmt = true;
-      uint32_t rest = (len - 16) + (len & 1);
+      uint32_t rest = (len - take) + (len & 1);
       if (rest && !r.seek(r.tell() + rest)) return SE_IO;
     } else if (id == 0x61746164u) {                           // "data"
       if (!haveFmt) return SE_NO_FMT;
-      if (w.format != 1 || w.bits != 16 || w.channels == 0) return SE_BAD_FORMAT;
+      if (w.channels == 0 || !wavCodecFor(w.format, w.bits, w.codec)) return SE_BAD_FORMAT;
+      uint16_t minAlign = (uint16_t)(w.channels * (w.bits / 8));
+      if (w.blockAlign < minAlign) w.blockAlign = minAlign;    // a broken writer; recover
+      w.dataOffset = r.tell();
       uint32_t avail = r.size() > r.tell() ? r.size() - r.tell() : 0;
       w.dataBytes = len < avail ? len : avail;                // streaming writers lie here
+      w.frames = w.dataBytes / w.blockAlign;
       return SE_OK;
     } else {
       if (!r.seek(r.tell() + len + (len & 1))) return SE_IO;
@@ -210,41 +248,61 @@ inline SourceErr parseWav(R& r, WavInfo& w) {
   }
 }
 
-// Read up to `cap` mono samples after parseWav() into dst, folding channels
-// by their mean (byte-exact with tools/wav2raw.py and the old sd_source.h).
-// `block` is scratch of `blockBytes` (a multiple of the frame size is not
-// required). Returns the sample count; 0 with err = SE_IO on a failed read.
-template <class R>
-inline uint32_t readWavMono(R& r, const WavInfo& w, float* dst, uint32_t cap,
-                            uint8_t* block, uint32_t blockBytes, SourceErr& err) {
-  const uint32_t ch = w.channels ? w.channels : 1;
-  const uint32_t frameBytes = 2u * ch;
-  const uint32_t total = w.dataBytes / frameBytes;
-  const uint32_t want = total < cap ? total : cap;
-  const uint32_t perBlock = blockBytes / frameBytes;
-  uint32_t written = 0;
-  err = SE_OK;
-  while (written < want && perBlock > 0) {
-    uint32_t frames = want - written;
-    if (frames > perBlock) frames = perBlock;
-    uint32_t got = 0;
-    if (!r.read(block, frames * frameBytes, got)) { err = SE_IO; return 0; }
-    uint32_t gotFrames = got / frameBytes;
-    for (uint32_t f = 0; f < gotFrames; f++) {
-      const uint8_t* p = block + f * frameBytes;
-      if (ch == 1) {
-        dst[written] = (int16_t)wavU16(p) / 32768.0f;
-      } else {
-        int32_t acc = 0;
-        for (uint32_t c = 0; c < ch; c++) acc += (int16_t)wavU16(p + 2 * c);
-        dst[written] = (float)acc / (ch * 32768.0f);
-      }
-      written++;
+// Decode one sample at p.
+inline float wavDecodeSample(const uint8_t* p, WavCodec c) {
+  switch (c) {
+    case WAV_U8:  return ((int)p[0] - 128) / 128.0f;
+    case WAV_S16: return (int16_t)wavU16(p) / 32768.0f;
+    case WAV_S24: {
+      int32_t v = (int32_t)((uint32_t)p[0] << 8 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 24);
+      return (float)(v >> 8) / 8388608.0f;                    // sign-extend via the shift
     }
-    if (gotFrames < frames) break;                            // short read = EOF
+    case WAV_S32: return (float)((int32_t)wavU32(p)) / 2147483648.0f;
+    case WAV_F32: { float v; uint32_t u = wavU32(p); memcpy(&v, &u, 4); return v; }
   }
-  if (written == 0) err = SE_EMPTY;
-  return written;
+  return 0.0f;
+}
+
+// Decode `frames` consecutive frames at `bytes` into dst: channel 0 only.
+inline void wavDecodeFrames(const uint8_t* bytes, uint32_t frames, const WavInfo& w, float* dst) {
+  for (uint32_t f = 0; f < frames; f++)
+    dst[f] = wavDecodeSample(bytes + (size_t)f * w.blockAlign, w.codec);
+}
+
+// Read frames [first, first + n) of a parsed file into dst, through a scratch
+// `stage` of `stageBytes`. Reads are issued at file offsets rounded DOWN to
+// `align` (a sector size on the device: FatFs then moves whole sectors
+// straight into `stage` by DMA instead of through the FIL's private window;
+// 1 = byte-exact, for a memory reader). Frames that straddle the end of one
+// staged read are re-read at the head of the next, so any blockAlign works
+// with any stage size >= align + blockAlign. Returns the frames decoded; a
+// short count with err = SE_IO is a failed read, with err = SE_OK it is the
+// end of the data. `first + n` must not exceed w.frames.
+template <class R>
+inline uint32_t readWavFrames(R& r, const WavInfo& w, uint32_t first, uint32_t n, float* dst,
+                              uint8_t* stage, uint32_t stageBytes, uint32_t align, SourceErr& err) {
+  err = SE_OK;
+  if (align == 0) align = 1;
+  const uint32_t ba = w.blockAlign;
+  uint32_t done = 0;
+  while (done < n) {
+    uint32_t byte = w.dataOffset + (first + done) * ba;
+    uint32_t at = byte - byte % align;
+    uint32_t want = stageBytes;
+    uint32_t end = w.dataOffset + w.dataBytes;
+    if (at + want > end) want = end - at;
+    if (!r.seek(at)) { err = SE_IO; return done; }
+    uint32_t got = 0;
+    if (!r.read(stage, want, got)) { err = SE_IO; return done; }
+    uint32_t availEnd = at + got;
+    uint32_t off = byte - at;
+    uint32_t fit = availEnd > byte ? (availEnd - byte) / ba : 0;
+    if (fit == 0) return done;                                // short read: end of data
+    uint32_t take = n - done < fit ? n - done : fit;
+    wavDecodeFrames(stage + off, take, w, dst + done);
+    done += take;
+  }
+  return done;
 }
 
 // A reader over a memory buffer (tests; also any memory-mapped WAV).

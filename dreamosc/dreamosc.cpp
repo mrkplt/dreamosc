@@ -110,6 +110,7 @@ struct Prof {
   // the WORST single render, which the average hides. Watch max_us at 16384.
   uint32_t maxTicks = 0;
   uint32_t lastUnder = 0, lastClip = 0, lastLate = 0, lastRefresh = 0, lastIsr = 0;
+  uint32_t lastTicks = 0;
   uint32_t lastPrint = 0;
   float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
   // Peak per-poll knob speed since the last print (instantaneous speed is ~0
@@ -250,9 +251,12 @@ static uint32_t lastDetentMs = 0;
 // TIM2 is System's tick source; TIM5 is the other 32-bit timer.
 static PanelQueue<32> panelQ;
 static TimerHandle    controlTimer;
-static volatile uint8_t buttonsPressed = 0;   // bit0 = button1, bit1 = button2 (PROFILE)
+static volatile uint8_t  buttonsPressed = 0;   // bit0 = button1, bit1 = button2 (PROFILE)
+static volatile uint32_t controlTicks   = 0;   // IRQ fires, ever (PROFILE prints the rate)
+static constexpr uint32_t CONTROL_TICK_HZ = 2000;
 
 static void ControlTick(void*) {
+  controlTicks++;
   pod.ProcessDigitalControls();
   uint32_t ms = System::GetNow();
   int32_t inc = pod.encoder.Increment();
@@ -268,8 +272,14 @@ static void startControlTimer() {
   cfg.periph     = TimerHandle::Config::Peripheral::TIM_5;
   cfg.dir        = TimerHandle::Config::CounterDir::UP;
   cfg.enable_irq = true;
+  // The period MUST be in the Config, not applied with SetPeriod() after
+  // Init(): libDaisy inits the timer with auto-reload PRELOAD enabled, so a
+  // later ARR write is only latched at the next update event -- which, from
+  // the Config's default period of 0xffffffff, is 2^32 ticks away (~18 s at
+  // 240 MHz). That is how the first cut of this shipped with dead controls.
+  // Tick rate is 2 x PCLK1 with prescaler 0 (libDaisy's own GetFreq()).
+  cfg.period = (System::GetPClk1Freq() * 2) / CONTROL_TICK_HZ;
   controlTimer.Init(cfg);
-  controlTimer.SetPeriod(controlTimer.GetFreq() / 2000);   // 2 kHz
   controlTimer.SetCallback(ControlTick);
   controlTimer.Start();
 }
@@ -358,16 +368,20 @@ static void profilePrint() {
   // threshold. f1/f2 = the fast verdict at print time. det = encoder detents
   // applied this second (count them against the physical clicks: the L1
   // bench check), drop = panel events the IRQ queue refused, ever (must stay
-  // 0). b1/b2 = buttons held, as the IRQ last saw them.
+  // 0), tick = control-IRQ fires this second (must read ~2000; 0 means the
+  // timer is not running). b1/b2 = buttons held, as the IRQ last saw them.
+  uint32_t ticks = controlTicks;
   pod.seed.PrintLine(
-      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u drop=%u",
+      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u drop=%u tick=%u",
       scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
       scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
       (int)panel.k1Live(), (int)panel.k2Live(),
       scaled(prof.pk1, 1000.0f), scaled(prof.pk2, 1000.0f),
       (int)panel.fast1(), (int)panel.fast2(),
       (int)(buttonsPressed & 1), (int)((buttonsPressed >> 1) & 1),
-      (unsigned)profDetents, (unsigned)panelQ.dropped.load());
+      (unsigned)profDetents, (unsigned)panelQ.dropped.load(),
+      (unsigned)(ticks - prof.lastTicks));
+  prof.lastTicks = ticks;
   prof.pk1 = prof.pk2 = 0.0f;   // reset peak for the next window
   profDetents = 0;
   // POS line: all 8 step positions (*1000). Homing every knob should make

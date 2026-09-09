@@ -13,6 +13,7 @@
 #include "controls_core.h"
 #include "source_core.h"
 #include "sd_source.h"
+#include "codec_rate.h"
 
 using namespace daisy;
 
@@ -184,6 +185,39 @@ static Source   src;
 // builds whose SRC lines match.
 static SourceInfo srcInfo;
 
+// The codec's rate: the material's own (codec_rate.h applies it through PLL3
+// and reads it back). `measured` is what the registers say the codec runs
+// at; it is the sample rate the Sequencer is initialised with, and it is the
+// only rate anything downstream ever sees.
+static CodecRate codecRate;
+
+#ifdef PROFILE
+static void profilePrintSource();
+#endif
+
+// No instrument: something the boot depends on failed (the codec would not
+// take the material's rate). Audio never starts; both LEDs blink red; under
+// PROFILE the SRC line says why, once a second. There is no fallback source
+// by design: a wrong rate or the wrong material is worse than silence.
+static void haltNoInstrument() {
+  uint32_t last = System::GetNow();
+  bool on = true;
+  for (;;) {
+    uint32_t now = System::GetNow();
+    if (now - last >= 500) {
+      last = now; on = !on;
+#ifdef PROFILE
+      if (on) profilePrintSource();
+#endif
+    }
+    float r = on ? 1.0f : 0.0f;
+    pod.led1.Set(r, 0.0f, 0.0f);
+    pod.led2.Set(r, 0.0f, 0.0f);
+    pod.UpdateLeds();
+    System::Delay(1);   // the LEDs are software PWM; keep stepping them
+  }
+}
+
 // Load the QSPI sample into the SDRAM source buffer as float. Returns false
 // if no valid blob is present (never uploaded, or erased), so the caller can
 // fall back to a synthesized source rather than playing garbage. The blob's
@@ -344,6 +378,24 @@ static void processControls() {
 }
 
 #ifdef PROFILE
+// SRC line: where the material came from (0 = synthesized stub, 1 = QSPI
+// blob, 2 = SD), its own sample rate, the codec's rate as READ BACK from the
+// registers (fs; the two must agree -- the codec runs at the material's
+// rate), the codec-rate error code (codec_rate.h; 0 = ok), the board
+// revision libDaisy detected (0 = Seed, 1 = Seed 1.1 / WM8731, 2 = Seed 2
+// DFM / PCM3060), the length in samples, the SD file name, and why the SD /
+// QSPI stages fell through (SourceErr codes in source_core.h; 0 = ok). crc=
+// is comparable only between builds with the same SRC line. Printed on its
+// own from haltNoInstrument() too, so a refused rate is visible.
+static void profilePrintSource() {
+  pod.seed.PrintLine("SRC kind=%d rate=%u fs=%u fs_err=%d board=%d len=%u sd_err=%d qspi_err=%d file=%s",
+                     (int)srcInfo.kind, (unsigned)srcInfo.rate,
+                     (unsigned)codecRate.measured, (int)codecRate.err,
+                     (int)pod.seed.CheckBoardVersion(),
+                     (unsigned)srcInfo.len,
+                     (int)srcInfo.sdErr, (int)srcInfo.qspiErr, srcInfo.name);
+}
+
 // The once-a-second serial dump. Every variable parameter appears here (the
 // profiler directive in CLAUDE.md); the format is the bench's diagnostic
 // contract, so keep the field names stable. Lines stay under libDaisy's
@@ -369,15 +421,7 @@ static void profilePrint() {
       (unsigned)AUDIO_BLOCK,
       (int)enc.page,
       panel.slot());                         // 0 = GLOBAL, 1..N = step
-  // SRC line: where the material came from (0 = synthesized stub, 1 = QSPI
-  // blob, 2 = SD), its own sample rate (reported, NOT applied: a 44.1 kHz
-  // file plays 9% fast at the 48 kHz codec), its length in samples, the SD
-  // file name, and why the SD / QSPI stages fell through (SourceErr codes in
-  // source_core.h; 0 = ok). crc= is comparable only between builds with the
-  // same SRC line.
-  pod.seed.PrintLine("SRC kind=%d rate=%u len=%u sd_err=%d qspi_err=%d file=%s",
-                     (int)srcInfo.kind, (unsigned)srcInfo.rate, (unsigned)srcInfo.len,
-                     (int)srcInfo.sdErr, (int)srcInfo.qspiErr, srcInfo.name);
+  profilePrintSource();
   // KNOB line: raw (r1/r2) and smoothed (k1/k2) knob reads (*1000) and whether
   // pickup has engaged on the current slot (k1L/k2L = 1 once the pot has moved
   // past threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
@@ -515,7 +559,16 @@ int main(void) {
   // sound. Card init plus the read is the audible boot delay.
   load_source_at_boot(src);
 
-  seq.init(&src, pod.AudioSampleRate(), voicePool);
+  // The codec runs at the material's rate (codec_rate.h): PLL3 is
+  // reprogrammed with audio and the ADC both stopped (neither has started
+  // yet here) and the rate is read back from the registers. A refusal is no
+  // instrument, not a resampled or pitched one. From here on `fs` -- the
+  // measured rate, never pod.AudioSampleRate()'s nominal 48000 -- is the
+  // sample rate everything is initialised with.
+  if (!setCodecRate(pod.seed, srcInfo.rate, codecRate)) haltNoInstrument();
+  const float fs = (float)codecRate.measured;
+
+  seq.init(&src, fs, voicePool);
 #ifdef PROFILE
   // Boot fingerprint (see profBootCrc): a fixed-config render with audio still
   // stopped, so service()/render() run strictly sequentially, exactly as the
@@ -523,7 +576,7 @@ int main(void) {
   seq.stretch = 50.0f; seq.duration = 0.5f; seq.fade = 0.5f;
   seq.setSteps(3); seq.setFrame(4096);
   profBootCrc = renderFingerprint(seq, monoBlock, (int)AUDIO_BLOCK, PROF_CRC_SAMPLES);
-  seq.init(&src, pod.AudioSampleRate(), voicePool);
+  seq.init(&src, fs, voicePool);
   gUnderruns = 0; gClips = 0;
 #endif
   // Starting values; the knobs/encoder take over from here (see processControls).

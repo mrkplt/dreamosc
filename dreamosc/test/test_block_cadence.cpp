@@ -36,7 +36,7 @@ TEST_CASE("block-32 render is bit-identical to per-sample render (drained produc
   // exactly so); per sample it lands at sample 1. Compare aligned at go-live.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   const uint32_t total = 48000 * 3 / 2;
   Sequencer a; make_seq(a, &src, 48000, 50.0f, 0.5f, 0.5f); a.setSteps(3);
   Sequencer b; make_seq(b, &src, 48000, 50.0f, 0.5f, 0.5f); b.setSteps(3);
@@ -60,7 +60,7 @@ TEST_CASE("renderFingerprint equals the CRC of the block-32 harness output", "[c
   // drive_blocks, so a device-vs-device comparison is the harness's own test.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto configure = [&](Sequencer& s) {
     make_seq(s, &src, 48000, 50.0f, 0.5f, 0.5f); s.setSteps(3); s.setFrame(4096);
   };
@@ -88,7 +88,7 @@ TEST_CASE("the boot sequence after a fingerprint render restores the audible sta
   // diverge at the fourth) against a never-fingerprinted Sequencer.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   float block[kBlock];
   auto boot = [&](Sequencer& s) {
     make_seq(s, &src, 48000, 50.0f, 1.0f, 0.0f);   // init + the boot values
@@ -114,7 +114,7 @@ TEST_CASE("block-32: live frame size 4096 -> 1024 reaches the sounding head with
           "[cadence]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   uint32_t when = 48000, seen = 0;
   auto out = drive_blocks(seq, 48000 * 2, kBlock, [&](uint32_t n) {
@@ -131,7 +131,7 @@ TEST_CASE("block-32: live position and stretch reach the sounding head within tw
           "[cadence]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](int what) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     return drive_blocks(seq, 48000, kBlock, [&](uint32_t n) {
@@ -153,7 +153,7 @@ TEST_CASE("block-32, costed: step-count shrink under an armed head does not run 
           "[cadence]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
   CostedProducer p;
   uint32_t lateAt = 0;
@@ -168,7 +168,7 @@ TEST_CASE("block-32: the armed head's deadline never reads 'now' through a cross
           "[cadence]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
   int32_t minSlack = 0x7fffffff;
   auto out = drive_blocks(seq, 48000 * 3, kBlock, [&](uint32_t) {
@@ -186,7 +186,7 @@ TEST_CASE("block-32, costed: a 0.25 s march under a full crossfade at 16384 stay
   // seam, plus the armed pair) at the real cadence.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.5f);
   seq.setFrame(16384);
   CostedProducer p(0.0038);

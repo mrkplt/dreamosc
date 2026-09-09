@@ -22,7 +22,7 @@ Sequencer& fresh_seq() {
   static Sequencer seq;
   static bool init = false;
   if (!init) { gTab.init(); init = true; }
-  static Source src;
+  static MemSource src;
   src.data = srcbuf.data();
   src.len = srcbuf.size();
   // init() deliberately leaves the public controls (stretch, duration, fade,

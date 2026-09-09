@@ -40,7 +40,7 @@ inline std::vector<float> make_source(float seconds, uint32_t sr) {
 // Configure a Sequencer for a test: ONE static pool shared by every test
 // (each test renders sequentially and a frame buffer is always written before
 // it is read, so sharing is safe), fixed seed unless given.
-inline void make_seq(Sequencer& seq, const Source* src, float sr, float stretch,
+inline void make_seq(Sequencer& seq, Source* src, float sr, float stretch,
                      float duration, float fade = 0.0f, float drift = 0.0f,
                      uint32_t seed = 0x12345678u) {
   static std::vector<float> pool(SS_POOL_FLOATS);

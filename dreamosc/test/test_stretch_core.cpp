@@ -92,7 +92,7 @@ TEST_CASE("ssHash2 is deterministic and never zero") {
 TEST_CASE("output contains no NaN or Inf and stays within bounds") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.5f);
   auto out = render(seq);
   REQUIRE(out.size() > 0);
@@ -102,7 +102,7 @@ TEST_CASE("output contains no NaN or Inf and stays within bounds") {
 TEST_CASE("deterministic: same config renders identically") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 1.0f, 0.5f);
   Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 1.0f, 0.5f);
   auto a = render(seqA);
@@ -116,7 +116,7 @@ TEST_CASE("startup: audible as soon as the first pre-roll pair is rendered") {
   // first tick arms it; the next service renders its pair). No lookahead wait.
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.0f);
   auto out = render(seq);
   REQUIRE(first_audible(out) <= 8);
@@ -135,7 +135,7 @@ TEST_CASE("raw cut is amplitude-continuous at every frame size (pre-roll)") {
   // fade-in from silence fails this by 20+ dB at every size.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   for (int w = 512; w <= SS_W; w <<= 1) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
     seq.setFrame(w);
@@ -167,7 +167,7 @@ TEST_CASE("a head's first hop is at steady-state level (per-head pre-roll)") {
   // Cleaner than the seam test: the first hop after startup vs the fifth hop.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   for (int w : {1024, 4096, 16384}) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     seq.setFrame(w);
@@ -186,7 +186,7 @@ TEST_CASE("single active step: no hole between dwells") {
   // lookahead of silence per dwell. A pool head per visit closes it.
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
   seq.setSteps(1);
   auto out = render(seq, 4);
@@ -200,7 +200,7 @@ TEST_CASE("no local discontinuity in head interiors (click detector)") {
   // not a transient -- design ruling). Nothing INSIDE a head may step.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.0f);
   uint32_t dur = seq.durSamples();
   auto out = render(seq, 2);
@@ -227,7 +227,7 @@ TEST_CASE("no local discontinuity in head interiors (click detector)") {
 TEST_CASE("level held roughly flat across crossfade (constant-loudness)") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   double prev = -1.0;
   for (float fade : {0.0f, 0.15f, 0.3f, 0.5f}) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, fade);
@@ -241,7 +241,7 @@ TEST_CASE("level held roughly flat across crossfade (constant-loudness)") {
 TEST_CASE("no per-step volume dips at max fade") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.5f);
   auto out = render(seq, 2);
   const uint32_t w = 2400;
@@ -261,7 +261,7 @@ TEST_CASE("renders at multiple sample rates without blowing up") {
   gTab.init();
   for (uint32_t sr : {44100u, 48000u, 96000u}) {
     auto srcbuf = make_source(1.5f, sr);
-    Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+    MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
     Sequencer seq; make_seq(seq, &src, (float)sr, 30.0f, 1.0f, 0.5f);
     auto out = render(seq);
     REQUIRE(out.size() > 0);
@@ -274,7 +274,7 @@ TEST_CASE("renders at multiple sample rates without blowing up") {
 TEST_CASE("duration is live and unquantized (frame size does not bend timing)") {
   gTab.init();
   auto srcbuf = make_source(1.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
   uint32_t at4096 = seq.durSamples();
   seq.setFrame(16384);
@@ -288,7 +288,7 @@ TEST_CASE("duration crank-down mid-dwell fast-marches with no silence") {
   // there is no cold-arrival gap at all.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 60.0f, 0.0f);
   int stepsSeen = 0, last = -1;
   auto out = drive(seq, 48000 * 3, [&](uint32_t n) {
@@ -305,7 +305,7 @@ TEST_CASE("duration crank-down mid-dwell fast-marches with no silence") {
 TEST_CASE("steady short-duration march stays fed") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
   auto out = render(seq, 3);
   REQUIRE(silent_windows(out, first_audible(out)) == 0);
@@ -315,7 +315,7 @@ TEST_CASE("steady short-duration march stays fed") {
 TEST_CASE("shrinking activeSteps under an armed head re-arms on a valid step") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.2f, 0.0f);
   bool bad = false;
   auto out = drive(seq, 48000 * 2, [&](uint32_t n) {
@@ -334,7 +334,7 @@ TEST_CASE("live frame size reaches the sounding head within one hop") {
   // replaces the pending frame and applies at the very next boundary.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   uint32_t when = 48000, seen = 0;
   auto out = drive(seq, 48000 * 2, [&](uint32_t n) {
@@ -354,7 +354,7 @@ TEST_CASE("live frame size up to 16384 applies within two hops") {
   // (it would miss) and the pair lands one boundary later. Two hops max.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   uint32_t when = 48000, seen = 0;
   auto out = drive(seq, 48000 * 2, [&](uint32_t n) {
@@ -371,7 +371,7 @@ TEST_CASE("live frame size up to 16384 applies within two hops") {
 TEST_CASE("changing frame size repeatedly mid-render stays clean") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
   seq.setFrame(SS_W);
   const int sizes[] = {SS_W, 512, 2048, 256, 1024, SS_W};
@@ -388,7 +388,7 @@ TEST_CASE("changing frame size repeatedly mid-render stays clean") {
 TEST_CASE("live position moves the sounding head (and is deterministic)") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](bool move) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     return drive(seq, 48000, [&](uint32_t n) { if (move && n == 24000) seq.position[0] = 0.7f; });
@@ -405,7 +405,7 @@ TEST_CASE("live position moves the sounding head (and is deterministic)") {
 TEST_CASE("live stretch reaches the sounding head within two hops") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](bool move) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     return drive(seq, 48000, [&](uint32_t n) { if (move && n == 24000) seq.stretch = 5.0f; });
@@ -425,7 +425,7 @@ TEST_CASE("cost-modelled producer at bench cost keeps a fast crossfade march fed
   // seam, plus the armed pre-roll pair. The EDF scheduler must keep them fed.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.5f);
   seq.setFrame(16384);
   auto out = render_costed(seq, 48000 * 4, 0.0038);
@@ -442,7 +442,7 @@ TEST_CASE("a knob turn right after go-live is not starved by the armed pair (cos
   // a slack-valid refresh. Compare against an unchanged run.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](bool move) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     seq.setFrame(16384);
@@ -468,7 +468,7 @@ TEST_CASE("a knob turn right after go-live is not starved by the armed pair (cos
 TEST_CASE("an overloaded producer degrades to frame repeats, never silence") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.5f);
   seq.setFrame(16384);
   uint32_t before = gUnderruns;
@@ -481,7 +481,7 @@ TEST_CASE("an overloaded producer degrades to frame repeats, never silence") {
 TEST_CASE("a starved head repeats its frame and counts holds") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   for (uint32_t i = 0; i < 4096; i++) { drain(seq); seq.next(); }
   uint32_t before = gUnderruns;
@@ -497,7 +497,7 @@ TEST_CASE("a starved head repeats its frame and counts holds") {
 TEST_CASE("setSteps clamps to [1, SS_STEPS] (#149)") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f);
   REQUIRE(seq.activeSteps == SS_STEPS);
   seq.setSteps(3);  REQUIRE(seq.activeSteps == 3);
@@ -509,7 +509,7 @@ TEST_CASE("setSteps clamps to [1, SS_STEPS] (#149)") {
 TEST_CASE("a K-step sequence renders bounded and walks only K steps") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f);
   seq.setSteps(3);
   int maxStep = 0;
@@ -524,7 +524,7 @@ TEST_CASE("a K-step sequence renders bounded and walks only K steps") {
 TEST_CASE("renders cleanly at every frame size") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   for (int w = SS_W_MIN; w <= SS_W; w <<= 1) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
     seq.setFrame(w);
@@ -543,7 +543,7 @@ TEST_CASE("renders cleanly at every frame size") {
 TEST_CASE("drift perturbs position within bounds and stays reproducible") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seqA; make_seq(seqA, &src, 48000, 50.0f, 0.5f, 0.0f, 0.3f, 42u);
   Sequencer seqB; make_seq(seqB, &src, 48000, 50.0f, 0.5f, 0.0f, 0.3f, 42u);
   auto a = render(seqA), b = render(seqB);

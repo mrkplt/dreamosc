@@ -82,7 +82,9 @@ static_assert(SS_W_DEFAULT >= SS_W_MIN && SS_W_DEFAULT <= SS_W
 #define SS_HEADS 10
 // Frame buffers per head: old + cur + a staged pair + a refresh pair.
 #define SS_FRAME_BUFS 6
-#define SS_HEAD_FLOATS (SS_FRAME_BUFS * SS_W)
+// Per head: the frame buffers plus the window cache (a run of source
+// samples, see WindowCache). SS_CACHE_FLOATS is defined with WindowCache.
+#define SS_HEAD_FLOATS (SS_FRAME_BUFS * SS_W + 4 * SS_W)
 #define SS_POOL_FLOATS (SS_HEADS * SS_HEAD_FLOATS)
 // Staged-frame descriptor queue depth per head (power of two). At most a
 // required render + one refresh are ever pending, plus one stale entry from a
@@ -227,28 +229,189 @@ struct StretchTables {
 extern StretchTables gTab;
 
 // ---------------------------------------------------------------------------
-// The source. A plain buffer plus its length; reads wrap, so every position is
-// legal. fillWindowed() is the hot path: source * window into dst with at most
-// one wrap split, no per-sample modulo.
+// The source. Anything that can deliver a run of mono float samples by index:
+// a memory buffer (host, tests) or a file streamed off the card (device).
+// Reads wrap, so every position is legal and the head's travel is unbounded.
+// A head never reads a Source directly: it reads through its WindowCache
+// (below), which asks the Source for whole runs ahead of need. read() runs on
+// the main loop only (a render), never in the ISR.
 // ---------------------------------------------------------------------------
 
 struct Source {
-  float* data = nullptr;
-  uint32_t len = 0;
-  void fillWindowed(int64_t start, int n, const float* win, float* dst) const {
+  uint32_t len  = 0;     // material length in samples; position 0..1 spans it
+  uint32_t rate = 0;     // the material's own sample rate (0 = unspecified)
+
+  // Fill dst[0..n) with samples [first, first + n) of the material,
+  // first + n <= len. False = the read failed (the caller zero-fills).
+  virtual bool read(uint32_t first, uint32_t n, float* dst) = 0;
+
+  // Wrapping read on the unbounded timeline: samples [start, start + n),
+  // split at the wrap into at most ceil(n / len) + 1 read() calls.
+  bool fetch(int64_t start, uint32_t n, float* dst) {
+    if (len == 0) { memset(dst, 0, (size_t)n * sizeof(float)); return false; }
     int64_t L = (int64_t)len;
     int64_t s = start % L;
     if (s < 0) s += L;
-    int i = 0;
+    uint32_t i = 0;
+    bool ok = true;
     while (i < n) {
-      int run = (int)(L - s);
+      uint32_t run = (uint32_t)(L - s);
       if (run > n - i) run = n - i;
-      const float* p = data + s;
-      for (int k = 0; k < run; k++) dst[i + k] = p[k] * win[i + k];
+      if (!read((uint32_t)s, run, dst + i)) {
+        memset(dst + i, 0, (size_t)run * sizeof(float));
+        ok = false;
+      }
       i += run;
       s = 0;
     }
+    return ok;
   }
+
+ protected:
+  ~Source() {}           // never deleted through the base; no vtable delete
+};
+
+// A Source over a buffer in memory (the host harness, the tests).
+struct MemSource : Source {
+  const float* data = nullptr;
+  MemSource() {}
+  MemSource(const float* d, uint32_t n, uint32_t r = 0) { data = d; len = n; rate = r; }
+  bool read(uint32_t first, uint32_t n, float* dst) override {
+    memcpy(dst, data + first, (size_t)n * sizeof(float));
+    return true;
+  }
+};
+
+// ---------------------------------------------------------------------------
+// WindowCache - a head's private run of source samples, so a render never
+// waits on the Source for material it has already been near. Coordinates are
+// UNWRAPPED int64 source positions (a head's travel grows without bound, and
+// the -hop frame of a head at position 0 is negative); the Source wraps.
+//
+//   ensure(s, n, src): make [s, s + n) resident with at least one window of
+//   look-ahead beyond it. A hit costs nothing. Otherwise the ring re-targets
+//   to [s - n/2, s + n + 2n) -- a back-pad for the previous frame's overlap,
+//   two windows of look-ahead -- keeping whatever of its current run
+//   intersects and fetching only the rest. A head travelling forward extends
+//   its run by a window every couple of hops; a scrub (the position knob) is
+//   a MISS and one whole fetch (3.5 windows). The count of each is kept for
+//   the profiler.
+//
+//   copyWindowed(s, n, win, dst): dst[i] = cached[s + i] * win[i] -- the same
+//   multiply the old Source::fillWindowed did, so renders are bit-identical
+//   to the in-memory source they replace.
+//
+// The ring is SS_CACHE_FLOATS floats carved from the head's SDRAM slice.
+// Main-loop-owned; the ISR never touches it. A failed read zero-fills what
+// it could not get and counts a failure: the render proceeds (never a hang,
+// never a hold for a read error), and the count is on the PROFILE line.
+// ---------------------------------------------------------------------------
+
+#define SS_CACHE_FLOATS (4 * SS_W)
+static_assert(SS_CACHE_FLOATS >= SS_W / 2 + SS_W + 2 * SS_W,
+              "cache must hold back-pad + window + two windows of look-ahead");
+
+class WindowCache {
+ public:
+  void setBuffer(float* buf, uint32_t cap) { buf_ = buf; cap_ = cap; reset(); }
+  void reset() { base_ = 0; count_ = 0; head_ = 0; misses_ = 0; extends_ = 0; failures_ = 0; fetched_ = 0; }
+
+  bool resident(int64_t s, uint32_t n) const {
+    return count_ != 0 && s >= base_ && s + (int64_t)n <= base_ + (int64_t)count_;
+  }
+
+  // Look-ahead policy: how far past the window the run should reach.
+  static int64_t wantStart(int64_t s, uint32_t n) { return s - (int64_t)(n / 2); }
+  static int64_t wantEnd(int64_t s, uint32_t n)   { return s + (int64_t)n + 2 * (int64_t)n; }
+
+  bool ensure(int64_t s, uint32_t n, Source& src) {
+    int64_t e = s + (int64_t)n;
+    bool hit = resident(s, n);
+    if (hit && (base_ + (int64_t)count_) - e >= (int64_t)n) return true;
+    int64_t ds = wantStart(s, n), de = wantEnd(s, n);
+    if (de - ds > (int64_t)cap_) de = ds + (int64_t)cap_;
+    if (hit) extends_++; else misses_++;
+    return retarget(ds, de, src);
+  }
+
+  // Requires resident(s, n).
+  void copyWindowed(int64_t s, uint32_t n, const float* win, float* dst) const {
+    uint32_t idx = ringIndex(s);
+    uint32_t i = 0;
+    while (i < n) {
+      uint32_t run = cap_ - idx;
+      if (run > n - i) run = n - i;
+      const float* p = buf_ + idx;
+      for (uint32_t k = 0; k < run; k++) dst[i + k] = p[k] * win[i + k];
+      i += run;
+      idx = 0;
+    }
+  }
+
+  int64_t  base() const { return base_; }
+  uint32_t count() const { return count_; }
+  uint32_t misses() const { return misses_; }
+  uint32_t extends() const { return extends_; }
+  uint32_t failures() const { return failures_; }
+  uint64_t fetched() const { return fetched_; }    // samples fetched, ever
+
+ private:
+  uint32_t ringIndex(int64_t pos) const {           // pos in [base_, base_ + count_)
+    return (uint32_t)(((int64_t)head_ + (pos - base_)) % (int64_t)cap_);
+  }
+
+  // Re-target the run to [ds, de), de - ds <= cap_: keep the intersection
+  // with the current run in place, drop what falls outside, fetch the rest.
+  bool retarget(int64_t ds, int64_t de, Source& src) {
+    int64_t cs = base_, ce = base_ + (int64_t)count_;
+    int64_t ks = ds > cs ? ds : cs, ke = de < ce ? de : ce;
+    if (count_ == 0 || ks >= ke) {              // nothing to keep: fresh fill
+      base_ = ds; count_ = 0; head_ = 0;
+      return append((uint32_t)(de - ds), src);
+    }
+    if (ks > cs) dropFront((uint32_t)(ks - cs));
+    if (ke < ce) count_ = (uint32_t)(ke - base_);
+    bool ok = true;
+    if (ds < base_) ok = prepend((uint32_t)(base_ - ds), src) && ok;
+    if (de > base_ + (int64_t)count_) ok = append((uint32_t)(de - (base_ + (int64_t)count_)), src) && ok;
+    return ok;
+  }
+  void dropFront(uint32_t m) {
+    base_ += m; count_ -= m; head_ = (head_ + m) % cap_;
+  }
+  // Fetch [start, start + n) into ring positions starting at idx (wrapping).
+  bool fetchInto(int64_t start, uint32_t n, uint32_t idx, Source& src) {
+    bool ok = true;
+    uint32_t i = 0;
+    while (i < n) {
+      uint32_t run = cap_ - idx;
+      if (run > n - i) run = n - i;
+      if (!src.fetch(start + i, run, buf_ + idx)) ok = false;
+      i += run;
+      idx = 0;
+    }
+    fetched_ += n;
+    if (!ok) failures_++;
+    return ok;
+  }
+  bool append(uint32_t m, Source& src) {
+    bool ok = fetchInto(base_ + (int64_t)count_, m, (head_ + count_) % cap_, src);
+    count_ += m;
+    return ok;
+  }
+  bool prepend(uint32_t m, Source& src) {
+    head_ = (head_ + cap_ - (m % cap_)) % cap_;
+    base_ -= m; count_ += m;
+    return fetchInto(base_, m, head_, src);
+  }
+
+  float*   buf_ = nullptr;
+  uint32_t cap_ = 0;
+  int64_t  base_ = 0;
+  uint32_t count_ = 0;
+  uint32_t head_ = 0;        // ring index of base_
+  uint32_t misses_ = 0, extends_ = 0, failures_ = 0;
+  uint64_t fetched_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -330,10 +493,12 @@ class Head {
 
   void setBuffers(float* slice) {
     for (int i = 0; i < SS_FRAME_BUFS; i++) buf_[i] = slice + (size_t)i * SS_W;
+    cache_.setBuffer(slice + (size_t)SS_FRAME_BUFS * SS_W, SS_CACHE_FLOATS);
   }
 
-  void reset(const Source* src) {
+  void reset(Source* src) {
     src_ = src;
+    cache_.reset();          // a re-opened file must not be read from the old run
     state_.store(FREE, std::memory_order_relaxed);
     life_.store(0, std::memory_order_relaxed);
     oldIdx_.store(-1, std::memory_order_relaxed);
@@ -583,6 +748,11 @@ class Head {
 
   uint32_t holds() const { return holds_; }
   int hop() const { return h_; }
+  const WindowCache& cache() const { return cache_; }
+  // The sequencer clock, so a render can measure its own fetch time.
+  void setClock(const std::atomic<uint32_t>* c) { clock_ = c; }
+  // ISR samples spent fetching since the last call; resets.
+  uint32_t takeFetchClocks() { uint32_t f = fetchClocks_; fetchClocks_ = 0; return f; }
 #ifdef SS_TEST_HOOKS
   // Test-only introspection (see SS_HOOK).
   int  dbgOldIdx() const { return oldIdx_.load(std::memory_order_relaxed); }
@@ -663,7 +833,14 @@ class Head {
   void renderFrame(int sizeIdx, double srcPos, uint32_t seed, float* target) {
     int w = ssSizeW(sizeIdx), passes = ssLog2(w);
     const float* win = &gWindows[ssWinOff(sizeIdx)];
-    src_->fillWindowed((int64_t)floor(srcPos), w, win, gWork);
+    int64_t s = (int64_t)floor(srcPos);
+    // A miss fetches here, on the main loop. The ISR samples it costs are
+    // kept apart from the render's own cost (takeFetchClocks): a scrub's
+    // fetch must not inflate the cost model and slow every refresh after it.
+    uint32_t t0 = clock_ ? clock_->load(std::memory_order_relaxed) : 0;
+    cache_.ensure(s, (uint32_t)w, *src_);
+    if (clock_) fetchClocks_ += clock_->load(std::memory_order_relaxed) - t0;
+    cache_.copyWindowed(s, (uint32_t)w, win, gWork);
     gTab.fft.Direct(gWork, gSpec, passes);
     float* re = &gSpec[0];
     float* im = &gSpec[w / 2];
@@ -682,8 +859,11 @@ class Head {
     memcpy(target, gWork, (size_t)w * sizeof(float));
   }
 
-  const Source* src_ = nullptr;
+  Source* src_ = nullptr;
   float* buf_[SS_FRAME_BUFS] = {nullptr};
+  WindowCache cache_;
+  const std::atomic<uint32_t>* clock_ = nullptr;
+  uint32_t fetchClocks_ = 0;
 
   // ISR-owned.
   std::atomic<uint8_t>  state_{FREE};
@@ -770,7 +950,7 @@ class Sequencer {
   void setSteps(int n) { activeSteps = ssClampSteps(n); }
 
   // pool: SS_POOL_FLOATS floats (SDRAM on device; plain data only).
-  void init(const Source* src, float sampleRate, float* pool,
+  void init(Source* src, float sampleRate, float* pool,
             uint32_t seed = 0x12345678u) {
     src_ = src;
     sr_ = sampleRate;
@@ -779,6 +959,7 @@ class Sequencer {
     if (driftRng_ == 0) driftRng_ = 0x9E3779B9u;
     for (int i = 0; i < SS_HEADS; i++) {
       head_[i].setBuffers(pool + (size_t)i * SS_HEAD_FLOATS);
+      head_[i].setClock(&clock_);
       head_[i].reset(src);
     }
     cur_ = inc_ = nxt_ = -1;
@@ -790,6 +971,7 @@ class Sequencer {
     cost_.seed();
     minSlack_ = 0x7fffffff;
     refreshes_ = 0;
+    fetchClocks_ = maxFetchClocks_ = 0;
   }
 
   uint32_t durSamples() const {
@@ -925,6 +1107,13 @@ class Sequencer {
     int frames = h.render(clock, w, stretch, h.basePos(position[h.step()]),
                           slack < 0 ? 0u : (uint32_t)slack, cost, s);
     uint32_t took = clock_.load(std::memory_order_relaxed) - t0;
+    // The source fetch is not render cost: a scrub's miss (a whole run off
+    // the card) would otherwise sit in the recent-max for ~64 renders and
+    // slow every refresh behind it. Subtract it; watch it on its own line.
+    uint32_t fetched = h.takeFetchClocks();
+    took = fetched < took ? took - fetched : 0;
+    fetchClocks_ += fetched;
+    if (fetched > maxFetchClocks_) maxFetchClocks_ = fetched;
     cost_.observe(s, took, frames);
     if (frames > 0 && refresh) refreshes_++;
     return frames;
@@ -955,8 +1144,25 @@ class Sequencer {
   }
   uint32_t refreshes() const { return refreshes_; }
   uint32_t costSamples(int sizeIdx) const { return cost_.at(sizeIdx); }
+  // Window-cache traffic summed over the pool (see WindowCache): misses =
+  // whole re-fetches (scrubs, fresh lives), extends = look-ahead top-ups,
+  // failures = reads the Source refused (zero-filled), fetched = samples.
+  struct CacheStats { uint32_t misses = 0, extends = 0, failures = 0; uint64_t fetched = 0; };
+  CacheStats cacheStats() const {
+    CacheStats c;
+    for (int i = 0; i < SS_HEADS; i++) {
+      const WindowCache& k = head_[i].cache();
+      c.misses += k.misses(); c.extends += k.extends();
+      c.failures += k.failures(); c.fetched += k.fetched();
+    }
+    return c;
+  }
   // Min slack (samples to deadline at render start) since last call; resets.
   int32_t takeMinSlack() { int32_t m = minSlack_; minSlack_ = 0x7fffffff; return m; }
+  // ISR samples spent fetching source material, ever, and the worst single
+  // render's fetch since the last call (resets).
+  uint32_t fetchSamples() const { return fetchClocks_; }
+  uint32_t takeMaxFetch() { uint32_t m = maxFetchClocks_; maxFetchClocks_ = 0; return m; }
   uint32_t clock() const { return clock_.load(std::memory_order_relaxed); }
 #ifdef SS_TEST_HOOKS
   Head& dbgHead(int i) { return head_[i]; }
@@ -1083,7 +1289,7 @@ class Sequencer {
     return -1;
   }
 
-  const Source* src_ = nullptr;
+  Source* src_ = nullptr;
   Head head_[SS_HEADS];
   float sr_ = 48000.0f;
   uint32_t seed_ = 0, driftRng_ = 1;
@@ -1103,6 +1309,7 @@ class Sequencer {
   CostModel cost_;
   int32_t  minSlack_ = 0x7fffffff;
   uint32_t refreshes_ = 0;
+  uint32_t fetchClocks_ = 0, maxFetchClocks_ = 0;
 };
 
 // ---------------------------------------------------------------------------

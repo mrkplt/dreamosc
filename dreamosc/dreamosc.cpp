@@ -159,7 +159,7 @@ static Sequencer seq;
 static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
-static Source   src;
+static MemSource src;   // over sourceBuf until the streaming SD source (next)
 
 // --- source audio -----------------------------------------------------------
 // Sample material is uploaded separately to QSPI flash (8 MB, memory-mapped at
@@ -223,7 +223,7 @@ static void haltNoInstrument() {
 // fall back to a synthesized source rather than playing garbage. The blob's
 // sample rate is decoded and reported but NOT applied (see the NOTE in
 // source_core.h and OPEN_ISSUES.md).
-static bool load_qspi_sample(Source& out) {
+static bool load_qspi_sample(MemSource& out) {
   uint32_t rate = 0;
   uint32_t n = decodeSampleBlob((const uint8_t*)SAMPLE_QSPI_ADDR, sourceBuf, SOURCE_LEN, rate);
   if (n == 0) { srcInfo.qspiErr = SE_NO_BLOB; return false; }
@@ -237,7 +237,7 @@ static bool load_qspi_sample(Source& out) {
 // file. The QSPI blob used to be wrap-padded to SOURCE_LEN (10 s) with len =
 // SOURCE_LEN; reads wrap modulo len anyway, so the padding decodeSampleBlob
 // still writes is inert.
-static void load_source_at_boot(Source& out) {
+static void load_source_at_boot(MemSource& out) {
   if (stretchsd::load_source(out, sourceBuf, SOURCE_LEN, srcInfo)) return;
   if (load_qspi_sample(out)) return;
   fillStubSource(sourceBuf, SOURCE_LEN, SAMPLE_RATE);

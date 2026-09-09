@@ -152,9 +152,7 @@ int main(int argc, char** argv) {
 
   gTab.init();
 
-  Source src;
-  src.data = mono.data();
-  src.len  = (uint32_t)mono.size();
+  MemSource src(mono.data(), (uint32_t)mono.size(), in.sr);
 
   Sequencer seq;
   static std::vector<float> voice_pool(SS_POOL_FLOATS);

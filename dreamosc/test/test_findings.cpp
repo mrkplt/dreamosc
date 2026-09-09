@@ -103,7 +103,7 @@ TEST_CASE("F1: buffer-pick race overwrites the frame the ISR is blending (audibl
           "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   std::vector<float> out;
   HookGuard hg(1, &seq, &out);
@@ -143,7 +143,7 @@ TEST_CASE("F1: buffer-pick race overwrites the frame the ISR is blending (audibl
 TEST_CASE("F2: costed harness runs the scheduler with a dead cost model", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, 0.0f);
   uint32_t seeded = seq.costSamples(ssSizeIdx(4096));
   auto out = render_costed(seq, 48000 * 4, 0.0038);
@@ -164,7 +164,7 @@ TEST_CASE("F2: costed harness runs the scheduler with a dead cost model", "[find
 TEST_CASE("F3: armed head's deadline reads 'now' during a crossfade seam", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 1.0f, 0.25f);
   int32_t minSlack = 0x7fffffff;
   uint32_t minDue = 0xffffffffu;
@@ -195,7 +195,7 @@ TEST_CASE("F4: only one refresh per armed life: a second knob turn on the next s
           "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](float p1, float p2, size_t* live) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, 0.0f);
     std::vector<float> out;
@@ -245,7 +245,7 @@ namespace {
 struct GrowthRun { uint32_t holds; int gated; int silent; };
 GrowthRun grow_to_16384(float fade, std::vector<float>& out) {
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.25f, fade);
   CostedProducer p(0.0038);
   uint32_t holdsBefore = 0; int gated = 0;
@@ -298,7 +298,7 @@ TEST_CASE("F5b: growing to 16384 under a full crossfade is throughput-bound: bou
 TEST_CASE("F7: a boundary between plan() and render() wastes a render", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   std::vector<float> out;
   HookGuard hg(2, &seq, &out);
@@ -325,7 +325,7 @@ TEST_CASE("F7: a boundary between plan() and render() wastes a render", "[findin
 TEST_CASE("F8: a pot move costs at most one refresh raw, one per hop smoothed", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   // Drive position the way the panel now does (raw) and the old way
   // (smoothed), and count refreshes in the second after one 30% move.
   auto run = [&](bool smoothed) {
@@ -366,7 +366,7 @@ TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does 
   // rendered (about 20 ms of a 10 s source). Nudge by 0.5% and by 0.1%.
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](float delta) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     uint32_t refreshesAt = 0;
@@ -386,7 +386,7 @@ TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does 
 TEST_CASE("F8: PanelEditor writes position from the raw pot, not the smoothed read", "[finding]") {
   static std::vector<float> pool(SS_POOL_FLOATS);
   auto srcbuf = make_source(0.5f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; seq.init(&src, 48000, pool.data());
   float dur = 1.0f, gd = 0.0f;
   PanelEditor pe;
@@ -405,7 +405,7 @@ TEST_CASE("F8: PanelEditor writes position from the raw pot, not the smoothed re
 TEST_CASE("F9: step-count shrink under an armed head makes the seam run late", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 0.5f, 0.0f);
   std::vector<float> out;
   CostedProducer p(0.0038);
@@ -430,7 +430,7 @@ TEST_CASE("F9: step-count shrink under an armed head makes the seam run late", "
 TEST_CASE("F11: a held (repeated) frame is click-free", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(2.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   std::vector<float> out;
   for (uint32_t i = 0; i < 4096; i++) { drain(seq); out.push_back(seq.next()); }
@@ -474,7 +474,7 @@ TEST_CASE("F7b: a boundary between plan and render with a size change stages the
           "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
   std::vector<float> out;
   gHook = HookCtx(); gHook.seq = &seq; gHook.out = &out; gHook.id = 2;
@@ -526,7 +526,7 @@ TEST_CASE("L2: a second position move within the same hop lands at that hop's bo
           "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   const uint32_t t1 = 22600, t2 = 23500, boundary = 24577;   // t2 in [t1+804, b-402)
   auto run = [&](bool twoMoves) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
@@ -555,7 +555,7 @@ TEST_CASE("L2: a second position move within the same hop lands at that hop's bo
 TEST_CASE("L3: an armed head refreshes near its go-live, not on every gap", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   auto run = [&](bool sweep, uint32_t* refreshes, size_t* live) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 2.0f, 0.0f);
     *live = 0;

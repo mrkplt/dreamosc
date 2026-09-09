@@ -15,7 +15,7 @@ static std::vector<float> pool(SS_POOL_FLOATS);
 static void probe(int frame, float duration, float fade, int steps) {
   gTab.init();
   auto srcbuf = make_source(4.0f, 48000);
-  Source src{srcbuf.data(), (uint32_t)srcbuf.size()};
+  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
   Sequencer seq;
   seq.init(&src, 48000.0f, pool.data());
   seq.stretch = 50.0f; seq.duration = duration; seq.fade = fade;

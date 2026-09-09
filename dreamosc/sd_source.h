@@ -58,7 +58,7 @@ inline bool findFirstWav(char* best, size_t cap) {
 // The seam. Mounts the card, loads the first WAV into dst (an SDRAM buffer of
 // `cap` floats, so a file longer than that is truncated) and points src at
 // it: src.len is the MATERIAL length, so position 0..1 spans the file.
-inline bool load_source(Source& src, float* dst, uint32_t cap, SourceInfo& info) {
+inline bool load_source(MemSource& src, float* dst, uint32_t cap, SourceInfo& info) {
   using namespace daisy;
   info.sdErr = SE_OK;
   info.name[0] = '\0';

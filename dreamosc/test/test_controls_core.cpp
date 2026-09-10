@@ -680,6 +680,8 @@ TEST_CASE("LastMovedOwner: the pot that moved most recently owns the parameter; 
   REQUIRE_FALSE(o.update(0.0f, 0.0f));          // nobody moved: the first owns by default
   REQUIRE(o.update(0.0f, 0.01f));               // the second moved: it owns
   REQUIRE(o.update(0.0f, 0.0f));                // and keeps owning while nothing moves
-  REQUIRE(o.update(0.0003f, 0.0f));             // ADC jitter on the first does not steal it
-  REQUIRE_FALSE(o.update(0.01f, 0.0f));         // a real move on the first takes it back
+  REQUIRE(o.update(0.005f, 0.0f));              // ADC flutter on the first does not steal it
+  REQUIRE(o.update(0.0f, 0.005f));              // nor does flutter on the second confirm it
+  REQUIRE_FALSE(o.update(0.02f, 0.0f));         // a real move on the first takes it back
+  REQUIRE_FALSE(o.update(0.0f, 0.005f));        // and flutter on the second cannot take it
 }

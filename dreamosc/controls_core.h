@@ -171,11 +171,13 @@ inline KnobSpec durationSpec(float durMin = 0.25f, float durMax = 60.0f) {
 // Two pots on ONE parameter (knob1 in GLOBAL and the mux pot, both on
 // duration): the one that moved most recently owns it. Without this the pot
 // polled second would overwrite the first every millisecond once its pickup
-// engaged. `eps` is the per-poll raw movement that counts as a turn (ADC
-// jitter on this board is under 0.0005).
+// engaged. `eps` is the per-poll raw movement that counts as a turn: the
+// bench shows ~0.005 of flutter on a floating mux input and ~0.001 on a
+// stationary pot, and the slowest deliberate turn moves more than 0.01 per
+// millisecond, so 0.008 separates the two.
 struct LastMovedOwner {
   bool second = false;                      // true: the second pot owns the parameter
-  bool update(float speedFirst, float speedSecond, float eps = 0.0005f) {
+  bool update(float speedFirst, float speedSecond, float eps = 0.008f) {
     if (speedFirst > eps)  second = false;
     if (speedSecond > eps) second = true;   // simultaneous: the second wins
     return second;

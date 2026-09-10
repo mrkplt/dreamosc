@@ -642,3 +642,35 @@ TEST_CASE("applyDigitalControls: buttons advance / return to GLOBAL, one edge pe
   applyDigitalControls(e, seq, pe, false, 0, true, true, 6, lastMs);
   REQUIRE(pe.inGlobal());
 }
+
+// --- the mux pot (AuxKnob) ---------------------------------------------------
+
+TEST_CASE("AuxKnob: does not write until the pot moves past threshold from its boot position") {
+  AuxKnob k; float dur = 1.0f;
+  REQUIRE_FALSE(k.update(0.50f, durationSpec(), &dur));    // primes the anchor
+  REQUIRE_FALSE(k.update(0.51f, durationSpec(), &dur));    // below threshold
+  REQUIRE_FALSE(k.update(0.49f, durationSpec(), &dur));
+  REQUIRE(dur == 1.0f);                                      // untouched
+  REQUIRE_FALSE(k.live);
+}
+
+TEST_CASE("AuxKnob: once live it maps 0..1 to 0.25..60 s through the smoother and stays live") {
+  AuxKnob k; float dur = 1.0f;
+  k.update(0.0f, durationSpec(), &dur);
+  REQUIRE(k.update(0.10f, durationSpec(), &dur));           // past threshold: live
+  REQUIRE(k.live);
+  REQUIRE(dur > 0.25f); REQUIRE(dur < 0.25f + 0.10f * 59.75f);   // smoothed: eased, not snapped
+  for (int i = 0; i < 2000; i++) k.update(1.0f, durationSpec(), &dur);
+  REQUIRE(dur == Approx(60.0f).margin(0.01f));               // settles at the top of the range
+  for (int i = 0; i < 2000; i++) k.update(0.0f, durationSpec(), &dur);
+  REQUIRE(dur == Approx(0.25f).margin(0.01f));
+  REQUIRE(k.update(0.001f, durationSpec(), &dur));           // small moves keep writing
+}
+
+TEST_CASE("AuxKnob: a slow sweep engages (the anchor does not chase the pot)") {
+  AuxKnob k; float dur = 1.0f;
+  k.update(0.30f, durationSpec(), &dur);
+  bool engaged = false;
+  for (int i = 1; i <= 30 && !engaged; i++) engaged = k.update(0.30f + 0.001f * i, durationSpec(), &dur);
+  REQUIRE(engaged);
+}

@@ -35,6 +35,15 @@ GLOBAL ──button1──▶ step 1 ──button1──▶ … ──button1─
   (0.0003) on a slow turn — 100 fine detents span the range.
 - **led1 = ROYGBIVW** shows the selected step (red=1 … white=8), off in GLOBAL.
 
+### Mux smoke test (row-2 knobs, Fizzy #157)
+
+A CD4051 8:1 mux is wired with its common output on **A7** and selects on
+**D11/D10/D9**; one pot sits at mux channel 0. For now that pot is a **second
+duration control** (0.25..60 s, same mapping and pickup as knob1 in GLOBAL);
+whichever of the two moved last wins. It appears on the PROFILE `KNOB` line
+as `mx=` (raw, ×1000) and `mxL=` (pickup engaged). This is a hardware smoke
+test, not the mapping; the real row-2 assignments are #157's.
+
 ## PICKUP (soft takeover) — everywhere
 
 Landing on any slot (GLOBAL or a step) does **not** snap its value to the pot. A

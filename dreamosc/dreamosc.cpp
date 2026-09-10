@@ -108,6 +108,7 @@ struct Prof {
   uint32_t lastUnder = 0, lastClip = 0, lastLate = 0, lastRefresh = 0, lastIsr = 0;
   uint32_t lastPrint = 0;
   float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
+  float mx = 0;                            // last mux channel-0 read (raw)
   // Peak per-poll knob speed since the last print (instantaneous speed is ~0
   // at any given print instant; the peak catches an actual turn). Used to
   // tune the potFast threshold from board data.
@@ -266,6 +267,30 @@ static float globalDrift = 0.0f;
 // + global drift. Step mode: knobs = that step's position + per-step drift.
 static PanelEditor panel;
 
+// --- the 4051 analog mux on A7 (row-2 knobs, Fizzy #157) ---------------------
+// A CD4051 8:1 mux: common out -> A7, selects S0/S1/S2 <- D11/D10/D9 (the
+// select order only matters for channels other than 0; smoke test wiring has
+// one pot at channel 0, where every select line is low). libDaisy scans the
+// mux itself (AdcChannelConfig::InitMux): the ADC runs one-shot with a
+// callback that steps the select lines between conversions, and every
+// channel -- the Pod's two knobs included -- is read the same way. The Pod
+// configured the ADC with just its two knobs in Init(); we configure it
+// AGAIN with the mux as a third channel, before StartAdc(), and re-point the
+// Pod's knob objects at the (unchanged) first two slots.
+static constexpr int   ADC_CH_MUX   = 2;          // channel index after knob1, knob2
+static constexpr int   MUX_CHANNELS = 8;
+static AuxKnob muxKnob;                            // channel 0 -> duration (smoke test)
+
+static void initAdcWithMux() {
+  AdcChannelConfig cfg[3];
+  cfg[0].InitSingle(seed::D21);                    // KNOB_1_PIN (daisy_pod.cpp)
+  cfg[1].InitSingle(seed::D15);                    // KNOB_2_PIN
+  cfg[ADC_CH_MUX].InitMux(seed::A7, MUX_CHANNELS, seed::D11, seed::D10, seed::D9);
+  pod.seed.adc.Init(cfg, 3);
+  pod.knob1.Init(pod.seed.adc.GetPtr(0), pod.AudioCallbackRate());
+  pod.knob2.Init(pod.seed.adc.GetPtr(1), pod.AudioCallbackRate());
+}
+
 // Audio block size. The hop (>= 128 samples, 2048 at the default window) sets
 // the control-to-ear floor, so a tiny block buys nothing; 32 (0.67 ms) keeps
 // ISR entry overhead and jitter low and gives the main loop longer uninterrupted
@@ -342,7 +367,12 @@ static void processControls() {
     float k2 = smoothKnob(knobSmooth[1], r2, knobPrimed);
     knobPrimed = true;
     panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
+    // The mux pot (channel 0): a second duration control, with its own
+    // pickup; whichever of knob1 (GLOBAL) and this moved last wins.
+    float mx = pod.seed.adc.GetMuxFloat(ADC_CH_MUX, 0);
+    muxKnob.update(mx, durationSpec(), &seq.duration);
 #ifdef PROFILE
+    prof.mx = mx;
     prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
     if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
     if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
@@ -448,16 +478,19 @@ static void profilePrint() {
   // applied this second (count them against the physical clicks: the L1
   // bench check), drop = panel events the IRQ queue refused, ever (must stay
   // bench check). b1/b2 = buttons held, as the last debounce sample saw them
-  // (a single-byte read of ISR-owned state; diagnostics only).
+  // (a single-byte read of ISR-owned state; diagnostics only). mx = the 4051
+  // mux channel-0 pot, raw (*1000); mxL = its pickup has engaged. A pot that
+  // reads a steady ~0 or ~1000 and never moves is a wiring fault, not pickup.
   pod.seed.PrintLine(
-      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u",
+      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u mx=%d mxL=%d",
       scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
       scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
       (int)panel.k1Live(), (int)panel.k2Live(),
       scaled(prof.pk1, 1000.0f), scaled(prof.pk2, 1000.0f),
       (int)panel.fast1(), (int)panel.fast2(),
       (int)pod.button1.Pressed(), (int)pod.button2.Pressed(),
-      (unsigned)profDetents);
+      (unsigned)profDetents,
+      scaled(prof.mx, 1000.0f), (int)muxKnob.live);
   prof.pk1 = prof.pk2 = 0.0f;   // reset peak for the next window
   profDetents = 0;
   // POS line: all 8 step positions (*1000). Homing every knob should make
@@ -562,6 +595,7 @@ int main(void) {
   pod.Init(true);
   pod.SetAudioBlockSize(AUDIO_BLOCK);
   boardVersion = (int)pod.seed.CheckBoardVersion();
+  initAdcWithMux();                  // the Pod's two knobs + the 4051 on A7 (before StartAdc)
 #ifdef PROFILE
   pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
   profTicksPerUs = System::GetTickFreq() / 1000000u;

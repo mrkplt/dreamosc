@@ -137,6 +137,37 @@ inline float smoothKnob(float& state, float raw, bool primed, float coeff = 0.02
   return state;
 }
 
+// An EXTRA pot behind the 4051 analog mux (the row-2 knob hardware, Fizzy
+// #157) that writes ONE parameter with the same pickup, smoothing and speed-
+// adaptive mapping as the panel knobs. Pickup: the pot takes over only after
+// it has moved past moveThresh from where it sat at boot (the anchor is
+// frozen until then -- the same slow-sweep rule as PanelEditor). Speed is
+// measured on the raw read; the value is written from the smoothed one (as
+// duration is on knob1). Smoke test today: mux channel 0 -> duration, beside
+// knob1 in GLOBAL mode; whichever moved last wins.
+struct AuxKnob {
+  bool  primed = false, live = false;
+  float anchor = 0.0f, prev = 0.0f, smooth = 0.0f, speed = 0.0f;
+
+  // One poll. Returns true and writes *out when the pot is live.
+  bool update(float raw, const KnobSpec& spec, float* out, float moveThresh = 0.02f) {
+    if (!primed) { anchor = raw; prev = raw; smooth = raw; primed = true; }
+    float k = smoothKnob(smooth, raw, true);
+    speed = fabsf(raw - prev);
+    prev = raw;
+    if (!live && fabsf(raw - anchor) > moveThresh) live = true;
+    if (!live) return false;
+    *out = applyKnob(spec, k, speed);
+    return true;
+  }
+};
+
+// The duration knob's spec (0.25..60 s, continuous), shared by knob1 in
+// GLOBAL mode (PanelEditor::update) and the mux pot.
+inline KnobSpec durationSpec(float durMin = 0.25f, float durMax = 60.0f) {
+  return KnobSpec{durMin, durMax, 0.0f, 0.0f};
+}
+
 // Advance the encoder page, wrapping.
 inline EncoderPage nextPage(EncoderPage p) {
   return (EncoderPage)((p + 1) % PAGE_COUNT);
@@ -317,7 +348,7 @@ class PanelEditor {
     // sweep; grid TBD). Global drift: same as per-step drift.
     const KnobSpec POSITION { 0.0f, 1.0f, 0.05f, 0.0f };
     const KnobSpec DRIFT    { 0.0f, driftMax, driftMax / 30.0f, 0.0003f };
-    const KnobSpec DURATION { durMin, durMax, 0.0f, 0.0f };
+    const KnobSpec DURATION = durationSpec(durMin, durMax);
     const KnobSpec GDRIFT   { 0.0f, gdriftMax, gdriftMax / 30.0f, 0.0003f };
 
     if (slot_ == PE_GLOBAL) {

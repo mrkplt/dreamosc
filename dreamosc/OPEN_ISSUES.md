@@ -38,12 +38,28 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
   blends two frame reads per gated head per sample (it used to read one ring
   sample); the main loop lost its whole per-sample kernel in exchange. Max
   concurrent is two sounding heads plus one armed rendering ahead.
-- **480 MHz** clean on the codec and SD paths (`pod.Init(true)`).
-- **The SD stream (#131), all of it.** Nothing below has run on hardware:
-  - Boot with the amen card: `SRC rate=44100 fs=44100 fs_err=0 err=0
-    spd=0 fmt=1 bits=16 ch=2 len=244716`, and `board=` (2 = Seed 2 DFM /
-    PCM3060 is the expectation for a 2026 Pod; 1 = Seed 1.1 would exercise
-    the unverified WM8731 register write).
+- **480 MHz** clean on the codec and SD paths (`pod.Init(true)`) -- the SD
+  stream and the 44.1 kHz codec both ran at 480 on the first pass.
+- **The 4051 mux on ADC2 (`mux_adc.h`) is confirmed on the bench:** channel
+  0 sweeps 1..1000 on the MUX/KNOB lines and drives duration. What is NOT
+  yet checked: crosstalk between channels once a second pot is wired
+  (adjacent-channel bleed with 1 ms settle), and ADC2's noise floor vs
+  ADC1's (`pk` on a stationary pot). Also recorded (CLAUDE.md): libDaisy's
+  AdcHandle cannot be re-initialised with a mux after DaisyPod::Init() --
+  the DMA mode is fixed by the first MspInit -- which is why the mux has its
+  own converter.
+- **The SD stream (#131).** First bench pass (2026-09-10, the amen card):
+  `SRC rate=44100 fs=44100 fs_err=0 board=0 fmt=1 bits=16 ch=2 len=244716
+  spd=0 err=0` -- the codec took 44.1 kHz and read it back, the card came
+  up at FAST, `FETCH fail=0`, and the stream ran (`ext=1 smp=640 max=640
+  rd=1 kb=16` on the first look-ahead top-up). `board=0`: libDaisy reports
+  the Seed 3 as an original Seed, so the WM8731 path is (correctly) never
+  taken. **First fetch number: 640 ISR samples for 16 KB, ~1.1 MB/s
+  effective, and that render's `max_us` was 17.5 ms.** At that rate a scrub
+  at 16384 (3.5 windows = ~230 KB at 16-bit stereo) would fetch for longer
+  than its 8192-sample hop and show as a hold -- measure it (below) before
+  tuning the look-ahead or the staging size. Not yet judged by ear at
+  44.1 kHz. Still owed:
   - No card / an empty card / a card with only a 64-bit-float file: both
     LEDs blink red, no audio, `err=` 1 / 3 / 7 on the SRC line.
   - `FETCH fail=0` always. A non-zero `fail` is a card read the firmware

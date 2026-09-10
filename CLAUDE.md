@@ -236,6 +236,7 @@ dreamosc/
   sd_source.h         SdSource: the WAV on the microSD, streamed. THE source seam.
   codec_rate.h        Apply + verify the codec rate through the HAL (device edge)
   axisram.h           AXISRAM_DATA: plain globals in D1 AXI SRAM (device edge)
+  mux_adc.h           The 4051 analog mux on A7, scanned by ADC2 (device edge)
   dreamosc.cpp        Pod firmware: hardware glue (audio callback, controls, LEDs)
   CONTROLS.md         The current control mapping (progressive disclosure)
   Makefile            libDaisy build; targets ../libDaisy and ../DaisySP
@@ -533,6 +534,15 @@ BOOT_SRAM`; with it installed programs cannot use internal flash).
   activated its voices → no sound). SDRAM is fine for **plain arrays you memset
   yourself** (like the source buffer); keep constructed objects in SRAM, or if a
   voice pool must go to SDRAM later, placement-new it after `Init()`.
+- **libDaisy ADC pitfall (bench-proven):** `DaisyPod::Init()` initialises
+  ADC1 for the two knobs, and the ADC's DMA mode (circular for plain
+  channels, one-shot for a mux) is chosen inside `HAL_ADC_MspInit`, which the
+  HAL runs only on the FIRST `HAL_ADC_Init`. Re-initialising `pod.seed.adc`
+  with a mux channel leaves the DMA circular under a one-shot ADC: every mux
+  channel reads the same stale value and the restart storm takes the board
+  down. `AdcHandle` has no DeInit. **Extra analog inputs get their own
+  converter:** `mux_adc.h` scans the 4051 on A7 with ADC2 (continuous, no
+  DMA, polled once per ms), leaving ADC1 alone.
 - **libDaisy + GCC 15.3 wrinkle:** `WavPlayer.h` throws a `[-Wtemplate-body]`
   error (`FileReader` vs `IReader`) when transitively included. It is upstream, not
   ours. Avoid pulling that header, or pin/patch it when building `dreamosc.cpp`.

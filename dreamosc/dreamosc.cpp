@@ -15,6 +15,7 @@
 #include "sd_source.h"
 #include "codec_rate.h"
 #include "axisram.h"      // AXISRAM_DATA: plain globals in D1 AXI SRAM (see the header)
+#include "mux_adc.h"      // the 4051 on A7, scanned by ADC2
 
 using namespace daisy;
 
@@ -269,30 +270,19 @@ static float globalDrift = 0.0f;
 static PanelEditor panel;
 
 // --- the 4051 analog mux on A7 (row-2 knobs, Fizzy #157) ---------------------
-// A CD4051 8:1 mux: common out -> A7 (D22); selects A/B/C <- the Seed pins
-// labelled SS/SCK/MI on the pinout, which are D7/D8/D9 (SPI1 NSS/SCK/MISO in
-// libDaisy's spi.cpp -- the SPI function is the unambiguous name; the header
-// numbering is not). One pot at channel 0 for the smoke test. libDaisy scans the
-// mux itself (AdcChannelConfig::InitMux): the ADC runs one-shot with a
-// callback that steps the select lines between conversions, and every
-// channel -- the Pod's two knobs included -- is read the same way. The Pod
-// configured the ADC with just its two knobs in Init(); we configure it
-// AGAIN with the mux as a third channel, before StartAdc(), and re-point the
-// Pod's knob objects at the (unchanged) first two slots.
-static constexpr int   ADC_CH_MUX   = 2;          // channel index after knob1, knob2
-static constexpr int   MUX_CHANNELS = 8;
+// A CD4051 8:1 mux: common out -> A7 (D22, PA5 = ADC12_INP19); selects A/B/C
+// <- the Seed pins labelled SS/SCK/MI on the pinout, which are D7/D8/D9
+// (SPI1 NSS/SCK/MISO in libDaisy's spi.cpp -- the SPI function is the
+// unambiguous name; the header numbering is not). One pot at channel 0 for
+// the smoke test. Scanned by ADC2 (mux_adc.h), NOT by re-initialising the
+// Pod's ADC1 with a mux channel: that left ADC1's DMA in the mode its first
+// init chose and took the board down (see mux_adc.h). The Pod's two knobs
+// are untouched.
+static constexpr int MUX_CHANNELS = MuxAdc::CHANNELS;
+static MuxAdc  muxAdc;
 static AuxKnob muxKnob;                            // channel 0 -> duration (smoke test)
 static LastMovedOwner durOwner;                    // knob1 (GLOBAL) vs the mux pot
 
-static void initAdcWithMux() {
-  AdcChannelConfig cfg[3];
-  cfg[0].InitSingle(seed::D21);                    // KNOB_1_PIN (daisy_pod.cpp)
-  cfg[1].InitSingle(seed::D15);                    // KNOB_2_PIN
-  cfg[ADC_CH_MUX].InitMux(seed::A7, MUX_CHANNELS, seed::D7, seed::D8, seed::D9);   // A, B, C
-  pod.seed.adc.Init(cfg, 3);
-  pod.knob1.Init(pod.seed.adc.GetPtr(0), pod.AudioCallbackRate());
-  pod.knob2.Init(pod.seed.adc.GetPtr(1), pod.AudioCallbackRate());
-}
 
 // Audio block size. The hop (>= 128 samples, 2048 at the default window) sets
 // the control-to-ear floor, so a tiny block buys nothing; 32 (0.67 ms) keeps
@@ -375,14 +365,15 @@ static void processControls() {
     // owns duration; the other's write is discarded (PanelEditor wrote
     // knob1's value above, so the mux value is applied over it only when the
     // mux owns).
-    float mx = pod.seed.adc.GetMuxFloat(ADC_CH_MUX, 0);
+    muxAdc.poll();                                   // one channel per ms
+    float mx = muxAdc.value(0);
     float muxDur = seq.duration;
     bool muxLive = muxKnob.update(mx, durationSpec(), &muxDur);
     if (durOwner.update(panel.inGlobal() ? panel.speed1() : 0.0f, muxKnob.speed) && muxLive)
       seq.duration = muxDur;
 #ifdef PROFILE
     prof.mx = mx;
-    for (int c = 0; c < MUX_CHANNELS; c++) prof.mux[c] = pod.seed.adc.GetMuxFloat(ADC_CH_MUX, c);
+    for (int c = 0; c < MUX_CHANNELS; c++) prof.mux[c] = muxAdc.value(c);
     prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
     if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
     if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
@@ -614,7 +605,9 @@ int main(void) {
   pod.Init(true);
   pod.SetAudioBlockSize(AUDIO_BLOCK);
   boardVersion = (int)pod.seed.CheckBoardVersion();
-  initAdcWithMux();                  // the Pod's two knobs + the 4051 on A7 (before StartAdc)
+  // The 4051 on A7 gets its own converter (ADC2, mux_adc.h), after
+  // pod.Init() and before StartAdc(). A7 = PA5 = ADC12 input 19.
+  muxAdc.init(seed::A7, ADC_CHANNEL_19, seed::D7, seed::D8, seed::D9);
 #ifdef PROFILE
   pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
   profTicksPerUs = System::GetTickFreq() / 1000000u;

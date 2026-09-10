@@ -39,7 +39,9 @@ GLOBAL ──button1──▶ step 1 ──button1──▶ … ──button1─
 
 A CD4051 8:1 mux is wired with its common output on **A7** (D22) and selects
 A/B/C on **D7/D8/D9** (the Seed pins labelled SS/SCK/MI); one pot sits at mux
-channel 0. For now that pot is a **second
+channel 0. The mux is scanned by **ADC2** (`mux_adc.h`, one channel per
+millisecond), leaving the Pod's own ADC1 and its two knobs untouched. For now
+that pot is a **second
 duration control** (0.25..60 s, same mapping and pickup as knob1 in GLOBAL);
 whichever of the two moved last wins. It appears on the PROFILE `KNOB` line
 as `mx=` (raw, ×1000) and `mxL=` (pickup engaged). This is a hardware smoke

@@ -1,95 +1,29 @@
-// source_core.h - platform-free source-loading logic for the Pod firmware.
+// source_core.h - platform-free source logic for the Pod firmware.
 //
-// The QSPI sample path in dreamosc.cpp used to validate the blob header,
-// convert int16 -> float and wrap-pad the buffer inline, all of which is pure
-// over a byte pointer and a float buffer -- only the QSPI base address and the
-// cast to it are hardware. That decision logic lives here so it is
-// host-compiled and tested (CLAUDE.md: as little as sensibly possible is left
-// in the un-host-compilable edge). dreamosc.cpp calls decodeSampleBlob() with
-// the memory-mapped QSPI pointer.
-//
-// Blob layout, little-endian (see tools/wav2raw.py):
-//   uint32 magic 'DRMO' | uint32 count | uint32 rate | uint32 reserved
-//   int16  samples[count]
-//
-// NOTE (surfaced, not fixed -- OPEN_ISSUES.md): `rate` is decoded and
-// returned but the firmware does not apply it. wav2raw.py's docstring promises
-// "the firmware reads the header and scales playback accordingly"; a blob at a
-// rate other than the codec's plays pitch-shifted. Applying it is a sound
-// change and a bench item, not a cleanup.
+// Everything about "the WAV on the card" that is a decision rather than a
+// bus transaction lives here so it is host-compiled and tested (CLAUDE.md:
+// as little as sensibly possible is left in the un-host-compilable edge):
+// which directory entry counts as the first WAV, the RIFF chunk walk, the
+// format check, the sector-aligned ranged read and the PCM/float decode.
+// sd_source.h wires it to SDMMC/FatFs; the tests drive it over a memory
+// reader.
 
 #ifndef SOURCE_CORE_H
 #define SOURCE_CORE_H
 
-#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
-#define SAMPLE_MAGIC 0x4F4D5244u   // 'DRMO'
-
-struct SampleHeader {
-  uint32_t magic;
-  uint32_t count;
-  uint32_t rate;
-  uint32_t reserved;
-};
-
-// Is `h` a plausible sample blob header? count must be 1..maxCount (the QSPI
-// part is 8 MB, so a count past that is garbage, not a sample).
-inline bool sampleBlobValid(const SampleHeader* h, uint32_t maxCount = 8u * 1024 * 1024) {
-  if (h->magic != SAMPLE_MAGIC) return false;
-  if (h->count == 0 || h->count > maxCount) return false;
-  return true;
-}
-
-// Decode a sample blob at `blob` into dst[0..cap): int16 PCM -> float in
-// [-1, 1), at most `cap` samples, then WRAP-PAD the remainder of dst so the
-// whole buffer is musical material rather than a block of silence the read
-// heads can wander into. Returns the number of samples decoded from the blob
-// (before padding), or 0 if the header is invalid (dst untouched). `rate` gets
-// the blob's sample rate (unused by the caller today -- see the NOTE above).
-// Byte-exact with the inline version this replaces: dst[i] = dst[i % n].
-inline uint32_t decodeSampleBlob(const uint8_t* blob, float* dst, uint32_t cap,
-                                 uint32_t& rate) {
-  SampleHeader h;
-  memcpy(&h, blob, sizeof(h));
-  if (!sampleBlobValid(&h)) return 0;
-  const int16_t* pcm = (const int16_t*)(blob + sizeof(SampleHeader));
-  uint32_t n = h.count > cap ? cap : h.count;
-  for (uint32_t i = 0; i < n; i++) dst[i] = pcm[i] / 32768.0f;
-  uint32_t j = 0;                       // running i % n, no per-sample modulo
-  for (uint32_t i = n; i < cap; i++) {
-    dst[i] = dst[j];
-    if (++j == n) j = 0;
-  }
-  rate = h.rate;
-  return n;
-}
-
-// Fallback when no blob is present: a spectrally-varied synthetic source, so
-// the position/stretch controls still audibly do something. Fills dst[0..n) at
-// sample rate `sr`.
-inline void fillStubSource(float* dst, uint32_t n, float sr) {
-  for (uint32_t i = 0; i < n; i++) {
-    float t = (float)i / sr;
-    dst[i] = 0.5f * sinf(2.0f * (float)M_PI * 220.0f * t)
-           + 0.3f * sinf(2.0f * (float)M_PI * 331.0f * t)
-           + 0.2f * sinf(2.0f * (float)M_PI * 554.0f * t);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Which source the instrument booted from, for the PROFILE `SRC` line. The
+// What the source is, for the PROFILE `SRC` line and the boot decision. The
 // boot fingerprint (`crc=`) renders whatever the source holds, so a crc is
 // comparable only between builds whose SRC lines match.
 // ---------------------------------------------------------------------------
 
-enum SourceKind : uint8_t { SRC_STUB = 0, SRC_QSPI = 1, SRC_SD = 2 };
-
-// Why a loader fell through (SD stage, then QSPI stage); 0 = it succeeded.
+// Why opening the source failed; 0 = it succeeded.
 enum SourceErr : uint8_t {
   SE_OK = 0,
-  SE_NO_CARD,        // SDMMC init failed (no card, or not readable)
+  SE_NO_CARD,        // SDMMC init failed at FAST and at STANDARD (no card, or not readable)
   SE_NO_FS,          // no FAT filesystem / mount failed
   SE_NO_WAV,         // no candidate *.wav in the root directory
   SE_OPEN,           // the chosen file would not open
@@ -99,55 +33,38 @@ enum SourceErr : uint8_t {
   SE_NO_DATA,        // no data chunk
   SE_IO,             // a read/seek failed mid-file
   SE_EMPTY,          // the file had no samples
-  SE_NO_BLOB,        // (QSPI) no valid blob header
+  SE_FRAGMENTED,     // too many fragments for the cluster map (sd_source.h)
 };
 
+enum SourceSpeed : uint8_t { SRC_SPEED_FAST = 0, SRC_SPEED_STANDARD = 1 };
+
 struct SourceInfo {
-  SourceKind kind = SRC_STUB;
-  uint32_t   rate = 0;         // the material's own rate; NOT applied (see NOTE)
-  uint32_t   len  = 0;         // samples in the Source
-  SourceErr  sdErr   = SE_OK;  // why the SD stage fell through, if it did
-  SourceErr  qspiErr = SE_OK;  // why the QSPI stage fell through, if it did
-  char       name[32] = {0};   // the SD file, or "" (13 chars if LFN is off)
+  uint32_t    rate = 0;         // the material's own rate; the codec runs at it
+  uint32_t    len  = 0;         // frames in the file
+  uint16_t    format = 0;       // 1 PCM, 3 float (EXTENSIBLE resolved)
+  uint16_t    channels = 0;     // in the file (channel 0 is played)
+  uint16_t    bits = 0;         // container bits per sample
+  SourceErr   err  = SE_OK;     // why the open failed, if it did
+  SourceSpeed speed = SRC_SPEED_FAST;   // the card clock that initialised
+  char        name[32] = {0};   // the file (truncated for the line; the open uses the full name)
 };
 
 // ---------------------------------------------------------------------------
-// "The first WAV on the card": among the ROOT directory's entries, the
-// candidate whose name sorts first case-insensitively (FAT directory order is
-// write order, so alphabetical is the only stable meaning of "first").
+// "The first WAV on the card" is List[0]: the first entry of the root
+// directory, in the order the directory lists it, that we would load -- a
+// plain file, not a dotfile (macOS writes an AppleDouble "._name.wav" twin
+// next to every file on a FAT card, and it is not audio), with a .wav
+// extension in any case. No sorting: the walk stops at the first candidate.
 // ---------------------------------------------------------------------------
 
 inline char ssLower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
-// A directory entry we would load: a plain file, not a dotfile (macOS writes
-// an AppleDouble "._name.wav" twin next to every file on a FAT card, and it
-// is not audio), with a .wav extension in any case.
 inline bool isCandidateWav(const char* name, bool isDir) {
   if (isDir || !name || name[0] == '\0' || name[0] == '.') return false;
   size_t n = strlen(name);
   if (n < 5) return false;
   const char* ext = name + n - 4;
   return ext[0] == '.' && ssLower(ext[1]) == 'w' && ssLower(ext[2]) == 'a' && ssLower(ext[3]) == 'v';
-}
-
-// Does `a` sort before `b` (case-insensitive; a prefix sorts first)?
-inline bool wavNameBefore(const char* a, const char* b) {
-  for (;; a++, b++) {
-    char ca = ssLower(*a), cb = ssLower(*b);
-    if (ca != cb) return (unsigned char)ca < (unsigned char)cb;
-    if (ca == '\0') return false;
-  }
-}
-
-// Fold one entry into the running best. Returns true if it became the best.
-inline bool pickFirstWav(const char* name, bool isDir, char* best, size_t cap) {
-  if (!isCandidateWav(name, isDir)) return false;
-  if (best[0] != '\0' && !wavNameBefore(name, best)) return false;
-  size_t n = strlen(name);
-  if (n >= cap) n = cap - 1;
-  memcpy(best, name, n);
-  best[n] = '\0';
-  return true;
 }
 
 // ---------------------------------------------------------------------------

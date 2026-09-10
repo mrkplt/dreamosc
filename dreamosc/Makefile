@@ -8,17 +8,21 @@ CPP_SOURCES = dreamosc.cpp
 LIBDAISY_DIR = ../libDaisy
 DAISYSP_DIR  = ../DaisySP
 
-# Built for the Daisy bootloader, which we need because the STM32 ROM bootloader
-# exposes no QSPI DFU target and sample audio has to live in QSPI (see CLAUDE.md).
-# BOOT_SRAM runs from internal SRAM: comparable speed to internal flash, 480 KB
-# limit (we use ~105 KB). Do NOT use BOOT_QSPI -- executing from QSPI is
-# "more cache-dependent" i.e. slower, a real risk for the audio callback.
+# Built for the Daisy bootloader. BOOT_SRAM runs from internal SRAM:
+# comparable speed to internal flash, 480 KB limit (we use ~130 KB). Do NOT
+# use BOOT_QSPI -- executing from QSPI is "more cache-dependent" i.e. slower,
+# a real risk for the audio callback. Consequence that matters (sd_source.h):
+# under BOOT_SRAM .bss/.data/stack are DTCM, which the SDMMC DMA cannot
+# reach, so every FatFs DMA target is placed in AXI SRAM by hand.
 APP_TYPE = BOOT_SRAM
 
 # FatFs for the microSD source (#131, sd_source.h). libdaisy.a already carries
 # ff.c/diskio.c, but NOT option/ccsbcs.c (ff_convert/ff_wtoupper, needed with
 # long-file-name support on); USE_FATFS=1 makes libDaisy's core Makefile add
 # the FatFs sources to this build -- the same wiring the DaisyExamples use.
+# Note the bootloader is still required (`make program-boot`, once): with it
+# installed programs cannot use internal flash, and it is what makes the
+# 480 KB SRAM image possible.
 USE_FATFS = 1
 
 # --- Vendored third-party sources -------------------------------------------
@@ -73,10 +77,10 @@ deps:
 deps-check:
 	$(DEPS_DIR)/setup.sh --check
 
-# Compile-check sd_source.h against the real libDaisy/FatFs API with the device
-# toolchain and flags. Nothing #includes it yet (the SD card path is #131, no
-# card present), so without this a GCC or libDaisy change could break it
-# silently until the card arrives. Syntax/semantics only; no object produced.
+# Compile-check sd_source.h on its own against the real libDaisy/FatFs API
+# with the device toolchain and flags (it is also compiled as part of
+# dreamosc.cpp; this catches a header that only builds because of what the
+# firmware happened to include before it). Syntax/semantics only.
 .PHONY: sd-check
 sd-check:
 	@mkdir -p $(BUILD_DIR)
@@ -91,50 +95,3 @@ $(VENDOR_STAMP):
 	$(VENDOR_DIR)/fetch.sh
 
 build/$(TARGET).o: $(VENDOR_STAMP)
-
-# --- Sample upload to QSPI ---------------------------------------------------
-# TEMPORARY scaffolding for #132 control testing: real broadband material has to
-# live somewhere, and internal flash (128 KB) is far too small. QSPI is 8 MB and
-# memory-mapped at 0x90000000, so the firmware reads it in place. Reverts to the
-# SD-card path (#131) once controls are sorted.
-#
-#   make sample SAMPLE_SRC=/path/to.wav   convert a WAV to the blob
-#   make program-all                      upload sample + firmware in one go
-#   make program-sample                   upload just the blob to QSPI
-#   make program-dfu                      upload just the firmware
-#
-# NOTE: QSPI DFU requires Electrosmith's Daisy bootloader (the STM32 ROM
-# bootloader exposes only Internal Flash + Option Bytes). Install it once with
-# `make program-boot`, which libDaisy's core Makefile provides.
-SAMPLE_BIN ?= ../sample/amen.bin
-SAMPLE_SRC ?=
-
-# 0x90400000 is the third QSPI region per the bootloader's DFU descriptor
-# (0x90000000 reserved, 0x90040000 firmware images, 0x90400000 free).
-# Must match SAMPLE_QSPI_ADDR in dreamosc.cpp.
-SAMPLE_ADDR = 0x90400000
-
-.PHONY: sample program-sample program-all
-sample:
-	@test -n "$(SAMPLE_SRC)" || { echo "usage: make sample SAMPLE_SRC=/path/to.wav"; exit 2; }
-	../tools/wav2raw.py "$(SAMPLE_SRC)" "$(SAMPLE_BIN)"
-
-program-sample:
-	@test -f "$(SAMPLE_BIN)" || { echo "no $(SAMPLE_BIN) -- run: make sample SAMPLE_SRC=..."; exit 2; }
-	dfu-util -a 0 -s $(SAMPLE_ADDR):leave -D "$(SAMPLE_BIN)" -d ,0483:df11
-
-# Both images in one pass. The sample is written WITHOUT ':leave' so the board
-# stays in DFU for the firmware upload that follows -- ':leave' would boot it out
-# and the second dfu-util call would find no device. Only the firmware (last)
-# leaves DFU and runs.
-#
-# dfu-util exits non-zero on the harmless "Submitting leave request" error on the
-# STM32H750 (the chip resets and drops USB before dfu-util gets its ack), so the
-# firmware step tolerates that; the sample step must genuinely succeed.
-program-all: $(BUILD_DIR)/$(TARGET_BIN)
-	@test -f "$(SAMPLE_BIN)" || { echo "no $(SAMPLE_BIN) -- run: make sample SAMPLE_SRC=..."; exit 2; }
-	@echo "==> 1/2 sample -> QSPI $(SAMPLE_ADDR)"
-	dfu-util -a 0 -s $(SAMPLE_ADDR) -D "$(SAMPLE_BIN)" -d ,0483:df11
-	@echo "==> 2/2 firmware -> $(FLASH_ADDRESS)"
-	-dfu-util -a 0 -s $(FLASH_ADDRESS):leave -D $(BUILD_DIR)/$(TARGET_BIN) -d ,0483:df11
-	@echo "==> done (ignore any 'Error during download get_status' above)"

@@ -38,7 +38,28 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
   blends two frame reads per gated head per sample (it used to read one ring
   sample); the main loop lost its whole per-sample kernel in exchange. Max
   concurrent is two sounding heads plus one armed rendering ahead.
-- **480 MHz** clean on the codec and QSPI paths (`pod.Init(true)`).
+- **480 MHz** clean on the codec and SD paths (`pod.Init(true)`).
+- **The SD stream (#131), all of it.** Nothing below has run on hardware:
+  - Boot with the amen card: `SRC rate=44100 fs=44100 fs_err=0 err=0
+    spd=0 fmt=1 bits=16 ch=2 len=244716`, and `board=` (2 = Seed 2 DFM /
+    PCM3060 is the expectation for a 2026 Pod; 1 = Seed 1.1 would exercise
+    the unverified WM8731 register write).
+  - No card / an empty card / a card with only a 64-bit-float file: both
+    LEDs blink red, no audio, `err=` 1 / 3 / 7 on the SRC line.
+  - `FETCH fail=0` always. A non-zero `fail` is a card read the firmware
+    zero-filled — the DTCM/DMA class of bug, or a card fault.
+  - **Scrub at 16384**: turn a step's position while it sounds. `FETCH
+    max=` is the fetch in ISR samples; the hop is 8192, and the render is
+    ~700 on top. If `du` ticks on every scrub, the cache's look-ahead policy
+    (`WindowCache::wantEnd`) or the staging size is the knob; if `max` sits
+    well under the hop, the design has slack to spare.
+  - Steady state: `FETCH ext=` ≈ one per window of travel per gated head;
+    `smp` well under `svc_us` at 48 k (the fetch must be a small fraction
+    of the render).
+  - `spd=0`: the card came up at FAST (50 MHz). If it reads `1`, the card
+    fell back to STANDARD — fine, but say so on the card.
+  - `isr_max` unchanged: the ISR never touches the card; SDRAM contention
+    from the fetch shows up here if anywhere.
 - **Refresh feel:** turning position/stretch/frame on a sounding head. `rfr`
   counts re-renders; `slack` should stay positive. If a fast knob sweep drives
   `du` up, the refresh threshold (0.002 in position) or the minimum gap
@@ -50,23 +71,21 @@ Found while reviewing the codebase for cleanup, deliberately NOT changed —
 each one alters what the instrument does or how it feels, so it is a decision
 and/or a bench item, not a cleanup. Recorded so they are not lost.
 
-- **The material's sample rate is never applied — and the amen break is
-  44.1 kHz.** `tools/wav2raw.py` promises "the firmware reads the header and
-  scales playback accordingly"; nothing does. The QSPI blob is a mono fold of
-  `cw_amen13_173.wav` at 44,100 Hz, so through alpha5 the instrument has been
-  playing it at 48 kHz: ~9% fast and ~1.5 semitones sharp, and every bench
-  judgment so far was made on that. The SD path now REPORTS the rate on the
-  PROFILE `SRC` line but still does not apply it. Resampling at load (or a
-  read-rate ratio in `fillWindowed`) is a sound change: its own card and its
-  own bench session.
-- ~~QSPI and SD disagree on the `Source` length rule~~ — decided with #131:
-  **`src.len` is the material length under every loader** (the file's sample
-  count, capped at `SOURCE_LEN`), so position 0..1 spans the file. The QSPI
-  fallback therefore changed: the amen used to be wrap-padded to 10 s (about
-  1.8 copies) with `len = 10 s`; it is now 5.55 s once. Every step position
-  tuned against the padded scale reads differently on the fallback. One line
-  flips it back (`out.len = SOURCE_LEN` in `load_qspi_sample`); the padding
-  `decodeSampleBlob` writes is inert because reads wrap modulo `len`.
+- ~~The material's sample rate is never applied~~ — done, and it is the
+  first thing the bench must hear. The codec now runs at the file's rate
+  (`clock_core.h` plans PLL3, `codec_rate.h` applies it and reads the rate
+  back from the registers; `SRC fs=` is the readback). **The amen is
+  44.1 kHz, so it will play 9% slower and 1.5 semitones lower than every
+  session through alpha5** — that is the file, not a regression. Every
+  bench judgment so far was made at 48 014 Hz (libDaisy's stock PLL3 is
+  +298 ppm; 48 kHz is now exact too). The fractional PLL3 plan is the one
+  in use; an integer alternative (M 7, N 326, P 33 with MCKDIV 2 →
+  44 101.7 Hz) exists if the fractional divider is ever suspected of
+  jitter — an A/B by ear, not a host question.
+- ~~QSPI and SD disagree on the `Source` length rule~~ — moot: there is one
+  source, the file, streamed. `len` is the file's frame count; position
+  0..1 spans the file; nothing is padded or truncated. The padded-10 s scale
+  every early step position was tuned against is gone with the QSPI path.
 - ~~Control poll is blocked behind renders~~ — done (L1), after a detour.
   **Where the panel is read is now the audio callback**: `processControls()`
   runs at the top of every callback, before `render()`, for the encoder,
@@ -178,6 +197,10 @@ the fix. What the bench still owes here:
 
 - AXI SRAM vs SDRAM for the FFT scratch (placed per ST's guidance; the speedup
   was never confirmed).
+- The cost of a whole-run fetch off the card at each window size (the
+  `FETCH max=` above). The look-ahead policy (back-pad ½ w, look-ahead 2 w,
+  extend when under 1 w remains) was chosen by reasoning, not measurement.
+- FAST (50 MHz) vs STANDARD (25 MHz) card clock on the Pod's SD slot.
 
 ## Closed by measurement (recorded so they are not re-tried)
 

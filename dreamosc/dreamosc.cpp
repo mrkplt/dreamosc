@@ -14,15 +14,9 @@
 #include "source_core.h"
 #include "sd_source.h"
 #include "codec_rate.h"
+#include "axisram.h"      // AXISRAM_DATA: plain globals in D1 AXI SRAM (see the header)
 
 using namespace daisy;
-
-// Place a plain (no-constructor) global in the AXI SRAM (D1, fast + L1-cacheable)
-// via our own linker script's .axisram_bss section (dreamosc.lds). This is the
-// region ST designates for large hot working sets that outgrow DTCM -- see
-// hardware_spec.md. NOLOAD, so it is runtime-zeroed by our own memset, NOT the
-// C runtime; only plain data, never constructed C++ objects.
-#define AXISRAM_DATA __attribute__((section(".axisram_bss")))
 
 // --- the globals stretch_core.h externs ------------------------------------
 StretchTables gTab;
@@ -133,14 +127,6 @@ static int appendScaled(char* buf, size_t cap, int used, const float* v, int n, 
 #endif
 
 // --- storage ---------------------------------------------------------------
-#define SOURCE_SECONDS 10
-#define SAMPLE_RATE    48000
-#define SOURCE_LEN     (SOURCE_SECONDS * SAMPLE_RATE)
-
-// Source audio lives in SDRAM (~1.9 MB) — never fits internal SRAM. A plain
-// array (no constructor), so NOLOAD SDRAM is fine; we memset it before use.
-static float DSY_SDRAM_BSS sourceBuf[SOURCE_LEN];
-
 // The Sequencer stays in internal SRAM. It is a C++ object with member
 // initializers and Head sub-objects (atomics); objects in .sdram_bss get NEITHER
 // their constructor run NOR their storage zeroed (the section is NOLOAD and SDRAM
@@ -149,40 +135,36 @@ static float DSY_SDRAM_BSS sourceBuf[SOURCE_LEN];
 // their big buffers (the pool below) go to SDRAM.
 static Sequencer seq;
 
-// Per-head frame buffers (SS_FRAME_BUFS per head, each SS_W floats) live in
-// SDRAM: SS_HEADS * 6 * 16384 floats ~= 3.9 MB. A plain array, NOT an object --
-// .sdram_bss is NOLOAD and SDRAM is unpowered at static-init time, so
-// constructors never run and storage is not zeroed there. Sequencer::init()
-// carves this up and hands each Head a slice; a frame buffer is always fully
-// written by a render before the ISR can reference it, so NOLOAD garbage never
+// Per-head frame buffers (SS_FRAME_BUFS per head, each SS_W floats) and each
+// head's window cache (4 * SS_W floats, the run of source it renders from)
+// live in SDRAM: SS_HEADS * 10 * 16384 floats ~= 6.5 MB. A plain array, NOT
+// an object -- .sdram_bss is NOLOAD and SDRAM is unpowered at static-init
+// time, so constructors never run and storage is not zeroed there.
+// Sequencer::init() carves this up and hands each Head a slice; a frame
+// buffer is always fully written by a render before the ISR can reference
+// it, and a cache run is fetched before it is read, so NOLOAD garbage never
 // reaches the output. The Head objects themselves stay in SRAM.
 static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
-static MemSource src;   // over sourceBuf until the streaming SD source (next)
 
 // --- source audio -----------------------------------------------------------
-// Sample material is uploaded separately to QSPI flash (8 MB, memory-mapped at
-// 0x90000000) rather than embedded in the firmware: internal flash is only
-// 128 KB and a usable sample is hundreds of KB. Build the blob with
-// tools/wav2raw.py and upload it with `make program-sample`. The blob format
-// and its decode (validate, int16 -> float, wrap-pad) are source_core.h,
-// host-tested; only the address and the cast are hardware.
+// The source is a WAV on the microSD, STREAMED: each head's window cache asks
+// SdSource::read() for the run it is about to render, and the frames come
+// off the card then (sector-aligned DMA into an AXI staging buffer, decoded
+// to float; sd_source.h). No length limit, no copy of the file in RAM. The
+// SdSource object is small (a handle, a WavInfo) and constructed normally
+// in .bss; its DMA targets are AXI SRAM statics inside sd_source.h.
 //
-// QSPI layout, read from the Daisy bootloader's own DFU descriptor:
-//   0x90000000  64 x 4KB   (256 KB) bootloader-reserved
-//   0x90040000  60 x 64KB  (3.75 MB) firmware images live here
-//   0x90400000  60 x 64KB  (3.75 MB) free
-// Sample data goes in the THIRD region so it can never collide with a firmware
-// image, even under APP_TYPE=BOOT_QSPI. Must match SAMPLE_ADDR in the Makefile.
-// (Not named QSPI_BASE: stm32h750xx.h already defines that as the peripheral's
-// 0x90000000 base, and redefining it was a warning on every build.)
-#define SAMPLE_QSPI_ADDR 0x90400000u
+// There is NO fallback source. No card, no WAV, an unsupported format, an
+// unreadable file, or a rate the codec cannot take is "no instrument":
+// haltNoInstrument() below. A wrong rate or the wrong material is worse than
+// silence with a reason on the SRC line.
+static stretchsd::SdSource sdSrc;
 
-// Where the source came from at boot (SD / QSPI / stub), its rate and length,
-// and why an earlier stage fell through -- printed as the PROFILE SRC line.
-// The boot crc= renders this material, so crc is comparable only between
-// builds whose SRC lines match.
+// The open file: rate, length, format, the name, and why an open failed --
+// printed as the PROFILE SRC line. The boot crc= renders this material, so
+// crc is comparable only between builds whose SRC lines match.
 static SourceInfo srcInfo;
 
 // The codec's rate: the material's own (codec_rate.h applies it through PLL3
@@ -191,15 +173,17 @@ static SourceInfo srcInfo;
 // only rate anything downstream ever sees.
 static CodecRate codecRate;
 
+static bool audioRunning = false;
+
 #ifdef PROFILE
 static void profilePrintSource();
 #endif
 
-// No instrument: something the boot depends on failed (the codec would not
-// take the material's rate). Audio never starts; both LEDs blink red; under
-// PROFILE the SRC line says why, once a second. There is no fallback source
-// by design: a wrong rate or the wrong material is worse than silence.
+// No instrument: the source would not open, or the codec would not take its
+// rate. Audio never starts (or has been stopped); both LEDs blink red; under
+// PROFILE the SRC line says why, once a second.
 static void haltNoInstrument() {
+  if (audioRunning) { pod.StopAudio(); pod.StopAdc(); audioRunning = false; }
   uint32_t last = System::GetNow();
   bool on = true;
   for (;;) {
@@ -218,31 +202,32 @@ static void haltNoInstrument() {
   }
 }
 
-// Load the QSPI sample into the SDRAM source buffer as float. Returns false
-// if no valid blob is present (never uploaded, or erased), so the caller can
-// fall back to a synthesized source rather than playing garbage. The blob's
-// sample rate is decoded and reported but NOT applied (see the NOTE in
-// source_core.h and OPEN_ISSUES.md).
-static bool load_qspi_sample(MemSource& out) {
-  uint32_t rate = 0;
-  uint32_t n = decodeSampleBlob((const uint8_t*)SAMPLE_QSPI_ADDR, sourceBuf, SOURCE_LEN, rate);
-  if (n == 0) { srcInfo.qspiErr = SE_NO_BLOB; return false; }
-  out.data = sourceBuf; out.len = n;
-  srcInfo.kind = SRC_QSPI; srcInfo.rate = rate; srcInfo.len = n;
+// Open a file as THE source and bring the codec to its rate. `name` is a
+// root-directory file name, or nullptr for List[0] (the first WAV the
+// directory lists). Re-entrant: audio and the ADC are stopped first if they
+// run (a PLL relock under a running stream would glitch; PLL3 R clocks the
+// ADC), the previous file is closed, and the Sequencer is re-initialised at
+// the new rate -- every head's cache is reset with it, so nothing reads the
+// old file. Public controls (stretch, duration, fade, window, steps,
+// positions) persist across an open; the sequence restarts at step 0.
+// Returns false with srcInfo.err / codecRate.err set; audio is then stopped
+// and the caller halts (no fallback).
+static bool openSource(const char* name) {
+  if (audioRunning) { pod.StopAudio(); pod.StopAdc(); audioRunning = false; }
+  bool ok = name ? sdSrc.open(name, srcInfo) : sdSrc.openFirst(srcInfo);
+  if (!ok) return false;
+  if (!setCodecRate(pod.seed, sdSrc.rate, codecRate)) return false;
+  seq.init(&sdSrc, (float)codecRate.measured, voicePool);
   return true;
 }
 
-// Source length rule (decided for #131, recorded in OPEN_ISSUES.md): src.len
-// is the MATERIAL length under every loader, so position 0..1 spans the
-// file. The QSPI blob used to be wrap-padded to SOURCE_LEN (10 s) with len =
-// SOURCE_LEN; reads wrap modulo len anyway, so the padding decodeSampleBlob
-// still writes is inert.
-static void load_source_at_boot(MemSource& out) {
-  if (stretchsd::load_source(out, sourceBuf, SOURCE_LEN, srcInfo)) return;
-  if (load_qspi_sample(out)) return;
-  fillStubSource(sourceBuf, SOURCE_LEN, SAMPLE_RATE);
-  out.data = sourceBuf; out.len = SOURCE_LEN;
-  srcInfo.kind = SRC_STUB; srcInfo.rate = SAMPLE_RATE; srcInfo.len = SOURCE_LEN;
+// Audio and the panel: the instrument is live from here.
+static void AudioCallback(AudioHandle::InterleavingInputBuffer in,
+                          AudioHandle::InterleavingOutputBuffer out, size_t size);
+static void startInstrument() {
+  pod.StartAdc();
+  pod.StartAudio(AudioCallback);   // the panel is read in the callback from here on
+  audioRunning = true;
 }
 
 // --- controls ---------------------------------------------------------------
@@ -378,22 +363,48 @@ static void processControls() {
 }
 
 #ifdef PROFILE
-// SRC line: where the material came from (0 = synthesized stub, 1 = QSPI
-// blob, 2 = SD), its own sample rate, the codec's rate as READ BACK from the
-// registers (fs; the two must agree -- the codec runs at the material's
-// rate), the codec-rate error code (codec_rate.h; 0 = ok), the board
-// revision libDaisy detected (0 = Seed, 1 = Seed 1.1 / WM8731, 2 = Seed 2
-// DFM / PCM3060), the length in samples, the SD file name, and why the SD /
-// QSPI stages fell through (SourceErr codes in source_core.h; 0 = ok). crc=
-// is comparable only between builds with the same SRC line. Printed on its
-// own from haltNoInstrument() too, so a refused rate is visible.
+// SRC line: the open file -- its own sample rate (rate), the codec's rate as
+// READ BACK from the registers (fs; the two must agree: the codec runs at
+// the material's rate), the codec-rate error code (codec_rate.h; 0 = ok),
+// the board revision libDaisy detected (0 = Seed, 1 = Seed 1.1 / WM8731, 2 =
+// Seed 2 DFM / PCM3060), the format (1 PCM / 3 float), container bits,
+// channels in the file (channel 0 plays), the length in frames, the card
+// clock that initialised (spd 0 = FAST 50 MHz, 1 = STANDARD 25 MHz), why the
+// open failed (err: SourceErr codes in source_core.h; 0 = ok) and the file
+// name. crc= is comparable only between builds with the same SRC line.
+// Printed on its own from haltNoInstrument() too, so a refusal is visible.
 static void profilePrintSource() {
-  pod.seed.PrintLine("SRC kind=%d rate=%u fs=%u fs_err=%d board=%d len=%u sd_err=%d qspi_err=%d file=%s",
-                     (int)srcInfo.kind, (unsigned)srcInfo.rate,
+  pod.seed.PrintLine("SRC rate=%u fs=%u fs_err=%d board=%d fmt=%u bits=%u ch=%u len=%u spd=%d err=%d file=%s",
+                     (unsigned)srcInfo.rate,
                      (unsigned)codecRate.measured, (int)codecRate.err,
                      (int)pod.seed.CheckBoardVersion(),
-                     (unsigned)srcInfo.len,
-                     (int)srcInfo.sdErr, (int)srcInfo.qspiErr, srcInfo.name);
+                     (unsigned)srcInfo.format, (unsigned)srcInfo.bits, (unsigned)srcInfo.channels,
+                     (unsigned)srcInfo.len, (int)srcInfo.speed, (int)srcInfo.err, srcInfo.name);
+}
+
+// FETCH line: the streaming source's traffic this second. miss = whole
+// cache re-fetches (a fresh life, a position scrub), ext = look-ahead
+// top-ups as heads travel, fail = reads the card refused (zero-filled:
+// must stay 0), smp = ISR samples the main loop spent inside fetches (this
+// time is SUBTRACTED from the render cost model), max = the worst single
+// render's fetch in samples (a scrub at 16384 is the case to watch against
+// the hop: 8192 samples at that size), rd = SdSource::read() calls, kb =
+// frame bytes delivered. A head is starved (du on HLTH) only if smp + the
+// render exceed the slack; this line says which half it was.
+static uint32_t profLastMiss = 0, profLastExt = 0, profLastFail = 0, profLastFetch = 0, profLastReads = 0;
+static uint64_t profLastBytes = 0;
+static void profilePrintFetch() {
+  Sequencer::CacheStats c = seq.cacheStats();
+  uint32_t fetch = seq.fetchSamples();
+  uint32_t reads = sdSrc.reads();
+  uint64_t bytes = sdSrc.bytes();
+  pod.seed.PrintLine("FETCH miss=%u ext=%u fail=%u smp=%u max=%u rd=%u kb=%u",
+                     (unsigned)(c.misses - profLastMiss), (unsigned)(c.extends - profLastExt),
+                     (unsigned)(c.failures - profLastFail), (unsigned)(fetch - profLastFetch),
+                     (unsigned)seq.takeMaxFetch(),
+                     (unsigned)(reads - profLastReads), (unsigned)((bytes - profLastBytes) / 1024));
+  profLastMiss = c.misses; profLastExt = c.extends; profLastFail = c.failures;
+  profLastFetch = fetch; profLastReads = reads; profLastBytes = bytes;
 }
 
 // The once-a-second serial dump. Every variable parameter appears here (the
@@ -505,6 +516,7 @@ static void profilePrint() {
   prof.lastLate = late; prof.lastRefresh = rfr;
   prof.busyTicks = prof.units = 0;
   prof.maxTicks = 0;   // reset the per-window peak (stk is a running high-water)
+  profilePrintFetch();
 }
 #endif
 
@@ -552,23 +564,15 @@ int main(void) {
 #endif
 
   gTab.init();                       // ShyFFT + window/blend tables (SDRAM is up)
-  // Source material, before audio starts (#131): the first WAV on the microSD
-  // (alphabetically, root directory, 16-bit PCM, stereo folded to mono, up to
-  // SOURCE_LEN samples); else the QSPI blob (the control-testing scaffolding,
-  // now the fallback); else a synthesized tone so the instrument always makes
-  // sound. Card init plus the read is the audible boot delay.
-  load_source_at_boot(src);
 
-  // The codec runs at the material's rate (codec_rate.h): PLL3 is
-  // reprogrammed with audio and the ADC both stopped (neither has started
-  // yet here) and the rate is read back from the registers. A refusal is no
-  // instrument, not a resampled or pitched one. From here on `fs` -- the
-  // measured rate, never pod.AudioSampleRate()'s nominal 48000 -- is the
-  // sample rate everything is initialised with.
-  if (!setCodecRate(pod.seed, srcInfo.rate, codecRate)) haltNoInstrument();
-  const float fs = (float)codecRate.measured;
+  // The source, before audio starts (#131): List[0] on the microSD, opened
+  // and streamed (sd_source.h), and the codec brought to ITS rate
+  // (codec_rate.h: PLL3 reprogrammed with audio and the ADC not yet running,
+  // the rate read back from the registers). Card init, the mount and the
+  // header parse are the boot delay. A refusal of any kind is no instrument.
+  if (!openSource(nullptr)) haltNoInstrument();
+  const float fs = (float)codecRate.measured;   // never pod.AudioSampleRate()'s nominal 48000
 
-  seq.init(&src, fs, voicePool);
 #ifdef PROFILE
   // Boot fingerprint (see profBootCrc): a fixed-config render with audio still
   // stopped, so service()/render() run strictly sequentially, exactly as the
@@ -576,7 +580,7 @@ int main(void) {
   seq.stretch = 50.0f; seq.duration = 0.5f; seq.fade = 0.5f;
   seq.setSteps(3); seq.setFrame(4096);
   profBootCrc = renderFingerprint(seq, monoBlock, (int)AUDIO_BLOCK, PROF_CRC_SAMPLES);
-  seq.init(&src, fs, voicePool);
+  seq.init(&sdSrc, fs, voicePool);
   gUnderruns = 0; gClips = 0;
 #endif
   // Starting values; the knobs/encoder take over from here (see processControls).
@@ -591,8 +595,7 @@ int main(void) {
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
   seq.setSteps(SS_STEPS);
 
-  pod.StartAdc();
-  pod.StartAudio(AudioCallback);   // the panel is read in the callback from here on
+  startInstrument();
 
   // Main loop: a pure producer. Render staged frames (earliest deadline
   // first), nothing else; the panel, the LEDs and every control value belong

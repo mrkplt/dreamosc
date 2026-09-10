@@ -225,12 +225,17 @@ dreamosc/
   THEORY_OF_OPERATION.md  HOW it works: synthesis math, head state machine, the
                       staged-frame queue protocol, scheduler, clock, memory,
                       invariants. Read before changing stretch_core.h.
-  stretch_core.h      DSP core: Source, Head, Sequencer, StretchTables (portable)
+  stretch_core.h      DSP core: Source (streaming interface) + WindowCache, Head,
+                      Sequencer, StretchTables (portable)
   controls_core.h     Control-surface logic: PanelEditor, encoder stepping, LED
                       colors, encoder tables/pages (portable, host-tested — see CONTROLS.md)
-  source_core.h       QSPI sample-blob decode + stub source (portable, host-tested)
+  source_core.h       WAV: List[0] rule, chunk walk, 8/16/24/32/float decode,
+                      sector-aligned ranged read (portable, host-tested)
+  clock_core.h        PLL3 plan for a native codec rate (portable, host-tested)
   shy_fft.h           Emilie Gillet's embedded real FFT (MIT; vendored)
-  sd_source.h         Load a WAV off microSD -> SDRAM -> Source. THE source seam.
+  sd_source.h         SdSource: the WAV on the microSD, streamed. THE source seam.
+  codec_rate.h        Apply + verify the codec rate through the HAL (device edge)
+  axisram.h           AXISRAM_DATA: plain globals in D1 AXI SRAM (device edge)
   dreamosc.cpp        Pod firmware: hardware glue (audio callback, controls, LEDs)
   CONTROLS.md         The current control mapping (progressive disclosure)
   Makefile            libDaisy build; targets ../libDaisy and ../DaisySP
@@ -346,56 +351,58 @@ showing `[0483:df11] ... @Internal Flash /0x08000000` before flashing.
 STM32H750 (the chip resets and drops USB before dfu-util gets its ack); the
 `File downloaded successfully` line above it means the flash landed.
 
-### Sample audio: microSD first, QSPI blob as the fallback
+### Sample audio: the WAV on the microSD, streamed, at its own rate
 
-**Boot order (`load_source_at_boot` in `dreamosc.cpp`, Fizzy #131):**
-1. **microSD**: the first `*.wav` in the card's root directory — *first* means
-   alphabetical, case-insensitive (FAT directory order is write order, so it is
-   the only stable meaning); dotfiles are skipped (macOS writes an AppleDouble
-   `._name.wav` twin next to every file on a FAT card). 16-bit PCM only, mono
-   or multichannel folded to mono by the mean, truncated to `SOURCE_LEN`
-   (10 s at 48 kHz). All of that logic is `source_core.h` (host-tested over a
-   memory reader); `sd_source.h` is only SDMMC/FatFs glue, compile-checked by
-   `make sd-check`. `USE_FATFS = 1` in the Makefile pulls in FatFs's
-   `option/ccsbcs.c`, which `libdaisy.a` lacks.
-2. **QSPI blob** (the scaffolding below), if no card / no usable file.
-3. **A synthesized tone**, so the instrument always makes sound.
+**Boot (`openSource(nullptr)` in `dreamosc.cpp`, Fizzy #131):**
+1. **List[0]**: the first entry of the card's root directory, *in the order
+   the directory lists it* (FAT write order; no sorting), that is a plain
+   file with a `.wav` extension and not a dotfile (macOS writes an
+   AppleDouble `._name.wav` twin next to every file on a FAT card, and it is
+   not audio). `isCandidateWav` in `source_core.h`.
+2. **Open and parse**: PCM 8 (unsigned) / 16 / 24 / 32-bit and IEEE float 32,
+   plain or `WAVE_FORMAT_EXTENSIBLE`; LIST/fact/odd chunks skipped; a lying
+   data length clamped to the file. **Channel 0 (left) only** from stereo or
+   multichannel — for now, by decision. A cluster link map is built so every
+   seek is a table lookup. `source_core.h`, host-tested over a memory reader;
+   `sd_source.h` is SDMMC/FatFs glue (`make sd-check` compiles it alone).
+3. **The codec is brought to the file's rate** (`codec_rate.h` /
+   `clock_core.h`): PLL3 is re-planned so `pll3_p = fs × 1024`, applied with
+   audio and the ADC stopped, and the achieved rate is **read back from the
+   registers** (`fs=` on the SRC line). A 44.1 kHz file plays at 44.1 kHz.
+   Range 16–96 kHz (the PCM3060's); a Seed 1.1 (WM8731) takes only the
+   44.1/48 families.
+4. **Streamed, not loaded.** There is no source buffer and no length limit:
+   each head's `WindowCache` (a 4 × `SS_W` ring in its SDRAM slice) asks
+   `SdSource::read()` for the run it is about to render — back-pad + window +
+   two windows of look-ahead — and the frames come off the card then, on the
+   main loop, whole sectors by DMA into an AXI staging buffer. Forward travel
+   extends the run by fetching only the new tail; a **scrub** (position knob)
+   is a miss and one whole fetch. Fetch time is measured and **subtracted
+   from the render cost model** (a scrub must not slow every refresh behind
+   it); it is on the PROFILE `FETCH` line.
 
-The PROFILE `SRC` line shows which stage won, the material's rate and length,
-the file name, and the reason each earlier stage fell through. **`src.len` is
-the material length under every loader** (position 0..1 spans the file). **The
-material's sample rate is reported but NOT applied**: a 44.1 kHz file plays
-about 9% fast/sharp at the 48 kHz codec. The amen break in QSPI is 44.1 kHz,
-so every bench judgment so far was made that way; changing it is a sound
-decision (OPEN_ISSUES.md).
+**No fallback, by design.** No card, no WAV, an unsupported format, an
+unreadable or over-fragmented file, or a rate the codec cannot take is *no
+instrument*: audio never starts, both LEDs blink red, and under PROFILE the
+`SRC` line says why (`err=` SourceErr, `fs_err=` CodecRateErr) once a second.
+The one retry is the card **clock**: FAST (50 MHz) first, STANDARD if the
+card would not initialise at FAST (`spd=` on the SRC line). `openSource()` is
+re-entrant (stops audio + ADC, closes the previous file, re-inits the
+Sequencer at the new rate; public controls persist, the sequence restarts at
+step 0) — reading arbitrary files is the next step.
 
-**QSPI blob — why it exists:** internal flash is only 128 KB, so real sample
-material (hundreds of KB) cannot be embedded, and before a card was present
-the controls had to be judged on broadband material (a sine has no spectral
-variation across the buffer). The current blob is a mono fold of
-`cw_amen13_173.wav` (rhythm-lab.com amen vol. 1; 5.55 s, 44.1 kHz).
+**Memory rule that made this work:** under `APP_TYPE = BOOT_SRAM`, `.bss`,
+`.data` and the stack are DTCM, which the SDMMC's IDMA cannot reach (libDaisy
+#508). Every FatFs DMA target — the `FIL`, the `FATFS` inside
+`FatFSInterface`, the staging buffer — is placed in AXI SRAM by hand
+(`AXISRAM_DATA`, `axisram.h`), NOLOAD and memset / placement-new'd before
+use. A `FIL` on the stack (which the first SD draft had) fails every read on
+hardware.
 
-```
-make sample SAMPLE_SRC=/path/to.wav   # WAV -> tools/wav2raw.py blob
-make program-boot                     # ONE TIME: install the Daisy bootloader
-make program-sample                   # upload the blob to QSPI
-```
-
-**The Daisy bootloader is required** because the STM32 ROM bootloader exposes
-only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
-
-- **Use `APP_TYPE = BOOT_SRAM`**, never `BOOT_QSPI`. SRAM execution is
-  "comparable speed to internal flash" with a 480 KB limit (we use ~105 KB,
-  ~21%); QSPI execution is "more cache-dependent" i.e. slower, which is a real
-  risk for a real-time audio callback.
-- The bootloader **reserves the first 256 KB of QSPI** (firmware images load at
-  `0x90040000`). Sample data therefore lives at **`0x90400000`** (the third
-  region, past the firmware area) — `QSPI_BASE` in `dreamosc.cpp` and
-  `SAMPLE_ADDR` in the Makefile must agree (both are `0x90400000`).
-- With the bootloader installed, programs **cannot use internal flash**.
-- The blob is self-describing (magic `DRMO`, count, rate) so the firmware
-  validates it and falls back to a synthesized source if QSPI is empty or
-  erased — it never plays garbage.
+**The QSPI sample scaffolding is gone** (blob decoder, `wav2raw.py`, the
+`sample`/`program-sample` targets, the 10 s SDRAM source buffer). The Daisy
+bootloader is still required (`make program-boot`, once; `APP_TYPE =
+BOOT_SRAM`; with it installed programs cannot use internal flash).
 
 ## State of play (what's done, what's next)
 
@@ -428,23 +435,24 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   read in the audio callback, heard clean on the bench with two gated heads
   at `isr_max` 24 µs). See `dreamosc/OPEN_ISSUES.md` for what the bench still
   owes, the tag discipline above, and Fizzy for what's next.
-- **SD source: wired at boot (#131), host-tested, NOT yet heard on hardware.**
-  `load_source_at_boot()` tries the card, then the QSPI blob, then the stub.
-  The WAV parser, the stereo fold and the "first WAV" rule are in
-  `source_core.h` with tests (canonical / LIST-before-data / odd chunks /
-  lying data length / 24-bit and EXTENSIBLE refused); `sd_source.h` is glue
-  and `make sd-check` keeps it compiling against libDaisy. Bench owes: boot
-  with no card falls back within about a second; a card with the amen WAV
-  prints `SRC kind=2 rate=44100 len=244716`; a 24-bit-only card falls back
-  with `sd_err=7`.
+- **SD source: streamed at the file's own rate (#131), host-tested, NOT yet
+  heard on hardware.** `openSource()` opens List[0], brings the codec to the
+  file's rate, and every head streams its windows off the card through its
+  `WindowCache`; the four host goldens are bit-identical through the cache.
+  Bench owes (see `OPEN_ISSUES.md`): the amen card boots to `SRC rate=44100
+  fs=44100` and sounds 9% slower / 1.5 semitones lower than every session
+  through alpha5 (that is the file); `FETCH fail=0` while scrubbing at 16384;
+  `du` on a scrub; `spd=0` (FAST) on this card; no card → both LEDs red.
 
 ## Key facts a future agent needs
 
-- **Source is source-agnostic by design.** `Source { float* data; uint32_t len; }`
-  with wrapping reads. `load_source_at_boot()` in `dreamosc.cpp` is the ONE
-  seam that decides where audio comes from: the microSD's first WAV, else the
-  QSPI blob, else a test tone. This SD path is reused in later projects, so it
-  was built for real, not faked.
+- **Source is source-agnostic by design.** `Source { len, rate; virtual
+  read(first, n, dst) }` — anything that delivers a run of samples by index —
+  with `fetch()` wrapping the unbounded timeline onto it. `MemSource` is the
+  buffer one (host, tests); `SdSource` (`sd_source.h`) streams the card.
+  `openSource()` in `dreamosc.cpp` is the ONE seam that decides what plays.
+  Heads never read a Source directly: each renders out of its `WindowCache`.
+  This SD path is reused in later projects, so it was built for real.
 - **Controls → see `dreamosc/CONTROLS.md`** for the full, current mapping (two
   knob modes global/step via button1, encoder pages stretch/fade/frame, pickup,
   the ROYGBIVW step LED, the speed model, and the hard-won pickup/polling facts).
@@ -463,8 +471,12 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   `crc` = a boot fingerprint of a fixed-config render so two firmware builds
   can be proven sample-identical ON THE BOARD, see OPEN_ISSUES.md) — split
   because the combined line overran
-  libDaisy's 128-byte Logger buffer — all as scaled integers (nano-newlib
-  printf can't do floats). Timing uses raw `GetTick()`
+  libDaisy's 128-byte Logger buffer — an `SRC` line (the file's rate, the
+  codec's rate read back from the registers, board revision, format/bits/
+  channels, length, card clock, file name, and the error code when there is
+  no instrument) and a `FETCH` line (cache misses/extends/failures, fetch
+  samples, worst single fetch, card reads, KB) — all as scaled integers
+  (nano-newlib printf can't do floats). Timing uses raw `GetTick()`
   deltas: `System::GetUs()` wraps every 21.5 s and poisoned the old numbers
   once per wrap. This is how the
   spread-0 CPU overload was measured, how the pickup and "steps go silent" bugs
@@ -486,25 +498,31 @@ only Internal Flash + Option Bytes over DFU — no QSPI target. Notes on it:
   budget — the correctness of where we put buffers is judged against that doc.
 - **Clock.** `pod.Init(true)` — boost mode, **480 MHz**. libDaisy's default
   (`pod.Init()`) is 400 MHz, which is what every `max_us` before the frame model
-  was measured at. Whether 480 is clean on the codec and QSPI paths is a bench
-  item (OPEN_ISSUES.md).
+  was measured at. Whether 480 is clean on the codec and SD paths is a bench
+  item (OPEN_ISSUES.md). **The codec's rate is the file's**, set by
+  re-planning PLL3 (`clock_core.h`) — never `pod.AudioSampleRate()`, whose
+  nominal 48000 was in truth 48014 Hz (+298 ppm) with libDaisy's stock PLL3.
 - **Memory.** `SS_W = 16384` is the compile-time buffer MAX (~0.34 s at 48 kHz,
   PaulXStretch's shimmer regime, #136); the runtime window is any power of two
   in `[SS_W_MIN, SS_W]` and **defaults to 4096** (`FRAME_DEFAULT_IDX`). Per Head:
   `SS_FRAME_BUFS = 6` frame buffers of `SS_W` floats (old, cur, a staged pair, a
-  refresh pair) = 384 KB; `SS_HEADS = 10` (3 live: cur + inc + armed, plus slack) → the
-  head pool (~3.9 MB) lives in **SDRAM** (a plain float array `init()` carves),
-  as do the **source buffer (~1.9 MB)** and the immutable tables (`gWindows`,
-  `gBlendA`, `gBlendC`, ~255 KB, read sequentially so they cache well). SDRAM is
-  configured cacheable + bufferable by libDaisy's MPU region 1.
+  refresh pair) plus a 4 × `SS_W` window cache = 640 KB; `SS_HEADS = 10`
+  (3 live: cur + inc + armed, plus slack) → the head pool (~6.5 MB) lives in
+  **SDRAM** (a plain float array `init()` carves), as do the immutable tables
+  (`gWindows`, `gBlendA`, `gBlendC`, ~255 KB, read sequentially so they cache
+  well). There is no source buffer: the source streams. SDRAM is configured
+  cacheable + bufferable by libDaisy's MPU region 1.
   - **The two hot FFT buffers — `gWork` and `gSpec` (64 KB each at SS_W 16384)
     — live in AXI SRAM** (`AXISRAM_DATA` → the `.axisram_bss` section in our
-    `dreamosc.lds`). AXI SRAM (D1, 480 KB, ~49% used incl. code) is fast +
-    L1-cacheable — the region ST designates for large hot working sets that
-    outgrow DTCM (see `hardware_spec.md`). The per-frame FFT hits these hard, so
-    they belong in the fast tier, NOT external SDRAM. **Safe by construction:**
-    the FFT always writes before any read, so NOLOAD (no `.bss` zeroing) is fine.
-    The speedup over SDRAM was never measured; it is a hypothesis for the bench.
+    `dreamosc.lds`), and so do the FatFs DMA targets (`FIL`, `FATFS`, the 32 KB
+    SD staging buffer, ~170 KB of `.axisram_bss` in all). AXI SRAM (D1, 480 KB)
+    is fast + L1-cacheable — the region ST designates for large hot working
+    sets that outgrow DTCM (see `hardware_spec.md`) — and the only on-chip RAM
+    the SDMMC DMA can reach under BOOT_SRAM. The per-frame FFT hits `gWork`/
+    `gSpec` hard, so they belong in the fast tier, NOT external SDRAM. **Safe
+    by construction:** the FFT always writes before any read, and every FatFs
+    object is memset / placement-new'd before use, so NOLOAD (no `.bss`
+    zeroing) is fine. The FFT speedup over SDRAM was never measured.
   - The `Sequencer` OBJECT + `gTab` stay in internal RAM (DTCM ~47%). A frame
     buffer is always fully written by a render before the ISR can reference it,
     so NOLOAD garbage never reaches the output.

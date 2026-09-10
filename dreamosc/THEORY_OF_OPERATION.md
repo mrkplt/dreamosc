@@ -367,17 +367,36 @@ the one-pole smoothed read, so a turn is a few discrete updates rather than a
 
 | what | where | size at SS_W 16384 |
 |---|---|---|
-| head pool: 10 heads × 6 frames × 16384 floats | SDRAM (`DSY_SDRAM_BSS`), plain array | ~3.9 MB |
-| source buffer (10 s at 48 kHz) | SDRAM | ~1.9 MB |
+| head pool: 10 heads × (6 frames + a 4-window cache) × 16384 floats | SDRAM (`DSY_SDRAM_BSS`), plain array | ~6.5 MB |
 | `gWindows` (7 window curves), `gBlendA`, `gBlendC` | SDRAM, written once by `init()` | ~255 KB |
 | `gWork`, `gSpec` FFT scratch | AXI SRAM (`.axisram_bss`, our linker script) | 128 KB |
-| `Sequencer` object (heads' atomics, queues), `gTab` (FFT twiddles, sin LUT) | DTCM (`.bss`) | ~60 KB |
+| FatFs DMA targets: `FIL`, `FATFS` (in `FatFSInterface`), 32 KB SD stage, cluster map | AXI SRAM (`.axisram_bss`) | ~40 KB |
+| `Sequencer` object (heads' atomics, queues), `gTab` (FFT twiddles, sin LUT), `SdSource` | DTCM (`.bss`) | ~60 KB |
+
+There is no source buffer. The source is the file on the card, streamed:
+`Source` is an interface (`len`, `rate`, `read(first, n, dst)`), and each
+head renders out of its own `WindowCache`, a ring of 4 × `SS_W` floats in its
+pool slice holding a contiguous run of the (unwrapped) source timeline. Before
+a frame is windowed, `ensure(s, w)` makes `[s, s + w)` resident with at least
+a window of look-ahead: a hit costs nothing; a hit with less look-ahead
+extends the run by fetching only the new tail; a miss (a fresh life, a
+position scrub) re-targets to back-pad ½ w + w + 2 w of look-ahead, keeping
+any overlap. The fetch happens inside the render, on the main loop, and the
+ISR samples it costs are subtracted before the cost model observes the render
+(§5) — a scrub's fetch must not inflate the recent-max and slow refreshes.
+`copyWindowed` is the exact multiply the in-memory source used, so renders are
+bit-identical to the buffer-backed `MemSource` the host harness and tests use.
+A failed read zero-fills and counts a failure; it never holds or hangs.
 
 Rules: SDRAM is unpowered at static-init time and its section is NOLOAD, so
 only plain arrays live there, filled after `pod.Init()`; never a constructed
 object (a `Sequencer` placed there once booted with garbage and no sound). A
 frame buffer is always fully written by a render before any descriptor can
-reference it, so NOLOAD garbage never reaches the output. SDRAM is configured
+reference it, and a cache run is fetched before it is read, so NOLOAD garbage
+never reaches the output. Under `APP_TYPE = BOOT_SRAM` the `.bss`, `.data`
+and stack are DTCM, which the SDMMC's IDMA cannot reach: every FatFs DMA
+target is placed in AXI SRAM by hand (`AXISRAM_DATA`), NOLOAD, and memset or
+placement-new'd before use. SDRAM is configured
 cacheable and bufferable by libDaisy's MPU region 1, and every access to it
 here is sequential (frame reads, table reads, source reads), so it is served
 from the 16 KB L1 in practice. The FFT scratch is random-stride, so it lives
@@ -388,14 +407,22 @@ in AXI SRAM.
 ## 10. Timing and CPU model
 
 - Clock: 480 MHz (`pod.Init(true)`; libDaisy's default is 400).
-- Audio: 48 kHz, block 32 (0.67 ms). The block is invisible against the hop
-  (43 ms at 4096, 171 ms at 16384); it exists to cut interrupt overhead.
+- Audio: the file's own rate (PLL3 re-planned per file, `clock_core.h`;
+  44.1 kHz for the amen), block 32 (0.67 ms at 48 k). The block is invisible
+  against the hop (43 ms at 4096, 171 ms at 16384); it exists to cut
+  interrupt overhead. Every sample-denominated number in this document
+  scales with the rate; the ones quoted are at 48 k.
 - ISR per sample: for each gated head, two frame reads, two table reads, the
   blend; plus the seam envelope (two LUT reads) during a seam.
 - Main loop per hop per gated head: one frame render. Steady-state load is
   `gated × cost(w) / h`. At most three heads render concurrently (cur + inc +
   armed); at the measured cost, three at 16384 is ~25%, three at 4096 is ~8%.
   A size change adds one pair per head, once.
+- Source fetches (a run off the card, on a cache miss or extend) are main-
+  loop time too, but are kept OUT of the cost model: measured per render,
+  subtracted before `observe`, reported on the `FETCH` line. A scrub's whole-
+  run fetch inside a REQUIRED render can cost one hold; it never costs
+  silence, and it never slows the refresh policy afterwards.
 - Overload degrades to holds (frame repeats) and late go-lives; both are
   counted, neither is silence.
 
@@ -417,6 +444,15 @@ waited, `rfr` control-driven re-renders, `clip` output clamp hits, `slack`
 minimum samples-to-deadline at render start (negative = a render started past
 its boundary). A separate `COST` line carries the per-size estimate in samples
 (16384 down to 256) and `stk` stack high-water.
+
+`SRC`: the open file's rate, the codec's rate READ BACK from the registers
+(`fs`, must equal `rate`), the codec-rate error, the board revision, format /
+bits / channels, length, card clock, the open error, the file name. Printed
+alone, once a second, when there is no instrument.
+
+`FETCH`: window-cache `miss` / `ext` / `fail` this second, `smp` ISR samples
+spent fetching (subtracted from the cost model), `max` the worst single
+render's fetch, `rd` card reads, `kb` delivered.
 
 The directive stands: every runtime value goes on one of these lines.
 
@@ -464,3 +500,7 @@ Check any change against these.
 8. No control latches at arm except drift. Stretch, position and size are
    read at every render.
 9. Every runtime value is on a PROFILE line.
+10. A head reads source only through its cache, on the main loop; a cache
+    run is fetched before it is read; fetch time is never render cost.
+11. The codec runs at the rate the registers confirm, which is the file's;
+    no other rate exists downstream.

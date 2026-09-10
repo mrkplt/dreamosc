@@ -674,3 +674,12 @@ TEST_CASE("AuxKnob: a slow sweep engages (the anchor does not chase the pot)") {
   for (int i = 1; i <= 30 && !engaged; i++) engaged = k.update(0.30f + 0.001f * i, durationSpec(), &dur);
   REQUIRE(engaged);
 }
+
+TEST_CASE("LastMovedOwner: the pot that moved most recently owns the parameter; jitter does not steal it") {
+  LastMovedOwner o;
+  REQUIRE_FALSE(o.update(0.0f, 0.0f));          // nobody moved: the first owns by default
+  REQUIRE(o.update(0.0f, 0.01f));               // the second moved: it owns
+  REQUIRE(o.update(0.0f, 0.0f));                // and keeps owning while nothing moves
+  REQUIRE(o.update(0.0003f, 0.0f));             // ADC jitter on the first does not steal it
+  REQUIRE_FALSE(o.update(0.01f, 0.0f));         // a real move on the first takes it back
+}

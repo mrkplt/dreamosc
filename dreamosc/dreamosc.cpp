@@ -109,6 +109,7 @@ struct Prof {
   uint32_t lastPrint = 0;
   float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
   float mx = 0;                            // last mux channel-0 read (raw)
+  float mux[8] = {0};                      // every mux channel, raw (the MUX line)
   // Peak per-poll knob speed since the last print (instantaneous speed is ~0
   // at any given print instant; the peak catches an actual turn). Used to
   // tune the potFast threshold from board data.
@@ -280,6 +281,7 @@ static PanelEditor panel;
 static constexpr int   ADC_CH_MUX   = 2;          // channel index after knob1, knob2
 static constexpr int   MUX_CHANNELS = 8;
 static AuxKnob muxKnob;                            // channel 0 -> duration (smoke test)
+static LastMovedOwner durOwner;                    // knob1 (GLOBAL) vs the mux pot
 
 static void initAdcWithMux() {
   AdcChannelConfig cfg[3];
@@ -368,11 +370,18 @@ static void processControls() {
     knobPrimed = true;
     panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
     // The mux pot (channel 0): a second duration control, with its own
-    // pickup; whichever of knob1 (GLOBAL) and this moved last wins.
+    // pickup. Whichever of knob1 (GLOBAL) and this pot moved most recently
+    // owns duration; the other's write is discarded (PanelEditor wrote
+    // knob1's value above, so the mux value is applied over it only when the
+    // mux owns).
     float mx = pod.seed.adc.GetMuxFloat(ADC_CH_MUX, 0);
-    muxKnob.update(mx, durationSpec(), &seq.duration);
+    float muxDur = seq.duration;
+    bool muxLive = muxKnob.update(mx, durationSpec(), &muxDur);
+    if (durOwner.update(panel.inGlobal() ? panel.speed1() : 0.0f, muxKnob.speed) && muxLive)
+      seq.duration = muxDur;
 #ifdef PROFILE
     prof.mx = mx;
+    for (int c = 0; c < MUX_CHANNELS; c++) prof.mux[c] = pod.seed.adc.GetMuxFloat(ADC_CH_MUX, c);
     prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
     if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
     if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
@@ -511,6 +520,15 @@ static void profilePrint() {
   used = appendScaled(line, sizeof(line), used, shadow, SS_STEPS, 10000.0f);
   used += snprintf(line + used, sizeof(line) - used, " | eff ");
   appendScaled(line, sizeof(line), used, seq.drift, SS_STEPS, 10000.0f);
+  pod.seed.PrintLine("%s", line);
+  // MUX line: all eight 4051 inputs, raw (*1000), channel 0 first, then own =
+  // who owns duration (0 = knob1, 1 = the mux pot). A pot wired to the wrong
+  // input, or select lines in the wrong order, shows up as the pot's sweep on
+  // a channel other than 0; an input that reads a steady small value on every
+  // channel is a floating mux output (INH or VEE not grounded).
+  used = snprintf(line, sizeof(line), "MUX ");
+  used = appendScaled(line, sizeof(line), used, prof.mux, MUX_CHANNELS, 1000.0f);
+  snprintf(line + used, sizeof(line) - used, " own=%d", (int)durOwner.second);
   pod.seed.PrintLine("%s", line);
   // HEALTH line: CPU and supply accounting for this second. act = gated
   // step heads (sounding + incoming, at most 2); arm = armed (pre-warmed)

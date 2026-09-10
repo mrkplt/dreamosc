@@ -175,6 +175,10 @@ static CodecRate codecRate;
 
 static bool audioRunning = false;
 
+// The Seed revision libDaisy detected, read ONCE at boot: CheckBoardVersion()
+// re-initialises two GPIOs on every call, so it is not for a per-second line.
+static int boardVersion = 0;
+
 #ifdef PROFILE
 static void profilePrintSource();
 #endif
@@ -377,7 +381,7 @@ static void profilePrintSource() {
   pod.seed.PrintLine("SRC rate=%u fs=%u fs_err=%d board=%d fmt=%u bits=%u ch=%u len=%u spd=%d err=%d file=%s",
                      (unsigned)srcInfo.rate,
                      (unsigned)codecRate.measured, (int)codecRate.err,
-                     (int)pod.seed.CheckBoardVersion(),
+                     boardVersion,
                      (unsigned)srcInfo.format, (unsigned)srcInfo.bits, (unsigned)srcInfo.channels,
                      (unsigned)srcInfo.len, (int)srcInfo.speed, (int)srcInfo.err, srcInfo.name);
 }
@@ -557,6 +561,7 @@ int main(void) {
   // max_us on record was taken at 400. Clock is cheap; latency is not.
   pod.Init(true);
   pod.SetAudioBlockSize(AUDIO_BLOCK);
+  boardVersion = (int)pod.seed.CheckBoardVersion();
 #ifdef PROFILE
   pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
   profTicksPerUs = System::GetTickFreq() / 1000000u;

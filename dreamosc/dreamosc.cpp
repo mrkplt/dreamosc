@@ -269,9 +269,10 @@ static float globalDrift = 0.0f;
 static PanelEditor panel;
 
 // --- the 4051 analog mux on A7 (row-2 knobs, Fizzy #157) ---------------------
-// A CD4051 8:1 mux: common out -> A7, selects S0/S1/S2 <- D11/D10/D9 (the
-// select order only matters for channels other than 0; smoke test wiring has
-// one pot at channel 0, where every select line is low). libDaisy scans the
+// A CD4051 8:1 mux: common out -> A7 (D22); selects A/B/C <- the Seed pins
+// labelled SS/SCK/MI on the pinout, which are D7/D8/D9 (SPI1 NSS/SCK/MISO in
+// libDaisy's spi.cpp -- the SPI function is the unambiguous name; the header
+// numbering is not). One pot at channel 0 for the smoke test. libDaisy scans the
 // mux itself (AdcChannelConfig::InitMux): the ADC runs one-shot with a
 // callback that steps the select lines between conversions, and every
 // channel -- the Pod's two knobs included -- is read the same way. The Pod
@@ -287,7 +288,7 @@ static void initAdcWithMux() {
   AdcChannelConfig cfg[3];
   cfg[0].InitSingle(seed::D21);                    // KNOB_1_PIN (daisy_pod.cpp)
   cfg[1].InitSingle(seed::D15);                    // KNOB_2_PIN
-  cfg[ADC_CH_MUX].InitMux(seed::A7, MUX_CHANNELS, seed::D11, seed::D10, seed::D9);
+  cfg[ADC_CH_MUX].InitMux(seed::A7, MUX_CHANNELS, seed::D7, seed::D8, seed::D9);   // A, B, C
   pod.seed.adc.Init(cfg, 3);
   pod.knob1.Init(pod.seed.adc.GetPtr(0), pod.AudioCallbackRate());
   pod.knob2.Init(pod.seed.adc.GetPtr(1), pod.AudioCallbackRate());

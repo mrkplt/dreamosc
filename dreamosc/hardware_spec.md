@@ -87,11 +87,16 @@ matters because codec, not MCU, is what changed:
 - libDaisy enumerates these as `DAISY_SEED`, `DAISY_SEED_1_1`, `DAISY_SEED_2_DFM`
   and still carries a deprecated `SEED_REV2` define.
 
-**"Seed3" as used in this repo's notes is a shorthand, not an official ST/ES
-SKU** — confirm the actual codec on the physical unit (via the libDaisy board
-version or the silkscreen) before relying on codec-specific behavior. The MCU
-(STM32H750) and the memory map are identical across these; only the codec and
-minor analog details differ.
+Seed 3 is the most recent version of the core hardware of the Seed product, and the chip installed in the test pod.
+Specs:
+- ARM Cortex-M7 MCU, Running at 480MHz
+- 192kHz/32-Bit Stereo Audio Hardware
+- 65MB of RAM (Up to 10 minute long audio buffers)
+- 8MB of Flash Memory
+- GPIO x31
+- 16-Bit ADC x12
+- 12-Bit DAC x2
+- USB-C port
 
 ## Sources
 

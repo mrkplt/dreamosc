@@ -40,11 +40,22 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
   concurrent is two sounding heads plus one armed rendering ahead.
 - **480 MHz** clean on the codec and SD paths (`pod.Init(true)`) -- the SD
   stream and the 44.1 kHz codec both ran at 480 on the first pass.
-- **The 4051 mux on ADC2 (`mux_adc.h`) is confirmed on the bench:** channel
-  0 sweeps 1..1000 on the MUX/KNOB lines and drives duration. What is NOT
-  yet checked: crosstalk between channels once a second pot is wired
-  (adjacent-channel bleed with 1 ms settle), and ADC2's noise floor vs
-  ADC1's (`pk` on a stationary pot). Also recorded (CLAUDE.md): libDaisy's
+- **The 4051 mux on ADC2 (`mux_adc.h`) is confirmed on the bench** with one
+  pot (channel 0 swept 1..1000). **Eight pots, one position per step, NOT yet
+  on the bench** (#157). Owed, all on the `MUX` line: turning knob N sweeps
+  only the Nth value (the `KNOB_MUX_CH` table vs the real board) -- try
+  EVERY knob: the one-pot test used X0 (selects 000), which cannot tell the
+  A/B/C order from its reverse, and an A<->C swap trades only knobs 2<->8
+  and 4<->7; no neighbour moves with it (crosstalk; the mux gets a ~5 us
+  sampling window to settle after each switch); **direction** -- every
+  pot has lug 1 on 3V3 and lug 3 on GND, so clockwise may read DOWN (1000
+  at the counter-clockwise stop = inverted; the fix is `1 - v` at the
+  table); and ADC2's noise floor on a still pot (`L=` must stay 0 until
+  touched) -- now at 16x oversampling, not the 32x the one-pot test ran.
+  The scan is interrupt-paced (ADC2 EOC -> latch, step, restart; 32.5-cycle
+  sampling, ~0.85 ms per scan): `scn=` must read ~1150..1190 (> 1000) and
+  `o1=` 0; `isr_max` must not move (the ADC IRQ
+  is below the audio DMA's priority). Also recorded (CLAUDE.md): libDaisy's
   AdcHandle cannot be re-initialised with a mux after DaisyPod::Init() --
   the DMA mode is fixed by the first MspInit -- which is why the mux has its
   own converter.

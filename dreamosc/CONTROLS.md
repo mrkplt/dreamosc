@@ -35,17 +35,35 @@ GLOBAL ──button1──▶ step 1 ──button1──▶ … ──button1─
   (0.0003) on a slow turn — 100 fine detents span the range.
 - **led1 = ROYGBIVW** shows the selected step (red=1 … white=8), off in GLOBAL.
 
-### Mux smoke test (row-2 knobs, Fizzy #157)
+### Row-2 pots: one position knob per step (Fizzy #157)
 
-A CD4051 8:1 mux is wired with its common output on **A7** (D22) and selects
-A/B/C on **D7/D8/D9** (the Seed pins labelled SS/SCK/MI); one pot sits at mux
-channel 0. The mux is scanned by **ADC2** (`mux_adc.h`, one channel per
-millisecond), leaving the Pod's own ADC1 and its two knobs untouched. For now
-that pot is a **second
-duration control** (0.25..60 s, same mapping and pickup as knob1 in GLOBAL);
-whichever of the two moved last wins. It appears on the PROFILE `KNOB` line
-as `mx=` (raw, ×1000) and `mxL=` (pickup engaged). This is a hardware smoke
-test, not the mapping; the real row-2 assignments are #157's.
+Eight pots behind a CD4051 8:1 mux, common output on **A7** (D22), selects
+A/B/C on **D7/D8/D9** (the Seed pins labelled SS/SCK/MI). The mux is scanned
+by **ADC2** (`mux_adc.h`), leaving the Pod's own ADC1 and its two knobs
+untouched. ADC2 paces the scan itself: its end-of-conversion interrupt
+latches the read, steps the mux and starts the next conversion (16×
+oversampled, 32.5-cycle sampling), so all eight pots are read in ~0.85 ms
+and every 1 ms control
+poll sees a fresh value for each.
+
+- **Knob N (left to right) sets step N's position**, 0..1 of the file. Same
+  feel as knob1 in step mode: `positionSpec()` (a fast turn snaps to 5%
+  landmarks, a slow turn is continuous), written from the raw read, pickup
+  from boot. Speed is measured per 1 ms poll, the same as knob1, so the
+  fast/slow split and the ownership threshold mean the same thing.
+- **The pots are not wired in panel order.** `KNOB_MUX_CH` in
+  `controls_core.h` maps panel knob → mux channel (from the PCB netlist:
+  X2 X1 X0 X3 X5 X7 X6 X4).
+- **knob1 in step mode still edits the same position.** Per step, whichever
+  of knob1 and that step's pot moved last owns it, and either one's pickup
+  engaging counts as a move (so a slow trim still takes the step).
+- PROFILE `MUX` line: the eight pots in panel order (raw ×1000), then
+  `L=` (pickup engaged) and `O=` (the pot owns the step), knob 1 first. The
+  positions themselves are the `POS` line. `scn=` = full scans this second
+  (~1150..1190; must be > 1000), `o1=` = ADC1 (Pod knob) overruns, ever
+  (must stay 0).
+- **Boot:** the pots are not read until ADC2 has converted every input once,
+  so their pickup starts from where they really sit.
 
 ## PICKUP (soft takeover) — everywhere
 

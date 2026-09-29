@@ -109,8 +109,8 @@ struct Prof {
   uint32_t lastUnder = 0, lastClip = 0, lastLate = 0, lastRefresh = 0, lastIsr = 0;
   uint32_t lastPrint = 0;
   float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
-  float mx = 0;                            // last mux channel-0 read (raw)
-  float mux[8] = {0};                      // every mux channel, raw (the MUX line)
+  float mux[8] = {0};                      // row-2 pots in PANEL order, raw (the MUX line)
+  uint32_t lastScans = 0;                  // muxAdc.scans() at the last print
   // Peak per-poll knob speed since the last print (instantaneous speed is ~0
   // at any given print instant; the peak catches an actual turn). Used to
   // tune the potFast threshold from board data.
@@ -151,6 +151,14 @@ static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
 
+// The 4051 on A7, scanned by ADC2 (mux_adc.h). Declared with the Pod because
+// it shares ADC1's lifecycle: both converters are stopped around a PLL3
+// re-plan (PLL3 R is the ADC kernel clock) and started with the instrument
+// (stopInstrument() / startInstrument()). ADC2's end-of-conversion interrupt drives
+// the scan; ADC1 and ADC2 share ADC_IRQn.
+static MuxAdc muxAdc;
+extern "C" void ADC_IRQHandler(void) { muxAdc.isr(); }
+
 // --- source audio -----------------------------------------------------------
 // The source is a WAV on the microSD, STREAMED: each head's window cache asks
 // SdSource::read() for the run it is about to render, and the frames come
@@ -178,6 +186,15 @@ static CodecRate codecRate;
 
 static bool audioRunning = false;
 
+// Stop audio and BOTH converters: the Pod's ADC1 (its knobs) and the mux's
+// ADC2. Required before a PLL3 re-plan (codec_rate.h).
+static void stopInstrument() {
+  pod.StopAudio();
+  pod.StopAdc();
+  muxAdc.stop();
+  audioRunning = false;
+}
+
 // The Seed revision libDaisy detected, read ONCE at boot: CheckBoardVersion()
 // re-initialises two GPIOs on every call, so it is not for a per-second line.
 static int boardVersion = 0;
@@ -190,7 +207,7 @@ static void profilePrintSource();
 // rate. Audio never starts (or has been stopped); both LEDs blink red; under
 // PROFILE the SRC line says why, once a second.
 static void haltNoInstrument() {
-  if (audioRunning) { pod.StopAudio(); pod.StopAdc(); audioRunning = false; }
+  if (audioRunning) stopInstrument();
   uint32_t last = System::GetNow();
   bool on = true;
   for (;;) {
@@ -220,7 +237,7 @@ static void haltNoInstrument() {
 // Returns false with srcInfo.err / codecRate.err set; audio is then stopped
 // and the caller halts (no fallback).
 static bool openSource(const char* name) {
-  if (audioRunning) { pod.StopAudio(); pod.StopAdc(); audioRunning = false; }
+  if (audioRunning) stopInstrument();
   bool ok = name ? sdSrc.open(name, srcInfo) : sdSrc.openFirst(srcInfo);
   if (!ok) return false;
   if (!setCodecRate(pod.seed, sdSrc.rate, codecRate)) return false;
@@ -233,6 +250,7 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer in,
                           AudioHandle::InterleavingOutputBuffer out, size_t size);
 static void startInstrument() {
   pod.StartAdc();
+  muxAdc.start();
   pod.StartAudio(AudioCallback);   // the panel is read in the callback from here on
   audioRunning = true;
 }
@@ -273,15 +291,14 @@ static PanelEditor panel;
 // A CD4051 8:1 mux: common out -> A7 (D22, PA5 = ADC12_INP19); selects A/B/C
 // <- the Seed pins labelled SS/SCK/MI on the pinout, which are D7/D8/D9
 // (SPI1 NSS/SCK/MISO in libDaisy's spi.cpp -- the SPI function is the
-// unambiguous name; the header numbering is not). One pot at channel 0 for
-// the smoke test. Scanned by ADC2 (mux_adc.h), NOT by re-initialising the
-// Pod's ADC1 with a mux channel: that left ADC1's DMA in the mode its first
-// init chose and took the board down (see mux_adc.h). The Pod's two knobs
-// are untouched.
-static constexpr int MUX_CHANNELS = MuxAdc::CHANNELS;
-static MuxAdc  muxAdc;
-static AuxKnob muxKnob;                            // channel 0 -> duration (smoke test)
-static LastMovedOwner durOwner;                    // knob1 (GLOBAL) vs the mux pot
+// unambiguous name; the header numbering is not). Eight pots, one per step:
+// knob i sets step i's position (StepKnobs, controls_core.h, which also holds
+// the panel-order -> mux-channel table). Scanned by ADC2 (mux_adc.h), NOT by
+// re-initialising the Pod's ADC1 with a mux channel: that left ADC1's DMA in
+// the mode its first init chose and took the board down (see mux_adc.h). The
+// Pod's two knobs are untouched.
+static_assert(MuxAdc::CHANNELS == MUX_KNOBS, "one 4051 input per row-2 pot");
+static StepKnobs stepKnobs;
 
 
 // Audio block size. The hop (>= 128 samples, 2048 at the default window) sets
@@ -360,20 +377,22 @@ static void processControls() {
     float k2 = smoothKnob(knobSmooth[1], r2, knobPrimed);
     knobPrimed = true;
     panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
-    // The mux pot (channel 0): a second duration control, with its own
-    // pickup. Whichever of knob1 (GLOBAL) and this pot moved most recently
-    // owns duration; the other's write is discarded (PanelEditor wrote
-    // knob1's value above, so the mux value is applied over it only when the
-    // mux owns).
-    muxAdc.poll();                                   // one channel per ms
-    float mx = muxAdc.value(0);
-    float muxDur = seq.duration;
-    bool muxLive = muxKnob.update(mx, durationSpec(), &muxDur);
-    if (durOwner.update(panel.inGlobal() ? panel.speed1() : 0.0f, muxKnob.speed) && muxLive)
-      seq.duration = muxDur;
+    // The row-2 pots: knob i -> step i's position. ADC2 scans all eight in
+    // under a millisecond (mux_adc.h), so each read here is fresh. Runs AFTER
+    // panel.update(): where knob1 (step mode) and a pot address the same
+    // step, the one that moved last owns it (StepKnobs). Nothing is read
+    // until ADC2 has converted every channel once (scans() >= 1): before that
+    // the reads are 0, not pot positions. A mux whose ADC did not come up
+    // never completes a scan, so it never writes.
+    float muxRaw[MUX_KNOBS];
+    for (int c = 0; c < MUX_KNOBS; c++) muxRaw[c] = muxAdc.value(c);
+    Knob1View k1v;
+    k1v.step    = panel.inGlobal() ? -1 : panel.step();
+    k1v.speed   = panel.speed1();
+    k1v.engaged = panel.k1Engaged();
+    stepKnobs.update(seq, muxRaw, muxAdc.scans() >= 1, k1v);
 #ifdef PROFILE
-    prof.mx = mx;
-    for (int c = 0; c < MUX_CHANNELS; c++) prof.mux[c] = muxAdc.value(c);
+    for (int k = 0; k < MUX_KNOBS; k++) prof.mux[k] = muxRaw[KNOB_MUX_CH[k]];
     prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
     if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
     if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
@@ -479,19 +498,16 @@ static void profilePrint() {
   // applied this second (count them against the physical clicks: the L1
   // bench check), drop = panel events the IRQ queue refused, ever (must stay
   // bench check). b1/b2 = buttons held, as the last debounce sample saw them
-  // (a single-byte read of ISR-owned state; diagnostics only). mx = the 4051
-  // mux channel-0 pot, raw (*1000); mxL = its pickup has engaged. A pot that
-  // reads a steady ~0 or ~1000 and never moves is a wiring fault, not pickup.
+  // (a single-byte read of ISR-owned state; diagnostics only).
   pod.seed.PrintLine(
-      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u mx=%d mxL=%d",
+      "KNOB r1=%d r2=%d k1=%d k2=%d k1L=%d k2L=%d pk1=%d pk2=%d f1=%d f2=%d b1=%d b2=%d det=%u",
       scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
       scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
       (int)panel.k1Live(), (int)panel.k2Live(),
       scaled(prof.pk1, 1000.0f), scaled(prof.pk2, 1000.0f),
       (int)panel.fast1(), (int)panel.fast2(),
       (int)pod.button1.Pressed(), (int)pod.button2.Pressed(),
-      (unsigned)profDetents,
-      scaled(prof.mx, 1000.0f), (int)muxKnob.live);
+      (unsigned)profDetents);
   prof.pk1 = prof.pk2 = 0.0f;   // reset peak for the next window
   profDetents = 0;
   // POS line: all 8 step positions (*1000). Homing every knob should make
@@ -513,14 +529,29 @@ static void profilePrint() {
   used += snprintf(line + used, sizeof(line) - used, " | eff ");
   appendScaled(line, sizeof(line), used, seq.drift, SS_STEPS, 10000.0f);
   pod.seed.PrintLine("%s", line);
-  // MUX line: all eight 4051 inputs, raw (*1000), channel 0 first, then own =
-  // who owns duration (0 = knob1, 1 = the mux pot). A pot wired to the wrong
-  // input, or select lines in the wrong order, shows up as the pot's sweep on
-  // a channel other than 0; an input that reads a steady small value on every
-  // channel is a floating mux output (INH or VEE not grounded).
+  // MUX line: the eight row-2 pots, raw (*1000), in PANEL order (leftmost
+  // first, KNOB_MUX_CH already applied), then two 8-digit strings, knob 1
+  // first: L = pickup engaged, O = the pot (not knob1) owns that step's
+  // position. Turning knob N must sweep the Nth value 0..1000 and nothing
+  // else; a sweep in the wrong slot is a table/wiring mismatch, one that moves
+  // with a neighbour is crosstalk, and 1000 at the counter-clockwise stop means
+  // the pots read inverted. The step positions themselves are the POS line.
+  // scn = full 8-channel scans this second: must be > 1000 (every pot fresh
+  // on every 1 ms poll; ~1150..1190 across the codec planner's ADC clock
+  // range, mux_adc.h). o1 = ADC1 (Pod knobs) overruns ever, cleared by the
+  // shared IRQ: must stay 0; if not, suspect knob1/knob2 reading swapped.
+  const uint32_t scans = muxAdc.scans();
+  char lv[MUX_KNOBS + 1], ow[MUX_KNOBS + 1];
+  for (int k = 0; k < MUX_KNOBS; k++) {
+    lv[k] = stepKnobs.live(k) ? '1' : '0';
+    ow[k] = stepKnobs.owns(k) ? '1' : '0';
+  }
+  lv[MUX_KNOBS] = ow[MUX_KNOBS] = '\0';
   used = snprintf(line, sizeof(line), "MUX ");
-  used = appendScaled(line, sizeof(line), used, prof.mux, MUX_CHANNELS, 1000.0f);
-  snprintf(line + used, sizeof(line) - used, " own=%d", (int)durOwner.second);
+  used = appendScaled(line, sizeof(line), used, prof.mux, MUX_KNOBS, 1000.0f);
+  snprintf(line + used, sizeof(line) - used, " L=%s O=%s scn=%u o1=%u", lv, ow,
+           (unsigned)(scans - prof.lastScans), (unsigned)muxAdc.ovr1());
+  prof.lastScans = scans;
   pod.seed.PrintLine("%s", line);
   // HEALTH line: CPU and supply accounting for this second. act = gated
   // step heads (sounding + incoming, at most 2); arm = armed (pre-warmed)

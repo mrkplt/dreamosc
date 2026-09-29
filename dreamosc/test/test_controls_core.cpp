@@ -675,6 +675,208 @@ TEST_CASE("AuxKnob: a slow sweep engages (the anchor does not chase the pot)") {
   REQUIRE(engaged);
 }
 
+TEST_CASE("AuxKnob: writeRaw writes the raw read through the position spec's speed grid") {
+  AuxKnob k; k.writeRaw = true;
+  float v = -1.0f;
+  k.update(0.30f, positionSpec(), &v);
+  REQUIRE(k.update(0.334f, positionSpec(), &v));            // 0.034 in one poll: fast -> 5% grid
+  REQUIRE(v == Approx(0.35f));
+  REQUIRE(k.update(0.337f, positionSpec(), &v));            // 0.003: slow -> continuous
+  REQUIRE(v == Approx(0.337f));                              // raw, not eased by the smoother
+}
+
+// --- the row-2 pots (StepKnobs) -----------------------------------------------
+
+TEST_CASE("KNOB_MUX_CH: panel order is the netlist, and the table is a permutation of the 8 channels") {
+  const int expect[MUX_KNOBS] = {2, 1, 0, 3, 5, 7, 6, 4};   // RV3 RV2 RV1 RV4 RV6 RV8 RV7 RV5
+  bool seen[MUX_KNOBS] = {false};
+  for (int k = 0; k < MUX_KNOBS; k++) {
+    REQUIRE(KNOB_MUX_CH[k] == expect[k]);
+    REQUIRE(KNOB_MUX_CH[k] >= 0);
+    REQUIRE(KNOB_MUX_CH[k] < MUX_KNOBS);
+    REQUIRE_FALSE(seen[KNOB_MUX_CH[k]]);
+    seen[KNOB_MUX_CH[k]] = true;
+  }
+}
+
+// One control poll: pots[k] is PANEL knob k's reading, routed through the
+// wiring table into the per-channel array the mux delivers.
+static void poll(StepKnobs& sk, Sequencer& seq, const float pots[MUX_KNOBS],
+                 int panelStep = -1, float panelSpeed = 0.0f,
+                 bool panelEngaged = false, bool scanned = true) {
+  float mux[MUX_KNOBS];
+  for (int k = 0; k < MUX_KNOBS; k++) mux[KNOB_MUX_CH[k]] = pots[k];
+  Knob1View k1;
+  k1.step = panelStep; k1.speed = panelSpeed; k1.engaged = panelEngaged;
+  sk.update(seq, mux, scanned, k1);
+}
+
+TEST_CASE("StepKnobs: pickup -- no position changes until a pot moves; then only its own step") {
+  Sequencer seq;
+  float before[SS_STEPS];
+  for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
+  StepKnobs sk;
+  float pots[MUX_KNOBS] = {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
+  for (int n = 0; n < 5; n++) poll(sk, seq, pots);
+  for (int i = 0; i < SS_STEPS; i++) {
+    REQUIRE(seq.position[i] == before[i]);
+    REQUIRE_FALSE(sk.live(i));
+  }
+  pots[2] = 0.75f;                               // panel knob 3 (mux channel 0) moves
+  poll(sk, seq, pots);
+  REQUIRE(sk.live(2));
+  REQUIRE(seq.position[2] == Approx(0.75f));
+  for (int i = 0; i < SS_STEPS; i++)
+    if (i != 2) REQUIRE(seq.position[i] == before[i]);
+}
+
+TEST_CASE("StepKnobs: each knob lands on its own step through the channel table") {
+  for (int k = 0; k < MUX_KNOBS; k++) {
+    Sequencer seq;
+    StepKnobs sk;
+    float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+    poll(sk, seq, pots);
+    float before[SS_STEPS];
+    for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
+    pots[k] = 0.53f;
+    poll(sk, seq, pots);
+    // One 0.03 move in one poll: the tuned position knob reads that as FAST
+    // and snaps to its 5% grid, exactly as knob1 would (0.55).
+    const float expect = applyKnob(positionSpec(), 0.53f, 0.03f);
+    REQUIRE(expect == Approx(0.55f));
+    for (int i = 0; i < SS_STEPS; i++) {
+      if (i == k) REQUIRE(seq.position[i] == Approx(expect));
+      else        REQUIRE(seq.position[i] == before[i]);
+    }
+  }
+}
+
+TEST_CASE("StepKnobs: a slow first turn engages AND takes the step (pickup claims ownership)") {
+  Sequencer seq;
+  StepKnobs sk;
+  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+  poll(sk, seq, pots);
+  for (int n = 1; n <= 30; n++) {                // 0.001/poll: below the 0.008 ownership threshold
+    pots[6] = 0.5f + 0.001f * n;
+    poll(sk, seq, pots);
+  }
+  REQUIRE(sk.live(6));
+  REQUIRE(sk.owns(6));
+  REQUIRE(seq.position[6] == Approx(0.53f));
+}
+
+TEST_CASE("StepKnobs: knob1 and a pot on the same step -- the last moved owns it") {
+  Sequencer seq;
+  StepKnobs sk;
+  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+  poll(sk, seq, pots);
+  pots[4] = 0.60f;                               // the pot takes step 5
+  poll(sk, seq, pots);
+  REQUIRE(sk.owns(4));
+  REQUIRE(seq.position[4] == Approx(0.60f));
+  // Knob1 (step mode on step 5) turns: PanelEditor wrote 0.20 and it owns.
+  seq.position[4] = 0.20f;
+  poll(sk, seq, pots, 4, 0.02f);
+  REQUIRE_FALSE(sk.owns(4));
+  REQUIRE(seq.position[4] == Approx(0.20f));
+  for (int n = 0; n < 3; n++) poll(sk, seq, pots, 4, 0.0f);   // pot still: knob1 keeps it
+  REQUIRE(seq.position[4] == Approx(0.20f));
+  pots[4] = 0.70f;                               // the pot turns again: it takes it back
+  poll(sk, seq, pots, 4, 0.0f);
+  REQUIRE(sk.owns(4));
+  REQUIRE(seq.position[4] == Approx(0.70f));
+  // Knob1 moving on ANOTHER step does not steal step 5.
+  poll(sk, seq, pots, 1, 0.05f);
+  REQUIRE(sk.owns(4));
+}
+
+TEST_CASE("StepKnobs: ADC flutter on a still pot neither engages pickup nor steals ownership") {
+  Sequencer seq;
+  StepKnobs sk;
+  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+  poll(sk, seq, pots);
+  pots[0] = 0.6f; poll(sk, seq, pots);           // engage knob 1, then hand step 1 to knob1
+  seq.position[0] = 0.1f;
+  poll(sk, seq, pots, 0, 0.02f);
+  for (int n = 0; n < 50; n++) {
+    // +-0.0025 alternating = 0.005 poll-to-poll: the bench's measured flutter
+    // on a FLOATING mux input (LastMovedOwner's comment), the worst recorded;
+    // a still, wired pot measured ~0.001. Measured at 32x oversampling: the
+    // scan's 16x adds ~sqrt(2), which the MUX line must confirm on the bench.
+    float f = (n & 1) ? 0.0025f : -0.0025f;
+    for (int k = 0; k < MUX_KNOBS; k++) pots[k] = (k == 0 ? 0.6f : 0.5f) + f;
+    poll(sk, seq, pots, 0, 0.0f);
+  }
+  REQUIRE_FALSE(sk.owns(0));
+  REQUIRE(seq.position[0] == Approx(0.1f));
+  for (int k = 1; k < MUX_KNOBS; k++) REQUIRE_FALSE(sk.live(k));
+}
+
+TEST_CASE("StepKnobs: boot -- reads before the first full scan are ignored, so real positions are not a move") {
+  Sequencer seq;
+  float before[SS_STEPS];
+  for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
+  StepKnobs sk;
+  // Power-on: ADC2 has not converted every channel yet, so the reads are
+  // still the 0s the buffer started with (some channels may already be real).
+  float pots[MUX_KNOBS] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  poll(sk, seq, pots, -1, 0.0f, false, /*scanned=*/false);
+  pots[2] = 0.5f;                                // part-way through the first scan
+  poll(sk, seq, pots, -1, 0.0f, false, /*scanned=*/false);
+  // First full scan done: the pots' real resting positions.
+  const float rest[MUX_KNOBS] = {0.9f, 0.8f, 0.5f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
+  for (int n = 0; n < 10; n++) poll(sk, seq, rest);
+  for (int i = 0; i < SS_STEPS; i++) {
+    REQUIRE(seq.position[i] == before[i]);
+    REQUIRE_FALSE(sk.live(i));
+  }
+}
+
+TEST_CASE("StepKnobs: a slow knob1 trim on a step the pot owns takes it (knob1's pickup engaging claims)") {
+  Sequencer seq;
+  StepKnobs sk;
+  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+  poll(sk, seq, pots);
+  pots[3] = 0.60f; poll(sk, seq, pots);          // the pot owns step 4
+  REQUIRE(sk.owns(3));
+  // Knob1 arrives on step 4 and trims slowly: 0.001/poll, under the 0.008
+  // ownership threshold. Its pickup engages on some poll; PanelEditor writes
+  // its value from then on, and the pot must stop overwriting it.
+  bool engaged = false;
+  for (int n = 1; n <= 40; n++) {
+    const bool edge = !engaged && n == 25;       // the poll PanelEditor reports the engage
+    engaged = engaged || edge;
+    if (engaged) seq.position[3] = 0.30f + 0.001f * n;   // PanelEditor's write
+    poll(sk, seq, pots, 3, 0.001f, edge);
+  }
+  REQUIRE_FALSE(sk.owns(3));
+  REQUIRE(seq.position[3] == Approx(0.34f));
+}
+
+TEST_CASE("PanelEditor: k1Engaged is true on exactly the poll knob1's pickup engages on a slot") {
+  Sequencer seq; PanelEditor pe; float dur = 1.0f, gd = 0.0f;
+  pe.update(seq, &dur, &gd, 0.5f, 0.5f, 0.5f, 0.5f);
+  REQUIRE_FALSE(pe.k1Engaged());
+  pe.advance();                                  // step 1: pickup re-armed
+  int edges = 0;
+  for (int n = 1; n <= 40; n++) {                // slow sweep: 0.001/poll
+    const float r = 0.5f + 0.001f * n;
+    pe.update(seq, &dur, &gd, r, 0.5f, r, 0.5f);
+    if (pe.k1Engaged()) { edges++; REQUIRE(pe.k1Live()); }
+  }
+  REQUIRE(edges == 1);
+}
+
+TEST_CASE("StepKnobs: a mux that reads a constant (dead ADC: all zeros) writes nothing") {
+  Sequencer seq;
+  float before[SS_STEPS];
+  for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
+  StepKnobs sk;
+  const float zeros[MUX_KNOBS] = {0};
+  for (int n = 0; n < 20; n++) poll(sk, seq, zeros);
+  for (int i = 0; i < SS_STEPS; i++) REQUIRE(seq.position[i] == before[i]);
+}
+
 TEST_CASE("LastMovedOwner: the pot that moved most recently owns the parameter; jitter does not steal it") {
   LastMovedOwner o;
   REQUIRE_FALSE(o.update(0.0f, 0.0f));          // nobody moved: the first owns by default

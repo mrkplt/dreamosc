@@ -16,6 +16,8 @@
 #include "codec_rate.h"
 #include "axisram.h"      // AXISRAM_DATA: plain globals in D1 AXI SRAM (see the header)
 #include "mux_adc.h"      // the 4051 on A7, scanned by ADC2
+#include "screen_oled.h"  // the SSD1309 OLED: libDaisy's OledDisplay, per-band transport
+#include "display_core.h" // what the screen shows (host-tested)
 
 using namespace daisy;
 
@@ -76,6 +78,9 @@ static uint32_t profTicksPerUs = 1;
 static uint32_t profBootCrc = 0;
 static constexpr uint32_t PROF_CRC_SAMPLES = 72000;
 static inline uint32_t profUs(uint32_t ticks) { return ticks / profTicksPerUs; }
+// OLED: band sends since the last print, and the worst single Update() (one
+// band at most, blocking: it holds the frame producer for that long).
+static uint32_t profOledUpdates = 0, profOledMaxTicks = 0;
 
 // Deepest stack use observed (bytes below _estack). The stack grows down from
 // _estack (top of DTCM); keeping the minimum MSP ever seen gives a high-water
@@ -150,6 +155,16 @@ static Sequencer seq;
 static float DSY_SDRAM_BSS voicePool[SS_POOL_FLOATS];
 
 static DaisyPod pod;
+
+// The permanently attached SSD1309 128x64 OLED (Fizzy #141): libDaisy's
+// OledDisplay over a per-band, error-checked I2C transport (screen_oled.h).
+// The screen model -- POS1..POS8 and each step's position -- is
+// display_core.h; the main loop feeds it and sends at most one changed band
+// per pass.
+static ScreenOled     display;
+static OledCanvas     canvas{display};
+static PositionScreen posScreen;
+static OledBusStats   oledStats;
 
 // The 4051 on A7, scanned by ADC2 (mux_adc.h). Declared with the Pod because
 // it shares ADC1's lifecycle: both converters are stopped around a PLL3
@@ -595,6 +610,16 @@ static void profilePrint() {
   prof.busyTicks = prof.units = 0;
   prof.maxTicks = 0;   // reset the per-window peak (stk is a running high-water)
   profilePrintFetch();
+  // OLED line: ok (0 = init failed or the bus latched off after an error),
+  // band sends this second, the worst single band send in us -- the
+  // main-loop time the screen took from the frame producer (compare against
+  // the hop; watch du/late on HLTH) -- then running totals: I2C transactions,
+  // errors, bands sent.
+  pod.seed.PrintLine("OLED ok=%u upd=%u max_us=%u tx=%u err=%u bands=%u",
+                     (unsigned)oledStats.ok, (unsigned)profOledUpdates,
+                     (unsigned)profUs(profOledMaxTicks), (unsigned)oledStats.sends,
+                     (unsigned)oledStats.errors, (unsigned)oledStats.bands);
+  profOledUpdates = 0; profOledMaxTicks = 0;
 }
 #endif
 
@@ -677,6 +702,15 @@ int main(void) {
   seq.fade     = 0.0f;    // butt-joint by default; raise fade for crossfade
   seq.setSteps(SS_STEPS);
 
+  // The OLED, before audio starts: I2C1 at 400 kHz, addr 0x3C (screen_oled.h
+  // defaults). Its framebuffer starts blank; the main loop draws the rows and
+  // sends the screen band by band, so nothing here blocks on the bus beyond
+  // the panel's init commands.
+  ScreenOled::Config disp_cfg;
+  disp_cfg.driver_config.transport_config.stats = &oledStats;
+  display.Init(disp_cfg);
+  display.Fill(false);
+
   startInstrument();
 
   // Main loop: a pure producer. Render staged frames (earliest deadline
@@ -707,5 +741,23 @@ int main(void) {
       profilePrint();
     }
 #endif
+    // The screen (#141): feed every step's position (a compare; a row
+    // redraws only when its shown, rounded value changes), draw
+    // the dirty rows, then send at most ONE changed band (~3 ms at 400 kHz)
+    // and go back to rendering. seq.position[] is written by the audio
+    // callback; a float read is atomic on the M7.
+    for (int i = 0; i < SS_STEPS; i++) posScreen.setPosition(i, seq.position[i]);
+    if (posScreen.pending()) posScreen.draw(canvas);
+    if (!display.UpdateFinished()) {
+      uint32_t u0 = System::GetTick();
+      display.Update();
+      uint32_t ud = System::GetTick() - u0;
+#ifdef PROFILE
+      profOledUpdates++;
+      if (ud > profOledMaxTicks) profOledMaxTicks = ud;
+#else
+      (void)ud;
+#endif
+    }
   }
 }

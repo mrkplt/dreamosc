@@ -228,4 +228,15 @@ inline void write_wav(const char* path, const std::vector<float>& s, uint32_t sr
 
 }  // namespace testutil
 
+
+// An AnalogInput the test sets by hand (analog_input.h): what a Knob reads
+// in place of an ADC pin or a mux channel.
+#include "analog_input.h"
+struct FakeInput : AnalogInput {
+  float v   = 0.0f;
+  bool  rdy = true;
+  float read() const override { return v; }
+  bool  ready() const override { return rdy; }
+};
+
 #endif  // TEST_SUPPORT_H

@@ -64,6 +64,7 @@
 #include <stdint.h>
 
 #include "daisy_seed.h"
+#include "analog_input.h"
 
 class MuxAdc {
  public:
@@ -174,6 +175,21 @@ class MuxAdc {
   volatile uint32_t scans_ = 0, ovr1_ = 0;
   int  cur_ = 0;
   bool ok_ = false;
+};
+
+// One 4051 channel as an AnalogInput: a "virtual pin". A control wired
+// through the mux reads exactly like one wired straight to an ADC (ControlPin); it
+// never sees the mux. Not ready until the mux has converted every channel
+// once: before that its reads are 0, not a pot position.
+class MuxPin : public AnalogInput {
+ public:
+  MuxPin(const MuxAdc& mux, int channel) : mux_(mux), ch_(channel) {}
+  float read() const override { return mux_.value(ch_); }
+  bool  ready() const override { return mux_.scans() >= 1; }
+
+ private:
+  const MuxAdc& mux_;
+  int           ch_;
 };
 
 #endif  // MUX_ADC_H

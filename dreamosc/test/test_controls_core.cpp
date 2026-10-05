@@ -34,6 +34,28 @@ Sequencer& fresh_seq() {
   return seq;
 }
 
+// A PanelEditor wired to two fake pots: set the pots, then poll.
+struct Rig {
+  FakeInput   in1, in2;
+  PanelEditor pe{in1, in2};
+  void prime(float r1, float r2) { in1.v = r1; in2.v = r2; pe.prime(); }
+  void update(Sequencer& seq, float& dur, float& gd, float r1, float r2, float driftMax = 0.03f) {
+    in1.v = r1; in2.v = r2;
+    pe.update(seq, &dur, &gd, driftMax);
+  }
+};
+
+// Hold both knobs at (r1, r2) long enough for the one-pole smoother to settle
+// (0.98^2000 is far below float resolution). Duration and drift are smoothed
+// parameters (KnobSpec::smooth), so one poll after a move they are still
+// easing; these tests check where they land. The first poll of a move is
+// FAST (coarse grid), the rest are still (slow grid): settled values sit on
+// the SLOW grid.
+void settle(Rig& rig, Sequencer& seq, float& dur, float& gd, float r1, float r2,
+            float driftMax = 0.03f) {
+  for (int i = 0; i < 2000; i++) rig.update(seq, dur, gd, r1, r2, driftMax);
+}
+
 }  // namespace
 
 TEST_CASE("foldDrift: global is the floor (max), clamped to [0,1]") {
@@ -52,7 +74,7 @@ TEST_CASE("foldDrift: global is the floor (max), clamped to [0,1]") {
 // slot with pickup. dur/gdrift are the caller-owned globals.
 
 TEST_CASE("panel starts in GLOBAL; advance walks steps then returns to GLOBAL") {
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   REQUIRE(pe.inGlobal());
   REQUIRE(pe.slot() == PE_GLOBAL);
   for (int s = 1; s <= SS_STEPS; s++) { pe.advance(); REQUIRE(pe.slot() == s); }
@@ -63,7 +85,7 @@ TEST_CASE("panel starts in GLOBAL; advance walks steps then returns to GLOBAL") 
 TEST_CASE("advance(N) tours only the active steps then wraps to GLOBAL (#149)") {
   // With activeSteps = 3, button1 should walk GLOBAL -> 1 -> 2 -> 3 -> GLOBAL,
   // never visiting steps 4..8 (they're not in the sequence).
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   REQUIRE(pe.inGlobal());
   pe.advance(3); REQUIRE(pe.slot() == 1);
   pe.advance(3); REQUIRE(pe.slot() == 2);
@@ -75,7 +97,7 @@ TEST_CASE("advance(N) tours only the active steps then wraps to GLOBAL (#149)") 
 }
 
 TEST_CASE("clampToActive: shrinking the count off a parked step returns to GLOBAL (#149)") {
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   pe.advance(); pe.advance(); pe.advance();   // full tour: on step 3
   REQUIRE(pe.slot() == 3);
   pe.clampToActive(3);                        // still valid: stays put
@@ -89,7 +111,7 @@ TEST_CASE("clampToActive: shrinking the count off a parked step returns to GLOBA
 }
 
 TEST_CASE("button2 (toGlobal) jumps back to GLOBAL from any step") {
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   pe.advance(); pe.advance(); pe.advance();   // on step 3
   REQUIRE(pe.slot() == 3);
   pe.toGlobal();
@@ -99,44 +121,41 @@ TEST_CASE("button2 (toGlobal) jumps back to GLOBAL from any step") {
 TEST_CASE("pickup: a freshly entered step is NOT snapped to the knob") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.5f, 0.5f);
-  pe.advance();                          // step 1 (index 0)
-  float p0 = seq.position[0];
-  pe.update(seq, &dur, &gd, 0.5f, 0.5f, 0.5f, 0.5f); // knob stationary since prime -> no snap
-  REQUIRE(seq.position[0] == Approx(p0));
+  Rig rig;
+  rig.prime(0.5f, 0.5f);
+  rig.pe.advance();                      // step 1 (index 0)
+  rig.update(seq, dur, gd, 0.5f, 0.5f);  // knobs stationary since prime -> no snap
+  REQUIRE(rig.pe.perStepDrift(0) == 0.0f);
 }
 
 TEST_CASE("pickup: the knob takes over only after it moves past threshold") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.30f, 0.0f);
-  pe.advance();                          // step 1 (index 0)
-  pe.update(seq, &dur, &gd, 0.31f, 0.0f, 0.31f, 0.0f);   // below threshold: no takeover
-  float before = seq.position[0];
-  pe.update(seq, &dur, &gd, 0.80f, 0.0f, 0.80f, 0.0f);   // moved past threshold: takes over
-  REQUIRE(seq.position[0] == Approx(0.80f));
-  REQUIRE(seq.position[0] != Approx(before));
-  pe.update(seq, &dur, &gd, 0.805f, 0.0f, 0.805f, 0.0f);  // stays live for small moves
-  REQUIRE(seq.position[0] == Approx(0.805f));
+  Rig rig;
+  rig.prime(0.0f, 0.30f);
+  rig.pe.advance();                       // step 1 (index 0): knob2 = its drift
+  rig.update(seq, dur, gd, 0.0f, 0.31f);  // below threshold: no takeover
+  REQUIRE(rig.pe.perStepDrift(0) == 0.0f);
+  settle(rig, seq, dur, gd, 0.0f, 0.80f); // moved past threshold: takes over
+  REQUIRE(rig.pe.perStepDrift(0) == Approx(0.03f * 0.80f).margin(0.0003f));
+  settle(rig, seq, dur, gd, 0.0f, 0.70f); // and stays live
+  REQUIRE(rig.pe.perStepDrift(0) == Approx(0.03f * 0.70f).margin(0.0003f));
 }
 
 TEST_CASE("entering a new step re-arms pickup (stationary knob doesn't snap it)") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.10f, 0.5f);
-  pe.advance();                             // step 1
+  Rig rig;
+  rig.prime(0.0f, 0.10f);
+  rig.pe.advance();                             // step 1
   // After a slot switch the FIRST update re-anchors the move reference to the
   // current pot (models the poll where the button was pressed, knob still).
-  pe.update(seq, &dur, &gd, 0.10f, 0.5f, 0.10f, 0.5f);   // stationary: re-anchor
-  pe.update(seq, &dur, &gd, 0.90f, 0.5f, 0.90f, 0.5f);   // now MOVE: step 1 takes over
-  REQUIRE(seq.position[0] == Approx(0.90f));
-  float p1 = seq.position[1];
-  pe.advance();                             // step 2, pickup re-armed
-  pe.update(seq, &dur, &gd, 0.90f, 0.5f, 0.90f, 0.5f);   // knob stationary at 0.90: step 2 unchanged
-  REQUIRE(seq.position[1] == Approx(p1));
+  rig.update(seq, dur, gd, 0.0f, 0.10f);        // stationary: re-anchor
+  settle(rig, seq, dur, gd, 0.0f, 0.90f);       // now MOVE: step 1 takes over
+  REQUIRE(rig.pe.perStepDrift(0) == Approx(0.03f * 0.90f).margin(0.0003f));
+  rig.pe.advance();                             // step 2, pickup re-armed
+  settle(rig, seq, dur, gd, 0.0f, 0.90f);       // knob stationary at 0.90: step 2 unchanged
+  REQUIRE(rig.pe.perStepDrift(1) == 0.0f);
 }
 
 TEST_CASE("pickup engages on a SLOW sweep (reference must not chase the pot)") {
@@ -147,85 +166,98 @@ TEST_CASE("pickup engages on a SLOW sweep (reference must not chase the pot)") {
   // (at prime / slot entry) until pickup engages, so slow movement ACCUMULATES.
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.30f, 0.0f);   // start anchored at 0.30
+  Rig rig;
+  rig.prime(0.30f, 0.0f);   // start anchored at 0.30
   // Sweep knob1 slowly from 0.30 up, 0.005 per poll (well below the 0.02
   // threshold per step) -- a realistic slow turn sampled at poll rate.
   bool engaged = false;
   for (int i = 1; i <= 40 && !engaged; i++) {
     float r = 0.30f + 0.005f * i;      // 0.305, 0.310, ... crosses 0.02 by step 4+
-    pe.update(seq, &dur, &gd, r, 0.0f, r, 0.0f);
+    rig.update(seq, dur, gd, r, 0.0f);
     if (dur != Approx(1.0f)) engaged = true;   // duration moved => pickup engaged
   }
   REQUIRE(engaged);   // a slow sweep of ~0.2 total MUST engage pickup
 }
 
 TEST_CASE("pickup re-anchors on slot change: globals work after returning from a step") {
-  // Regression: the move-detection reference (now k1Anchor_, frozen at slot
-  // entry; r1Prev_ is only the per-poll speed reference) is shared across slots.
-  // Without re-anchoring on a slot switch, it carried over stale -- a step left
-  // the knob at 1.0, then GLOBAL compared against 1.0 and pickup never
-  // re-engaged, so global duration/drift silently stopped working after
-  // returning from a step. This is the exact reported symptom.
+  // Regression: the move reference must be re-captured on every slot switch.
+  // Without it, a step left the knob at 1.0, then GLOBAL compared against 1.0
+  // and pickup never re-engaged, so global drift silently stopped working
+  // after returning from a step. This is the exact reported symptom.
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.0f, 0.0f);
+  Rig rig;
+  rig.prime(0.0f, 0.0f);
 
-  // In a STEP, drive knob1 all the way to 1.0 -- this leaves the shared move
-  // reference (k1Anchor_) at 1.0. (Stationary re-anchor pass, then move.)
-  pe.advance();                                       // step 1
-  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f);  // re-anchor at 0
-  pe.update(seq, &dur, &gd, 1.0f, 0.0f, 1.0f, 0.0f);  // move 0->1.0: pos -> 1.0
-  REQUIRE(seq.position[0] == Approx(1.0f));
+  // In a STEP, drive knob2 all the way to 1.0.
+  rig.pe.advance();                             // step 1
+  rig.update(seq, dur, gd, 0.0f, 0.0f);         // re-anchor at 0
+  settle(rig, seq, dur, gd, 0.0f, 1.0f);
+  REQUIRE(rig.pe.perStepDrift(0) == Approx(0.03f).margin(0.0003f));
 
   // Return to GLOBAL with the knob still parked at 1.0.
-  pe.toGlobal();
+  rig.pe.toGlobal();
   // Stationary knob at 1.0: no takeover yet (correct -- pickup, not snapped).
-  float durBefore = dur;
-  pe.update(seq, &dur, &gd, 1.0f, 0.0f, 1.0f, 0.0f);
-  REQUIRE(dur == Approx(durBefore));
-  // Move the knob down to 0.5. WITHOUT the slot-change re-anchor, the anchor was
-  // still 1.0 from the step, |1.0-1.0|=0 that first stationary pass updated it,
-  // and the interaction left global pickup unreliable. With the fix, this
-  // deliberate move engages and duration follows.
-  pe.update(seq, &dur, &gd, 0.5f, 0.0f, 0.5f, 0.0f);
-  REQUIRE(dur == Approx(0.25f + (60.0f - 0.25f) * 0.5f));
+  settle(rig, seq, dur, gd, 0.0f, 1.0f);
+  REQUIRE(gd == 0.0f);
+  // A deliberate move engages, and global drift follows.
+  settle(rig, seq, dur, gd, 0.0f, 0.5f);
+  REQUIRE(gd == Approx(0.03f * 0.5f).margin(0.0003f));
+}
+
+TEST_CASE("step mode: knob1 is unassigned -- turning it writes nothing") {
+  Sequencer& seq = fresh_seq();
+  float before[SS_STEPS];
+  for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
+  float dur = 1.0f, gd = 0.0f;
+  Rig rig;
+  rig.prime(0.0f, 0.0f);
+  rig.pe.advance();                             // step 1
+  rig.update(seq, dur, gd, 0.0f, 0.0f);
+  settle(rig, seq, dur, gd, 1.0f, 0.0f);        // knob1 all the way up
+  REQUIRE(rig.pe.knob1().live());               // it engaged (it still reads) ...
+  REQUIRE_FALSE(rig.pe.knob1().bound());        // ... but is bound to nothing
+  REQUIRE(dur == 1.0f);
+  for (int i = 0; i < SS_STEPS; i++) REQUIRE(seq.position[i] == before[i]);
 }
 
 TEST_CASE("GLOBAL mode: knobs drive duration and global drift, with pickup") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.0f, 0.0f);                     // in GLOBAL
+  Rig rig;
+  rig.prime(0.0f, 0.0f);                    // in GLOBAL
   // Stationary knobs: no change.
-  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f);
+  rig.update(seq, dur, gd, 0.0f, 0.0f);
   REQUIRE(dur == Approx(1.0f));
   REQUIRE(gd == Approx(0.0f));
   // Move knob1 -> duration = durMin + (durMax-durMin)*k1 (defaults 0.25..60).
-  pe.update(seq, &dur, &gd, 0.5f, 0.0f, 0.5f, 0.0f);
+  rig.update(seq, dur, gd, 0.5f, 0.0f);
+  REQUIRE(rig.pe.k1Live());                              // live at once ...
+  REQUIRE(dur != Approx(1.0f));                          // ... writing ...
+  REQUIRE(dur < 0.25f + (60.0f - 0.25f) * 0.5f);         // ... and easing (smoothed)
+  settle(rig, seq, dur, gd, 0.5f, 0.0f);
   REQUIRE(dur == Approx(0.25f + (60.0f - 0.25f) * 0.5f));
-  // Move knob2 -> global drift = gdriftMax * k2 (default gdriftMax = 0.03 = 3%).
-  pe.update(seq, &dur, &gd, 0.5f, 0.4f, 0.5f, 0.4f);
-  REQUIRE(gd == Approx(0.03f * 0.4f));
+  // Move knob2 -> global drift = gdriftMax * k2 (default gdriftMax = 0.03 = 3%),
+  // settled on the slow grid (0.0003).
+  settle(rig, seq, dur, gd, 0.5f, 0.4f);
+  REQUIRE(gd == Approx(0.03f * 0.4f).margin(0.0003f));
 }
 
 TEST_CASE("per-step drift is independent between steps; global is the floor for all") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.0f, 0.0f);
+  Rig rig; PanelEditor& pe = rig.pe;
+  rig.prime(0.0f, 0.0f);
   pe.advance();                             // step 1 (index 0)
   // This case tests the FOLD/independence math (foldDrift = max), not the drift
   // max -- pass an explicit driftMax=0.25 so the designed 0.2 / global values are
-  // reachable and the arithmetic stays legible. (Signature order: moveThresh
-  // then driftMax.)
-  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.25f);     // re-anchor at 0
+  // reachable and the arithmetic stays legible.
+  rig.update(seq, dur, gd, 0.0f, 0.0f, 0.25f);     // re-anchor at 0
   // Margin = one slow-grid step (0.0003): the slow drift grid quantizes 0.25*0.8
   // to the nearest 0.0003 (0.2001), so assert the fold behavior to within a grid
   // step rather than an exact 0.20 that the finer grid no longer lands on.
   const float G = 0.0003f;   // slow drift grid step (see DRIFT KnobSpec)
-  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f, 0.02f, 0.25f);   // knob2 0->0.80: perStep[0] = 0.25*0.8 = 0.2
+  settle(rig, seq, dur, gd, 0.0f, 0.80f, 0.25f);   // knob2 0->0.80: perStep[0] = 0.25*0.8 = 0.2
   REQUIRE(pe.perStepDrift(0) == Approx(0.20f).margin(G));
   REQUIRE(pe.perStepDrift(1) == Approx(0.0f));   // untouched
   REQUIRE(seq.drift[0] == Approx(0.20f).margin(G));   // max(0.20, global 0)
@@ -235,7 +267,7 @@ TEST_CASE("per-step drift is independent between steps; global is the floor for 
   // gd via pointer -- set it, then update to re-fold. Floor 0.10 is BELOW step0's
   // own 0.20, so step0 keeps 0.20; step1 (own 0) rises to the 0.10 floor.
   gd = 0.10f;
-  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f, 0.02f, 0.25f);
+  rig.update(seq, dur, gd, 0.0f, 0.80f, 0.25f);
   REQUIRE(seq.drift[0] == Approx(0.20f).margin(G));   // max(0.20, 0.10) -> own value wins
   REQUIRE(seq.drift[1] == Approx(0.10f));   // max(0.00, 0.10) -> floor
   REQUIRE(pe.perStepDrift(0) == Approx(0.20f).margin(G));   // shadow UNCHANGED (no double-add)
@@ -243,7 +275,7 @@ TEST_CASE("per-step drift is independent between steps; global is the floor for 
   // Floor now ABOVE step0's own 0.20 -> step0 lifts to the 0.25 floor; the
   // per-step shadow still does not move (fold is non-destructive).
   gd = 0.25f;
-  pe.update(seq, &dur, &gd, 0.0f, 0.80f, 0.0f, 0.80f, 0.02f, 0.25f);
+  rig.update(seq, dur, gd, 0.0f, 0.80f, 0.25f);
   REQUIRE(seq.drift[0] == Approx(0.25f));   // max(0.20, 0.25) -> floor wins (exact gd)
   REQUIRE(pe.perStepDrift(0) == Approx(0.20f).margin(G));
 }
@@ -251,17 +283,18 @@ TEST_CASE("per-step drift is independent between steps; global is the floor for 
 TEST_CASE("effective drift with max-fold stays in range; a floor above per-step wins") {
   Sequencer& seq = fresh_seq();
   float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.0f, 0.0f);
+  Rig rig; PanelEditor& pe = rig.pe;
+  rig.prime(0.0f, 0.0f);
   pe.advance();                             // step 1
   // max-fold cannot overflow from two in-range inputs (unlike the old additive
   // fold). Drive per-step to its 0.25 max, then a floor ABOVE it: the floor wins,
   // and the result never exceeds 1.0. Explicit driftMax=0.25 for legible values.
-  pe.update(seq, &dur, &gd, 0.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.25f);    // re-anchor at 0
-  pe.update(seq, &dur, &gd, 0.0f, 1.0f, 0.0f, 1.0f, 0.02f, 0.25f);    // perStep[0] = 0.25 (max via knob)
-  REQUIRE(seq.drift[0] == Approx(0.25f));   // max(0.25, floor 0)
+  rig.update(seq, dur, gd, 0.0f, 0.0f, 0.25f);    // re-anchor at 0
+  settle(rig, seq, dur, gd, 0.0f, 1.0f, 0.25f);    // perStep[0] = 0.25 (max via knob)
+  // Settled on the slow drift grid (0.0003): 0.25 lands on 0.2499.
+  REQUIRE(seq.drift[0] == Approx(0.25f).margin(0.0003f));   // max(0.25, floor 0)
   gd = 0.9f;                                // floor above per-step
-  pe.update(seq, &dur, &gd, 0.0f, 1.0f, 0.0f, 1.0f, 0.02f, 0.25f);
+  rig.update(seq, dur, gd, 0.0f, 1.0f, 0.25f);
   REQUIRE(seq.drift[0] == Approx(0.9f));    // max(0.25, 0.9) -> floor, still <= 1.0
 }
 
@@ -467,7 +500,7 @@ TEST_CASE("encoderSync: boot pushes stretch 50x and window SS_W_DEFAULT into the
 
 TEST_CASE("applyEncoder: stretch page steps the detent index (3/detent fast, 1 slow), clamped") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e;                                  // page = stretch, idx 20 (50x)
   encoderSync(e, seq);
   applyEncoder(e, seq, pe, +1, /*fast=*/false);
@@ -486,7 +519,7 @@ TEST_CASE("applyEncoder: stretch page steps the detent index (3/detent fast, 1 s
 
 TEST_CASE("applyEncoder: frame page walks the size index one per detent; CW shrinks") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e; e.page = PAGE_FRAME;
   encoderSync(e, seq);
   REQUIRE(seq.frameSize == 4096);
@@ -503,7 +536,7 @@ TEST_CASE("applyEncoder: frame page walks the size index one per detent; CW shri
 
 TEST_CASE("applyEncoder: steps page changes the count and keeps the panel on a valid slot (#149)") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e; e.page = PAGE_STEPS;
   REQUIRE(seq.activeSteps == SS_STEPS);
   pe.advance(); pe.advance(); pe.advance();        // parked on step 3
@@ -521,7 +554,7 @@ TEST_CASE("applyEncoder: steps page changes the count and keeps the panel on a v
 
 TEST_CASE("applyEncoder: fade page is additive, 0.04 fast / 0.005 slow, clamped to [0, 0.5]") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e; e.page = PAGE_FADE;
   seq.fade = 0.0f;
   applyEncoder(e, seq, pe, +1, false); REQUIRE(seq.fade == Approx(0.005f));
@@ -598,7 +631,7 @@ TEST_CASE("applyKnob: one behavior, ranges differ per spec") {
 
 TEST_CASE("applyDigitalControls: detent speed comes from the gap to the previous detent") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e;                                  // stretch page, idx 20 (50x)
   encoderSync(e, seq);
   uint32_t lastMs = 0;
@@ -617,7 +650,7 @@ TEST_CASE("applyDigitalControls: detent speed comes from the gap to the previous
 
 TEST_CASE("applyDigitalControls: a click in the same sample as a detent moves the page first") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e;
   encoderSync(e, seq);
   uint32_t lastMs = 0;
@@ -629,7 +662,7 @@ TEST_CASE("applyDigitalControls: a click in the same sample as a detent moves th
 
 TEST_CASE("applyDigitalControls: buttons advance / return to GLOBAL, one edge per sample") {
   Sequencer& seq = fresh_seq();
-  PanelEditor pe;
+  Rig rig; PanelEditor& pe = rig.pe;
   EncoderState e;
   uint32_t lastMs = 0;
   for (int i = 0; i < 3; i++) applyDigitalControls(e, seq, pe, false, 0, true, false, i, lastMs);
@@ -643,49 +676,157 @@ TEST_CASE("applyDigitalControls: buttons advance / return to GLOBAL, one edge pe
   REQUIRE(pe.inGlobal());
 }
 
-// --- the mux pot (AuxKnob) ---------------------------------------------------
+// --- Knob: every pot's pickup, speed, deadband and smoothing ----------------
+// A Knob reads an injected AnalogInput (a FakeInput here) and writes the
+// float it is bound to.
 
-TEST_CASE("AuxKnob: does not write until the pot moves past threshold from its boot position") {
-  AuxKnob k; float dur = 1.0f;
-  REQUIRE_FALSE(k.update(0.50f, durationSpec(), &dur));    // primes the anchor
-  REQUIRE_FALSE(k.update(0.51f, durationSpec(), &dur));    // below threshold
-  REQUIRE_FALSE(k.update(0.49f, durationSpec(), &dur));
-  REQUIRE(dur == 1.0f);                                      // untouched
-  REQUIRE_FALSE(k.live);
+TEST_CASE("Knob: does not go live until the pot moves past threshold from its boot position") {
+  FakeInput in; float out = -1.0f;
+  Knob k(in, &out, durationSpec());
+  in.v = 0.50f; k.poll();                          // primes the anchor
+  in.v = 0.51f; k.poll();                          // below threshold
+  in.v = 0.49f; k.poll();
+  REQUIRE_FALSE(k.live());
+  REQUIRE(out == -1.0f);                           // nothing written
+  in.v = 0.53f; k.poll();                          // 0.03 from the anchor
+  REQUIRE(k.live());
+  REQUIRE(k.engaged());                            // engaged on exactly this poll
+  REQUIRE(out != -1.0f);                           // and writes
+  in.v = 0.54f; k.poll();
+  REQUIRE_FALSE(k.engaged());
 }
 
-TEST_CASE("AuxKnob: once live it maps 0..1 to 0.25..60 s through the smoother and stays live") {
-  AuxKnob k; float dur = 1.0f;
-  k.update(0.0f, durationSpec(), &dur);
-  REQUIRE(k.update(0.10f, durationSpec(), &dur));           // past threshold: live
-  REQUIRE(k.live);
+TEST_CASE("Knob: a smoothed spec eases, settles at the range ends, and stays live") {
+  FakeInput in; float dur = 1.0f;
+  Knob k(in, &dur, durationSpec());
+  in.v = 0.0f;  k.poll();
+  in.v = 0.10f; k.poll();                          // past threshold: live
+  REQUIRE(k.live());
   REQUIRE(dur > 0.25f); REQUIRE(dur < 0.25f + 0.10f * 59.75f);   // smoothed: eased, not snapped
-  for (int i = 0; i < 2000; i++) k.update(1.0f, durationSpec(), &dur);
-  REQUIRE(dur == Approx(60.0f).margin(0.01f));               // settles at the top of the range
-  for (int i = 0; i < 2000; i++) k.update(0.0f, durationSpec(), &dur);
+  in.v = 1.0f; for (int i = 0; i < 2000; i++) k.poll();
+  REQUIRE(dur == Approx(60.0f).margin(0.01f));
+  in.v = 0.0f; for (int i = 0; i < 2000; i++) k.poll();
   REQUIRE(dur == Approx(0.25f).margin(0.01f));
-  REQUIRE(k.update(0.001f, durationSpec(), &dur));           // small moves keep writing
+  in.v = 0.001f; k.poll();
+  REQUIRE(k.live());                               // small moves keep it live
 }
 
-TEST_CASE("AuxKnob: a slow sweep engages (the anchor does not chase the pot)") {
-  AuxKnob k; float dur = 1.0f;
-  k.update(0.30f, durationSpec(), &dur);
+TEST_CASE("Knob: a slow sweep engages (the anchor does not chase the pot)") {
+  FakeInput in;
+  Knob k(in);
+  in.v = 0.30f; k.poll();
   bool engaged = false;
-  for (int i = 1; i <= 30 && !engaged; i++) engaged = k.update(0.30f + 0.001f * i, durationSpec(), &dur);
+  for (int i = 1; i <= 30 && !engaged; i++) { in.v = 0.30f + 0.001f * i; k.poll(); engaged = k.live(); }
   REQUIRE(engaged);
 }
 
-TEST_CASE("AuxKnob: writeRaw writes the raw read through the position spec's speed grid") {
-  AuxKnob k; k.writeRaw = true;
-  float v = -1.0f;
-  k.update(0.30f, positionSpec(), &v);
-  REQUIRE(k.update(0.334f, positionSpec(), &v));            // 0.034 in one poll: fast -> 5% grid
-  REQUIRE(v == Approx(0.35f));
-  REQUIRE(k.update(0.337f, positionSpec(), &v));            // 0.003: slow -> continuous
-  REQUIRE(v == Approx(0.337f));                              // raw, not eased by the smoother
+TEST_CASE("Knob: an unsmoothed spec writes the deadbanded read through the speed grid") {
+  FakeInput in; float pos = -1.0f;
+  Knob k(in, &pos, positionSpec());
+  in.v = 0.30f;  k.poll();
+  in.v = 0.334f; k.poll();                         // 0.034 in one poll: fast -> 5% grid
+  REQUIRE(pos == Approx(0.35f));
+  in.v = 0.337f; k.poll();                         // 0.003: slow -> continuous
+  REQUIRE(pos == Approx(0.337f));                  // the pot, not eased by the smoother
+  REQUIRE(k.smoothed() < 0.337f);                  // (which is still easing)
 }
 
-// --- the row-2 pots (StepKnobs) -----------------------------------------------
+TEST_CASE("Knob: rearm re-anchors pickup where the pot is, not where it was") {
+  FakeInput in;
+  Knob k(in);
+  in.v = 0.0f; k.poll();
+  in.v = 1.0f; k.poll();
+  REQUIRE(k.live());
+  k.rearm();
+  k.poll();                                        // stationary at the new anchor
+  REQUIRE_FALSE(k.live());
+  in.v = 0.97f; k.poll();                          // 0.03 from it: live again
+  REQUIRE(k.live());
+}
+
+TEST_CASE("Knob: unbound, it reads and tracks but writes nothing; bind() does not re-arm") {
+  FakeInput in; float target = -1.0f;
+  Knob k(in);
+  in.v = 0.0f; k.poll();
+  in.v = 0.5f; k.poll();
+  REQUIRE(k.live());
+  REQUIRE(target == -1.0f);
+  k.bind(&target, positionSpec());                 // still live: writes on the next poll
+  k.poll();
+  REQUIRE(target == Approx(0.5f));
+  k.unbind();
+  in.v = 0.6f; k.poll();
+  REQUIRE(target == Approx(0.5f));
+}
+
+TEST_CASE("Knob: an input that is not ready is never read, so its first real read is not a move") {
+  FakeInput in; float pos = -1.0f;
+  Knob k(in, &pos, positionSpec());
+  in.rdy = false;
+  in.v = 0.0f;  REQUIRE_FALSE(k.poll());           // pre-scan zeros: ignored entirely
+  in.v = 0.5f;  REQUIRE_FALSE(k.poll());
+  in.rdy = true;
+  in.v = 0.9f;
+  for (int n = 0; n < 10; n++) REQUIRE(k.poll());  // the pot's real resting position
+  REQUIRE_FALSE(k.live());
+  REQUIRE(pos == -1.0f);
+}
+
+// --- Deadband: knob flutter is removed at the knob ---------------------------
+
+TEST_CASE("Deadband: holds inside the band, jumps to the pot outside it") {
+  Deadband d;
+  REQUIRE(d.update(0.5f, 0.002f) == 0.5f);        // first read primes
+  REQUIRE(d.update(0.5019f, 0.002f) == 0.5f);
+  REQUIRE(d.update(0.4981f, 0.002f) == 0.5f);
+  REQUIRE(d.update(0.5021f, 0.002f) == 0.5021f);  // past the band: the pot
+  REQUIRE(d.update(0.0f, 0.002f) == 0.0f);        // a jump lands exactly (ends reachable)
+  REQUIRE(d.update(1.0f, 0.002f) == 1.0f);
+}
+
+TEST_CASE("Deadband: flutter up to the band peak-to-peak never moves the value") {
+  // Worst case: the value lands at one extreme of the flutter, which then
+  // swings a full band (less a hair) to the other extreme and back.
+  const float band = Knob::DEADBAND, span = band * 0.999f;
+  for (float dir : {+1.0f, -1.0f}) {
+    for (float rest = 0.1f; rest < 0.9f; rest += 0.0137f) {
+      Deadband d;
+      d.update(rest - dir * 0.05f, band);
+      const float settled = d.update(rest, band);   // arrive from afar
+      for (int i = 0; i < 100; i++)
+        REQUIRE(d.update((i & 1) ? rest + dir * span : rest, band) == settled);
+    }
+  }
+}
+
+TEST_CASE("Knob: a resting pot's flutter never changes an unsmoothed value") {
+  FakeInput in; float pos = -1.0f;
+  Knob k(in, &pos, positionSpec());
+  in.v = 0.30f; k.poll();
+  in.v = 0.40f; k.poll();                          // engage (fast: grid)
+  for (float r : {0.4050f, 0.4090f, 0.4130f}) { in.v = r; k.poll(); }   // slow turn, each step past the band
+  const float settled = pos;
+  REQUIRE(settled == Approx(0.4130f));
+  // The bench's stationary-pot flutter (~0.001 per poll), both ways.
+  for (int i = 0; i < 1000; i++) {
+    in.v = (i & 1) ? 0.4140f : 0.4120f; k.poll();
+    REQUIRE(pos == settled);
+  }
+}
+
+TEST_CASE("Knob: a resting pot's flutter never changes a smoothed value once settled") {
+  FakeInput in; float dur = -1.0f;
+  Knob k(in, &dur, durationSpec());
+  in.v = 0.0f; k.poll();
+  in.v = 0.613f; for (int i = 0; i < 3000; i++) k.poll();   // settle the smoother on the held read
+  const float settled = dur;
+  for (int i = 0; i < 1000; i++) {
+    in.v = (i & 1) ? 0.614f : 0.612f; k.poll();
+    REQUIRE(dur == settled);
+  }
+}
+
+// --- the row-2 pots: one independent position Knob per head ----------------
 
 TEST_CASE("KNOB_MUX_CH: panel order is the netlist, and the table is a permutation of the 8 channels") {
   const int expect[MUX_KNOBS] = {2, 1, 0, 3, 5, 7, 6, 4};   // RV3 RV2 RV1 RV4 RV6 RV8 RV7 RV5
@@ -699,191 +840,62 @@ TEST_CASE("KNOB_MUX_CH: panel order is the netlist, and the table is a permutati
   }
 }
 
-// One control poll: pots[k] is PANEL knob k's reading, routed through the
-// wiring table into the per-channel array the mux delivers.
-static void poll(StepKnobs& sk, Sequencer& seq, const float pots[MUX_KNOBS],
-                 int panelStep = -1, float panelSpeed = 0.0f,
-                 bool panelEngaged = false, bool scanned = true) {
-  float mux[MUX_KNOBS];
-  for (int k = 0; k < MUX_KNOBS; k++) mux[KNOB_MUX_CH[k]] = pots[k];
-  Knob1View k1;
-  k1.step = panelStep; k1.speed = panelSpeed; k1.engaged = panelEngaged;
-  sk.update(seq, mux, scanned, k1);
-}
+// The firmware's eight head-position knobs, as dreamosc.cpp builds them: knob
+// i reads its own input and is bound to seq.position[i] with positionSpec().
+struct HeadKnobs {
+  FakeInput in[MUX_KNOBS];
+  std::vector<Knob> k;
+  explicit HeadKnobs(Sequencer& seq) {
+    for (int i = 0; i < MUX_KNOBS; i++) k.emplace_back(in[i], &seq.position[i], positionSpec());
+  }
+  void set(const float v[MUX_KNOBS]) { for (int i = 0; i < MUX_KNOBS; i++) in[i].v = v[i]; }
+  void poll() { for (auto& x : k) x.poll(); }
+};
 
-TEST_CASE("StepKnobs: pickup -- no position changes until a pot moves; then only its own step") {
+TEST_CASE("head knobs: pickup -- no position changes until a pot moves; then only its own head") {
   Sequencer seq;
   float before[SS_STEPS];
   for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
-  StepKnobs sk;
-  float pots[MUX_KNOBS] = {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
-  for (int n = 0; n < 5; n++) poll(sk, seq, pots);
-  for (int i = 0; i < SS_STEPS; i++) {
-    REQUIRE(seq.position[i] == before[i]);
-    REQUIRE_FALSE(sk.live(i));
-  }
-  pots[2] = 0.75f;                               // panel knob 3 (mux channel 0) moves
-  poll(sk, seq, pots);
-  REQUIRE(sk.live(2));
-  REQUIRE(seq.position[2] == Approx(0.75f));
-  for (int i = 0; i < SS_STEPS; i++)
-    if (i != 2) REQUIRE(seq.position[i] == before[i]);
-}
-
-TEST_CASE("StepKnobs: each knob lands on its own step through the channel table") {
+  HeadKnobs hk(seq);
+  const float rest[MUX_KNOBS] = {0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
+  hk.set(rest);
+  for (int n = 0; n < 5; n++) hk.poll();
+  for (int i = 0; i < SS_STEPS; i++) REQUIRE(seq.position[i] == before[i]);
   for (int k = 0; k < MUX_KNOBS; k++) {
-    Sequencer seq;
-    StepKnobs sk;
-    float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
-    poll(sk, seq, pots);
-    float before[SS_STEPS];
-    for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
-    pots[k] = 0.53f;
-    poll(sk, seq, pots);
-    // One 0.03 move in one poll: the tuned position knob reads that as FAST
-    // and snaps to its 5% grid, exactly as knob1 would (0.55).
-    const float expect = applyKnob(positionSpec(), 0.53f, 0.03f);
-    REQUIRE(expect == Approx(0.55f));
+    hk.in[k].v = rest[k] + 0.03f;                // one 0.03 move: fast -> 5% grid
+    hk.poll();
     for (int i = 0; i < SS_STEPS; i++) {
-      if (i == k) REQUIRE(seq.position[i] == Approx(expect));
-      else        REQUIRE(seq.position[i] == before[i]);
+      // The pot that moved this poll: snapped to the fast grid. The ones that
+      // moved earlier and are now still: the slow (continuous) read -- the
+      // fast snap lasts only while the pot moves (existing behavior).
+      if (i == k)     REQUIRE(seq.position[i] == Approx(applyKnob(positionSpec(), rest[i] + 0.03f, 0.03f)));
+      else if (i < k) REQUIRE(seq.position[i] == Approx(rest[i] + 0.03f));
+      else            REQUIRE(seq.position[i] == before[i]);
     }
   }
 }
 
-TEST_CASE("StepKnobs: a slow first turn engages AND takes the step (pickup claims ownership)") {
-  Sequencer seq;
-  StepKnobs sk;
-  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
-  poll(sk, seq, pots);
-  for (int n = 1; n <= 30; n++) {                // 0.001/poll: below the 0.008 ownership threshold
-    pots[6] = 0.5f + 0.001f * n;
-    poll(sk, seq, pots);
-  }
-  REQUIRE(sk.live(6));
-  REQUIRE(sk.owns(6));
-  REQUIRE(seq.position[6] == Approx(0.53f));
-}
-
-TEST_CASE("StepKnobs: knob1 and a pot on the same step -- the last moved owns it") {
-  Sequencer seq;
-  StepKnobs sk;
-  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
-  poll(sk, seq, pots);
-  pots[4] = 0.60f;                               // the pot takes step 5
-  poll(sk, seq, pots);
-  REQUIRE(sk.owns(4));
-  REQUIRE(seq.position[4] == Approx(0.60f));
-  // Knob1 (step mode on step 5) turns: PanelEditor wrote 0.20 and it owns.
-  seq.position[4] = 0.20f;
-  poll(sk, seq, pots, 4, 0.02f);
-  REQUIRE_FALSE(sk.owns(4));
-  REQUIRE(seq.position[4] == Approx(0.20f));
-  for (int n = 0; n < 3; n++) poll(sk, seq, pots, 4, 0.0f);   // pot still: knob1 keeps it
-  REQUIRE(seq.position[4] == Approx(0.20f));
-  pots[4] = 0.70f;                               // the pot turns again: it takes it back
-  poll(sk, seq, pots, 4, 0.0f);
-  REQUIRE(sk.owns(4));
-  REQUIRE(seq.position[4] == Approx(0.70f));
-  // Knob1 moving on ANOTHER step does not steal step 5.
-  poll(sk, seq, pots, 1, 0.05f);
-  REQUIRE(sk.owns(4));
-}
-
-TEST_CASE("StepKnobs: ADC flutter on a still pot neither engages pickup nor steals ownership") {
-  Sequencer seq;
-  StepKnobs sk;
-  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
-  poll(sk, seq, pots);
-  pots[0] = 0.6f; poll(sk, seq, pots);           // engage knob 1, then hand step 1 to knob1
-  seq.position[0] = 0.1f;
-  poll(sk, seq, pots, 0, 0.02f);
-  for (int n = 0; n < 50; n++) {
-    // +-0.0025 alternating = 0.005 poll-to-poll: the bench's measured flutter
-    // on a FLOATING mux input (LastMovedOwner's comment), the worst recorded;
-    // a still, wired pot measured ~0.001. Measured at 32x oversampling: the
-    // scan's 16x adds ~sqrt(2), which the MUX line must confirm on the bench.
-    float f = (n & 1) ? 0.0025f : -0.0025f;
-    for (int k = 0; k < MUX_KNOBS; k++) pots[k] = (k == 0 ? 0.6f : 0.5f) + f;
-    poll(sk, seq, pots, 0, 0.0f);
-  }
-  REQUIRE_FALSE(sk.owns(0));
-  REQUIRE(seq.position[0] == Approx(0.1f));
-  for (int k = 1; k < MUX_KNOBS; k++) REQUIRE_FALSE(sk.live(k));
-}
-
-TEST_CASE("StepKnobs: boot -- reads before the first full scan are ignored, so real positions are not a move") {
+TEST_CASE("head knobs: a slow first turn engages and writes; flutter on the others writes nothing") {
   Sequencer seq;
   float before[SS_STEPS];
   for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
-  StepKnobs sk;
-  // Power-on: ADC2 has not converted every channel yet, so the reads are
-  // still the 0s the buffer started with (some channels may already be real).
-  float pots[MUX_KNOBS] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  poll(sk, seq, pots, -1, 0.0f, false, /*scanned=*/false);
-  pots[2] = 0.5f;                                // part-way through the first scan
-  poll(sk, seq, pots, -1, 0.0f, false, /*scanned=*/false);
-  // First full scan done: the pots' real resting positions.
-  const float rest[MUX_KNOBS] = {0.9f, 0.8f, 0.5f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f};
-  for (int n = 0; n < 10; n++) poll(sk, seq, rest);
+  HeadKnobs hk(seq);
+  const float rest[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+  hk.set(rest);
+  hk.poll();
+  for (int n = 1; n <= 30; n++) {
+    for (int i = 0; i < MUX_KNOBS; i++)          // ADC flutter on every pot ...
+      hk.in[i].v = 0.5f + ((n + i) & 1 ? 0.001f : -0.001f);
+    hk.in[6].v = 0.5f + 0.001f * n;              // ... and a slow turn on pot 7
+    hk.poll();
+  }
+  REQUIRE(hk.k[6].live());
+  // A slow turn moves the position in deadband steps, so where the turn stops
+  // the value can sit up to Knob::DEADBAND short of the pot (by design).
+  REQUIRE(seq.position[6] == Approx(0.53f).margin(Knob::DEADBAND));
   for (int i = 0; i < SS_STEPS; i++) {
+    if (i == 6) continue;
+    REQUIRE_FALSE(hk.k[i].live());
     REQUIRE(seq.position[i] == before[i]);
-    REQUIRE_FALSE(sk.live(i));
   }
-}
-
-TEST_CASE("StepKnobs: a slow knob1 trim on a step the pot owns takes it (knob1's pickup engaging claims)") {
-  Sequencer seq;
-  StepKnobs sk;
-  float pots[MUX_KNOBS] = {0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
-  poll(sk, seq, pots);
-  pots[3] = 0.60f; poll(sk, seq, pots);          // the pot owns step 4
-  REQUIRE(sk.owns(3));
-  // Knob1 arrives on step 4 and trims slowly: 0.001/poll, under the 0.008
-  // ownership threshold. Its pickup engages on some poll; PanelEditor writes
-  // its value from then on, and the pot must stop overwriting it.
-  bool engaged = false;
-  for (int n = 1; n <= 40; n++) {
-    const bool edge = !engaged && n == 25;       // the poll PanelEditor reports the engage
-    engaged = engaged || edge;
-    if (engaged) seq.position[3] = 0.30f + 0.001f * n;   // PanelEditor's write
-    poll(sk, seq, pots, 3, 0.001f, edge);
-  }
-  REQUIRE_FALSE(sk.owns(3));
-  REQUIRE(seq.position[3] == Approx(0.34f));
-}
-
-TEST_CASE("PanelEditor: k1Engaged is true on exactly the poll knob1's pickup engages on a slot") {
-  Sequencer seq; PanelEditor pe; float dur = 1.0f, gd = 0.0f;
-  pe.update(seq, &dur, &gd, 0.5f, 0.5f, 0.5f, 0.5f);
-  REQUIRE_FALSE(pe.k1Engaged());
-  pe.advance();                                  // step 1: pickup re-armed
-  int edges = 0;
-  for (int n = 1; n <= 40; n++) {                // slow sweep: 0.001/poll
-    const float r = 0.5f + 0.001f * n;
-    pe.update(seq, &dur, &gd, r, 0.5f, r, 0.5f);
-    if (pe.k1Engaged()) { edges++; REQUIRE(pe.k1Live()); }
-  }
-  REQUIRE(edges == 1);
-}
-
-TEST_CASE("StepKnobs: a mux that reads a constant (dead ADC: all zeros) writes nothing") {
-  Sequencer seq;
-  float before[SS_STEPS];
-  for (int i = 0; i < SS_STEPS; i++) before[i] = seq.position[i];
-  StepKnobs sk;
-  const float zeros[MUX_KNOBS] = {0};
-  for (int n = 0; n < 20; n++) poll(sk, seq, zeros);
-  for (int i = 0; i < SS_STEPS; i++) REQUIRE(seq.position[i] == before[i]);
-}
-
-TEST_CASE("LastMovedOwner: the pot that moved most recently owns the parameter; jitter does not steal it") {
-  LastMovedOwner o;
-  REQUIRE_FALSE(o.update(0.0f, 0.0f));          // nobody moved: the first owns by default
-  REQUIRE(o.update(0.0f, 0.01f));               // the second moved: it owns
-  REQUIRE(o.update(0.0f, 0.0f));                // and keeps owning while nothing moves
-  REQUIRE(o.update(0.005f, 0.0f));              // ADC flutter on the first does not steal it
-  REQUIRE(o.update(0.0f, 0.005f));              // nor does flutter on the second confirm it
-  REQUIRE_FALSE(o.update(0.02f, 0.0f));         // a real move on the first takes it back
-  REQUIRE_FALSE(o.update(0.0f, 0.005f));        // and flutter on the second cannot take it
 }

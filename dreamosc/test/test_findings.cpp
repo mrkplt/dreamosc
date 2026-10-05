@@ -319,7 +319,7 @@ TEST_CASE("F7: a boundary between plan() and render() wastes a render", "[findin
 // ---------------------------------------------------------------------------
 // F8: the knob smoother (coeff 0.02 at 1 ms) creeps for ~250 ms after any
 // touch, and every creep step above threshold was a refresh (7 per touch).
-// Fixed at both ends: position is now fed from the RAW pot (PanelEditor), and
+// Fixed at both ends: position is now fed from the RAW pot (positionSpec), and
 // the core caps refreshes at one per hop per head with a 0.002 threshold.
 // ---------------------------------------------------------------------------
 TEST_CASE("F8: a pot move costs at most one refresh raw, one per hop smoothed", "[finding]") {
@@ -383,19 +383,15 @@ TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does 
   REQUIRE(tiny == 0);
 }
 
-TEST_CASE("F8: PanelEditor writes position from the raw pot, not the smoothed read", "[finding]") {
-  static std::vector<float> pool(SS_POOL_FLOATS);
-  auto srcbuf = make_source(0.5f, 48000);
-  MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  Sequencer seq; seq.init(&src, 48000, pool.data());
-  float dur = 1.0f, gd = 0.0f;
-  PanelEditor pe;
-  pe.prime(0.10f, 0.0f);
-  pe.advance();                                              // step 1
-  pe.update(seq, &dur, &gd, 0.10f, 0.0f, 0.10f, 0.0f);       // re-anchor
-  // Raw pot jumps to 0.80; the smoothed read is still lagging at 0.30.
-  pe.update(seq, &dur, &gd, 0.80f, 0.0f, 0.30f, 0.0f);
-  REQUIRE(seq.position[0] == Approx(0.80f));                 // raw, not 0.30
+TEST_CASE("F8: a position knob writes the pot, not the smoothed read", "[finding]") {
+  FakeInput in; float pos = -1.0f;
+  Knob k(in, &pos, positionSpec());
+  in.v = 0.10f; k.poll();
+  in.v = 0.10f; k.poll();
+  // Pot jumps to 0.80; the knob's smoothed read is still lagging behind it.
+  in.v = 0.80f; k.poll();
+  REQUIRE(k.smoothed() < 0.5f);
+  REQUIRE(pos == Approx(0.80f));                 // the pot, not the smoothed read
 }
 
 // ---------------------------------------------------------------------------

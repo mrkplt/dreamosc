@@ -15,7 +15,8 @@
 #include "sd_source.h"
 #include "codec_rate.h"
 #include "axisram.h"      // AXISRAM_DATA: plain globals in D1 AXI SRAM (see the header)
-#include "mux_adc.h"      // the 4051 on A7, scanned by ADC2
+#include "mux_adc.h"      // the 4051 on A7, scanned by ADC2; MuxPin
+#include "control_pin.h"  // ControlPin: the Pod's knobs, through libDaisy's AnalogControl
 #include "screen_oled.h"  // the SSD1309 OLED: libDaisy's OledDisplay, per-band transport
 #include "display_core.h" // what the screen shows (host-tested)
 
@@ -274,7 +275,8 @@ static void startInstrument() {
 // Panel (2026 Daisy Pod): 2 knobs, encoder (turn + click), 2 buttons, 2 RGB LEDs.
 // Two KNOB MODES (button1 cycles GLOBAL -> step1..8 -> GLOBAL; button2 = GLOBAL):
 //   GLOBAL mode (led1 OFF):  knob1 -> duration (0.25..60s), knob2 -> global drift
-//   step mode  (led1 ROYGBIVW): knob1 -> that step's position, knob2 -> its drift
+//   step mode  (led1 ROYGBIVW): knob1 -> unassigned, knob2 -> that step's drift
+//   row-2 pots     -> one head's position each (always, no mode)
 //   encoder turn   -> the current page's parameter (stretch / fade / frame / steps)
 //   encoder click  -> cycle page: stretch(red)/steps(orange)/fade(yellow)/window(green)
 //                     each page's led2 brightness encodes that page's level
@@ -297,23 +299,45 @@ static EncoderState enc;
 // clamped -- see foldDrift() in controls_core.h.
 static float globalDrift = 0.0f;
 
+// The Pod's two knobs: ControlPins over the AnalogControls DaisyPod::Init()
+// builds (pod.knob1 / pod.knob2), read raw -- every filter is the Knob's.
+static ControlPin podKnob1Pin(pod.knob1);
+static ControlPin podKnob2Pin(pod.knob2);
+
 // Panel edit state (mode/pickup/shadow) lives in the platform-free PanelEditor
 // so it is host-testable — see controls_core.h. GLOBAL mode: knobs = duration
-// + global drift. Step mode: knobs = that step's position + per-step drift.
-static PanelEditor panel;
+// + global drift. Step mode: knob2 = per-step drift (knob1 unassigned).
+static PanelEditor panel(podKnob1Pin, podKnob2Pin);
 
 // --- the 4051 analog mux on A7 (row-2 knobs, Fizzy #157) ---------------------
 // A CD4051 8:1 mux: common out -> A7 (D22, PA5 = ADC12_INP19); selects A/B/C
 // <- the Seed pins labelled SS/SCK/MI on the pinout, which are D7/D8/D9
 // (SPI1 NSS/SCK/MISO in libDaisy's spi.cpp -- the SPI function is the
-// unambiguous name; the header numbering is not). Eight pots, one per step:
-// knob i sets step i's position (StepKnobs, controls_core.h, which also holds
-// the panel-order -> mux-channel table). Scanned by ADC2 (mux_adc.h), NOT by
-// re-initialising the Pod's ADC1 with a mux channel: that left ADC1's DMA in
-// the mode its first init chose and took the board down (see mux_adc.h). The
-// Pod's two knobs are untouched.
+// unambiguous name; the header numbering is not). Eight pots, one per head:
+// pot i is a Knob reading MuxPin i (the 4051 channel KNOB_MUX_CH[i], the PCB
+// netlist order) and bound to head i's position. Scanned by ADC2
+// (mux_adc.h), NOT by re-initialising the Pod's ADC1 with a mux channel: that
+// left ADC1's DMA in the mode its first init chose and took the board down
+// (see mux_adc.h). A MuxPin is not ready until ADC2 has converted every
+// channel once, so a pot never reads the pre-scan 0 as a position; a mux
+// whose ADC did not come up is never ready, so its pots never write.
 static_assert(MuxAdc::CHANNELS == MUX_KNOBS, "one 4051 input per row-2 pot");
-static StepKnobs stepKnobs;
+static_assert(MUX_KNOBS == 8, "the pin and knob tables below list eight");
+static MuxPin headPosPin[MUX_KNOBS] = {
+  {muxAdc, KNOB_MUX_CH[0]}, {muxAdc, KNOB_MUX_CH[1]}, {muxAdc, KNOB_MUX_CH[2]},
+  {muxAdc, KNOB_MUX_CH[3]}, {muxAdc, KNOB_MUX_CH[4]}, {muxAdc, KNOB_MUX_CH[5]},
+  {muxAdc, KNOB_MUX_CH[6]}, {muxAdc, KNOB_MUX_CH[7]},
+};
+static Knob headPos[MUX_KNOBS] = {
+  Knob(headPosPin[0], &seq.position[0], positionSpec()),
+  Knob(headPosPin[1], &seq.position[1], positionSpec()),
+  Knob(headPosPin[2], &seq.position[2], positionSpec()),
+  Knob(headPosPin[3], &seq.position[3], positionSpec()),
+  Knob(headPosPin[4], &seq.position[4], positionSpec()),
+  Knob(headPosPin[5], &seq.position[5], positionSpec()),
+  Knob(headPosPin[6], &seq.position[6], positionSpec()),
+  Knob(headPosPin[7], &seq.position[7], positionSpec()),
+};
 
 
 // Audio block size. The hop (>= 128 samples, 2048 at the default window) sets
@@ -322,10 +346,6 @@ static StepKnobs stepKnobs;
 // runs for its FFTs.
 static constexpr size_t AUDIO_BLOCK = 32;
 static float monoBlock[AUDIO_BLOCK];
-
-// Knob smoothing state (the smoothing math is smoothKnob() in controls_core.h).
-static float knobSmooth[2] = {0.0f, 0.0f};
-static bool  knobPrimed    = false;
 
 // Timestamp of the last encoder detent, for the shared fast/slow speed
 // detection (encoderFast). Carried across page changes (a click then a quick
@@ -351,8 +371,8 @@ static uint32_t lastDetentMs = 0;
 //
 // Rates. The debouncers self-limit to one sample per GetNow() millisecond, so
 // calling them at 1.5 kHz is exactly right (never a skipped ms, edges valid
-// on this call only). The knobs are sampled once per ms too, on purpose: the
-// smoother (smoothKnob) and the pickup speed detector (potFast) are per-call
+// on this call only). The knobs are sampled once per ms too, on purpose: each
+// Knob's smoother and pickup speed detector (potFast) are per-call
 // filters tuned at 1 kHz; sampling them at the callback rate would change how
 // duration and drift feel under the hand. The LEDs are libDaisy SOFTWARE PWM
 // (Led::Update steps a ramp per call) and want the steady callback rate.
@@ -379,36 +399,21 @@ static void processControls() {
   (void)det;
 #endif
 
-  // --- knobs, once per ms: GLOBAL mode -> duration + global drift; step mode
-  // -> that step's position + per-step drift. PICKUP everywhere (a knob takes
-  // over only after it moves since arriving on a slot). All decision logic is
-  // host-tested (controls_core.h). seq.duration is written by PanelEditor via
-  // &seq.duration. ---
+  // --- knobs, once per ms: every pot is a Knob that reads its own input
+  // (ControlPin / MuxPin) and writes its bound parameter when live -- pickup,
+  // speed, deadband and smoothing are the Knob's (controls_core.h, host-
+  // tested). The Pod's knobs go through PanelEditor (GLOBAL: duration +
+  // global drift; step: per-step drift); the row-2 pots each write one
+  // head's position. ADC1 and ADC2 both convert continuously, so every read
+  // here is fresh. ---
   if (ms != lastKnobMs) {
     lastKnobMs = ms;
-    pod.ProcessAnalogControls();
-    float r1 = pod.knob1.Value(), r2 = pod.knob2.Value();   // raw (move detect)
-    float k1 = smoothKnob(knobSmooth[0], r1, knobPrimed);   // smoothed (value)
-    float k2 = smoothKnob(knobSmooth[1], r2, knobPrimed);
-    knobPrimed = true;
-    panel.update(seq, &seq.duration, &globalDrift, r1, r2, k1, k2);
-    // The row-2 pots: knob i -> step i's position. ADC2 scans all eight in
-    // under a millisecond (mux_adc.h), so each read here is fresh. Runs AFTER
-    // panel.update(): where knob1 (step mode) and a pot address the same
-    // step, the one that moved last owns it (StepKnobs). Nothing is read
-    // until ADC2 has converted every channel once (scans() >= 1): before that
-    // the reads are 0, not pot positions. A mux whose ADC did not come up
-    // never completes a scan, so it never writes.
-    float muxRaw[MUX_KNOBS];
-    for (int c = 0; c < MUX_KNOBS; c++) muxRaw[c] = muxAdc.value(c);
-    Knob1View k1v;
-    k1v.step    = panel.inGlobal() ? -1 : panel.step();
-    k1v.speed   = panel.speed1();
-    k1v.engaged = panel.k1Engaged();
-    stepKnobs.update(seq, muxRaw, muxAdc.scans() >= 1, k1v);
+    panel.update(seq, &seq.duration, &globalDrift);
+    for (Knob& k : headPos) k.poll();
 #ifdef PROFILE
-    for (int k = 0; k < MUX_KNOBS; k++) prof.mux[k] = muxRaw[KNOB_MUX_CH[k]];
-    prof.r1 = r1; prof.r2 = r2; prof.k1 = k1; prof.k2 = k2;   // for the KNOB line
+    for (int k = 0; k < MUX_KNOBS; k++) prof.mux[k] = headPos[k].raw();
+    prof.r1 = panel.knob1().raw();      prof.r2 = panel.knob2().raw();   // for the KNOB line
+    prof.k1 = panel.knob1().smoothed(); prof.k2 = panel.knob2().smoothed();
     if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
     if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
 #endif
@@ -545,9 +550,8 @@ static void profilePrint() {
   appendScaled(line, sizeof(line), used, seq.drift, SS_STEPS, 10000.0f);
   pod.seed.PrintLine("%s", line);
   // MUX line: the eight row-2 pots, raw (*1000), in PANEL order (leftmost
-  // first, KNOB_MUX_CH already applied), then two 8-digit strings, knob 1
-  // first: L = pickup engaged, O = the pot (not knob1) owns that step's
-  // position. Turning knob N must sweep the Nth value 0..1000 and nothing
+  // first, KNOB_MUX_CH already applied), then an 8-digit string, knob 1
+  // first: L = pickup engaged. Turning knob N must sweep the Nth value 0..1000 and nothing
   // else; a sweep in the wrong slot is a table/wiring mismatch, one that moves
   // with a neighbour is crosstalk, and 1000 at the counter-clockwise stop means
   // the pots read inverted. The step positions themselves are the POS line.
@@ -556,15 +560,12 @@ static void profilePrint() {
   // range, mux_adc.h). o1 = ADC1 (Pod knobs) overruns ever, cleared by the
   // shared IRQ: must stay 0; if not, suspect knob1/knob2 reading swapped.
   const uint32_t scans = muxAdc.scans();
-  char lv[MUX_KNOBS + 1], ow[MUX_KNOBS + 1];
-  for (int k = 0; k < MUX_KNOBS; k++) {
-    lv[k] = stepKnobs.live(k) ? '1' : '0';
-    ow[k] = stepKnobs.owns(k) ? '1' : '0';
-  }
-  lv[MUX_KNOBS] = ow[MUX_KNOBS] = '\0';
+  char lv[MUX_KNOBS + 1];
+  for (int k = 0; k < MUX_KNOBS; k++) lv[k] = headPos[k].live() ? '1' : '0';
+  lv[MUX_KNOBS] = '\0';
   used = snprintf(line, sizeof(line), "MUX ");
   used = appendScaled(line, sizeof(line), used, prof.mux, MUX_KNOBS, 1000.0f);
-  snprintf(line + used, sizeof(line) - used, " L=%s O=%s scn=%u o1=%u", lv, ow,
+  snprintf(line + used, sizeof(line) - used, " L=%s scn=%u o1=%u", lv,
            (unsigned)(scans - prof.lastScans), (unsigned)muxAdc.ovr1());
   prof.lastScans = scans;
   pod.seed.PrintLine("%s", line);

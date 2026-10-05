@@ -232,13 +232,16 @@ dreamosc/
   source_core.h       WAV: List[0] rule, chunk walk, 8/16/24/32/float decode,
                       sector-aligned ranged read (portable, host-tested)
   clock_core.h        PLL3 plan for a native codec rate (portable, host-tested)
+  analog_input.h      AnalogInput: the interface every analog control reads
+                      (implemented by ControlPin, MuxPin, test fakes)
   display_core.h      OLED screen logic: band diff, the POS1..POS8 screen
                       (portable, host-tested)
   shy_fft.h           Emilie Gillet's embedded real FFT (MIT; vendored)
   sd_source.h         SdSource: the WAV on the microSD, streamed. THE source seam.
   codec_rate.h        Apply + verify the codec rate through the HAL (device edge)
   axisram.h           AXISRAM_DATA: plain globals in D1 AXI SRAM (device edge)
-  mux_adc.h           The 4051 analog mux on A7, scanned by ADC2 (device edge)
+  mux_adc.h           The 4051 analog mux on A7, scanned by ADC2; MuxPin (device edge)
+  control_pin.h       ControlPin: a libDaisy AnalogControl as an AnalogInput (device edge)
   screen_oled.h       SSD1309 OLED: libDaisy OledDisplay + our per-band,
                       error-checked I2C transport (device edge)
   dreamosc.cpp        Pod firmware: hardware glue (audio callback, controls, LEDs)

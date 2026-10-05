@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "stretch_core.h"   // for SS_STEPS
+#include "analog_input.h"   // what a Knob reads
 
 // Encoder pages (the parameter the encoder turn drives; click cycles). Duration
 // and drift live on the knobs (global mode); these four are the encoder's.
@@ -99,6 +100,12 @@ struct KnobSpec {
   float lo, hi;         // parameter range
   float fastGrid;       // coarse grid, used on a fast move
   float slowGrid;       // fine grid (0 = continuous), used on a slow move
+  // Which de-fluttered read a Knob maps: true = the one-pole smoothed read
+  // (de-zippers a parameter applied per sample/block: duration, drift);
+  // false = the deadbanded read with no smoother (position: the core applies
+  // it at frame boundaries, so there is no zipper, and a one-pole's creep
+  // would cost a re-render per hop -- finding F8).
+  bool  smooth = true;
 };
 
 // Apply a KnobSpec: scale the 0..1 read to [lo,hi], pick the grid by speed,
@@ -137,62 +144,129 @@ inline float smoothKnob(float& state, float raw, bool primed, float coeff = 0.02
   return state;
 }
 
-// An EXTRA pot behind the 4051 analog mux (the row-2 knob hardware, Fizzy
-// #157) that writes ONE parameter with the same pickup, smoothing and speed-
-// adaptive mapping as the panel knobs. Pickup: the pot takes over only after
-// it has moved past moveThresh from where it sat at boot (the anchor is
-// frozen until then -- the same slow-sweep rule as PanelEditor). Speed is
-// measured on the raw read, once per poll -- the same 1 ms cadence as the
-// panel knobs, which is what potFast() and LastMovedOwner are tuned in (the
-// mux scan finishes inside every poll, mux_adc.h).
-//   writeRaw: write the value from the RAW read, not the smoothed one -- the
-//     position rule (see PanelEditor::update: the core applies position at
-//     frame boundaries, and a one-pole's creep would cost a re-render per hop).
-struct AuxKnob {
-  bool  writeRaw = false;
-  bool  primed = false, live = false;
-  float anchor = 0.0f, prev = 0.0f, smooth = 0.0f, speed = 0.0f;
-
-  // One read. Returns true and writes *out when the pot is live.
-  bool update(float raw, const KnobSpec& spec, float* out, float moveThresh = 0.02f) {
-    if (!primed) { anchor = raw; prev = raw; smooth = raw; primed = true; }
-    float k = smoothKnob(smooth, raw, true);
-    speed = fabsf(raw - prev);
-    prev = raw;
-    if (!live && fabsf(raw - anchor) > moveThresh) live = true;
-    if (!live) return false;
-    *out = applyKnob(spec, writeRaw ? raw : k, speed);
-    return true;
+// Deadband on a raw pot read: the value holds until the pot moves more than
+// `band` away from it, then jumps to the pot. A resting pot's ADC flutter
+// therefore never reaches the parameter (or anything downstream of it: the
+// core's re-render check, the OLED). After a jump the held value IS a pot
+// read, so flutter of peak-to-peak amplitude <= band around it can never
+// re-trigger it; the band is sized from the measured flutter. A slow turn
+// moves the value in steps just over `band`; a fast turn is unaffected (each
+// poll moves farther than the band). Unlike the one-pole smoother there is
+// no settling tail and no lag: the first poll past the band writes the pot.
+struct Deadband {
+  float held   = 0.0f;
+  bool  primed = false;
+  float update(float raw, float band) {
+    if (!primed || fabsf(raw - held) > band) { held = raw; primed = true; }
+    return held;
   }
 };
 
+// ONE physical pot: every knob on the instrument is a Knob (or derives from
+// one), so they all share the same feel and the same flutter handling. A Knob
+// is injected with the AnalogInput it reads (analog_input.h: an ADC pin, a
+// mux channel, a test fake -- it never knows which) and BOUND to the
+// parameter it writes (a float and the KnobSpec that maps onto it). poll()
+// runs once per control poll (1 ms -- the cadence potFast() and the smoother
+// are tuned in) and keeps:
+//   - PICKUP: the knob takes over its parameter only after it has moved past
+//     MOVE_THRESH from where it sat when it arrived (boot, or rearm() when it
+//     starts addressing another parameter). The anchor is FROZEN until then,
+//     so a slow sweep accumulates and engages (comparing against the previous
+//     poll let the reference chase the pot and a slow turn never engaged --
+//     the "control feels dead" bug). Detected on the RAW read.
+//   - SPEED: |delta raw| this poll, for the speed-adaptive grid (applyKnob).
+//     Raw, so a real turn is never hidden.
+//   - DE-FLUTTER: the raw read through DEADBAND, so a resting knob's value
+//     is constant; then a one-pole (SMOOTH) over that for parameters whose
+//     spec wants de-zippering (KnobSpec::smooth).
+class Knob {
+ public:
+  // Movement from the anchor that engages pickup.
+  static constexpr float MOVE_THRESH = 0.02f;
+  // Deadband in raw pot units (0..1 = full travel). The bench measures
+  // ~0.001 of per-poll flutter on a stationary pot (and ~0.005 on a floating
+  // mux input); 0.002 is twice the pot's. Cost: a slow turn moves a parameter
+  // in steps of 0.2% of its range (for position, 0.2% of the source), against
+  // the ~0.1% the flutter already blurred it to; where a slow turn stops, the
+  // value can sit up to 0.2% short of the pot.
+  static constexpr float DEADBAND = 0.002f;
+  // One-pole coefficient per poll (~50 ms time constant at 1 kHz).
+  static constexpr float SMOOTH = 0.02f;
+
+  explicit Knob(const AnalogInput& in) : in_(&in) {}
+  Knob(const AnalogInput& in, float* target, const KnobSpec& spec) : in_(&in) { bind(target, spec); }
+
+  // Point the knob at a parameter. Binding does NOT re-arm pickup (rearm()
+  // does), so a caller may re-bind every poll. Unbound, the knob still reads
+  // and tracks (pickup, speed, de-flutter stay current) but writes nothing.
+  void bind(float* target, const KnobSpec& spec) { target_ = target; spec_ = spec; }
+  void unbind() { target_ = nullptr; }
+
+  // Seat the knob where its input is now, so a stationary pot is not a move:
+  // anchor, speed reference, deadband and smoother all start there. Does
+  // nothing until the input is ready; the first ready poll() seats itself
+  // if this was never called.
+  void prime() { if (in_->ready()) seat(in_->read()); }
+
+  // Re-arm pickup: not live until it moves MOVE_THRESH from where its input
+  // is at the next poll().
+  void rearm() { live_ = false; anchorPending_ = true; }
+
+  // One poll: read the input, update pickup / speed / de-flutter, and write
+  // the bound parameter when live. Returns false (and does nothing at all)
+  // while the input is not ready.
+  bool poll() {
+    if (!in_->ready()) return false;
+    const float raw = in_->read();
+    if (!primed_) seat(raw);
+    if (anchorPending_) { anchor_ = raw; anchorPending_ = false; }
+    engaged_ = !live_ && fabsf(raw - anchor_) > MOVE_THRESH;
+    if (engaged_) live_ = true;
+    speed_ = fabsf(raw - prev_);
+    prev_  = raw;
+    smoothKnob(smooth_, hold_.update(raw, DEADBAND), true, SMOOTH);
+    if (live_ && target_) *target_ = value();
+    return true;
+  }
+
+  // The bound parameter's value: the de-fluttered read (smoothed or not, per
+  // the spec) through the speed-adaptive grid.
+  float value() const { return applyKnob(spec_, spec_.smooth ? smooth_ : hold_.held, speed_); }
+
+  bool  live() const     { return live_; }
+  bool  engaged() const  { return engaged_; }   // pickup engaged on THIS poll
+  bool  bound() const    { return target_ != nullptr; }
+  float speed() const    { return speed_; }
+  float raw() const      { return prev_; }
+  float held() const     { return hold_.held; }
+  float smoothed() const { return smooth_; }
+
+ private:
+  void seat(float raw) {
+    anchor_ = prev_ = smooth_ = raw;
+    hold_.held = raw; hold_.primed = true;
+    primed_ = true;
+  }
+
+  const AnalogInput* in_;
+  float*   target_ = nullptr;
+  KnobSpec spec_   = KnobSpec{0.0f, 1.0f, 0.0f, 0.0f};
+  Deadband hold_;
+  float anchor_ = 0.0f, prev_ = 0.0f, smooth_ = 0.0f, speed_ = 0.0f;
+  bool  primed_ = false, live_ = false, engaged_ = false, anchorPending_ = false;
+};
+
 // The position knob's spec: 0..1 of the source; a fast move snaps to 5%
-// landmarks (20 detents), a slow move is continuous. Shared by knob1 in step
-// mode (PanelEditor::update) and the row-2 pots (StepKnobs).
-inline KnobSpec positionSpec() { return KnobSpec{0.0f, 1.0f, 0.05f, 0.0f}; }
+// landmarks (20 detents), a slow move is continuous; not smoothed (see
+// KnobSpec::smooth). The row-2 pots' spec (one per head, see KNOB_MUX_CH).
+inline KnobSpec positionSpec() { return KnobSpec{0.0f, 1.0f, 0.05f, 0.0f, false}; }
 
 // The duration knob's spec (0.25..60 s, continuous): knob1 in GLOBAL mode
 // (PanelEditor::update).
 inline KnobSpec durationSpec(float durMin = 0.25f, float durMax = 60.0f) {
   return KnobSpec{durMin, durMax, 0.0f, 0.0f};
 }
-
-// Two pots on ONE parameter (knob1 in step mode and that step's row-2 pot,
-// both on its position -- StepKnobs): the one that moved most recently owns
-// it. Without this the pot polled second would overwrite the first every
-// millisecond once its pickup engaged. A pickup ENGAGING also claims the
-// parameter (StepKnobs), since a fine turn can stay under `eps`. `eps` is the per-poll raw movement that counts as a turn: the
-// bench shows ~0.005 of flutter on a floating mux input and ~0.001 on a
-// stationary pot, and the slowest deliberate turn moves more than 0.01 per
-// millisecond, so 0.008 separates the two.
-struct LastMovedOwner {
-  bool second = false;                      // true: the second pot owns the parameter
-  bool update(float speedFirst, float speedSecond, float eps = 0.008f) {
-    if (speedFirst > eps)  second = false;
-    if (speedSecond > eps) second = true;   // simultaneous: the second wins
-    return second;
-  }
-};
 
 // Advance the encoder page, wrapping.
 inline EncoderPage nextPage(EncoderPage p) {
@@ -276,45 +350,46 @@ inline Rgb stepColor(int i, float b = 0.6f) {
 // MODES, cycled by button1: GLOBAL (slot 0) then steps 1..SS_STEPS, then back to
 // GLOBAL (a SS_STEPS+1 loop). button2 jumps straight to GLOBAL.
 //   - GLOBAL: knob1 = global duration, knob2 = global drift.
-//   - step i: knob1 = that step's position, knob2 = that step's per-step drift.
+//   - step i: knob1 = unassigned (reads, writes nothing -- each head's
+//     position has its own row-2 pot), knob2 = that step's per-step drift.
 //
 // PICKUP everywhere: landing on any slot (global or a step) does NOT snap its
 // value to the pot. A knob takes over its parameter for the CURRENT slot only
-// after it has physically MOVED (> moveThresh) since arriving. Each of the
-// SS_STEPS+1 slots has its own k1/k2 latch, so touring never disturbs untouched
-// values. Effective drift per step = max(per-step, global), clamped (foldDrift).
+// after it has physically MOVED (> Knob::MOVE_THRESH) since arriving: every
+// arrival re-arms both knobs, so touring never disturbs untouched values.
+// Effective drift per step = max(per-step, global), clamped (foldDrift).
 //
-// The caller owns the Sequencer and the global duration/drift floats; this class
-// owns the mode/pickup/shadow state and never touches hardware.
+// The two knobs are Knobs injected with their inputs (the Pod's ADC pins on
+// the device, fakes in tests); this class re-binds them to the slot's
+// parameters every poll. The caller owns the Sequencer and the global
+// duration/drift floats; this class owns the mode and per-step drift shadow
+// and never touches hardware.
 constexpr int PE_GLOBAL = 0;                 // slot 0 = global page
-constexpr int PE_NSLOTS = SS_STEPS + 1;      // global + 8 steps
 
 class PanelEditor {
  public:
-  // Prime with the initial RAW knob reads so a stationary pot at boot isn't a
-  // move.
-  void prime(float r1, float r2) {
-    k1Anchor_ = r1; k2Anchor_ = r2;
-    r1Prev_ = r1; r2Prev_ = r2;   // so the first pass reads speed 0, not a jump
-    primed_ = true;
-  }
+  PanelEditor(const AnalogInput& in1, const AnalogInput& in2) : k1_(in1), k2_(in2) {}
+
+  // Seat both knobs where their pots are now, so a stationary pot at boot
+  // isn't a move.
+  void prime() { k1_.prime(); k2_.prime(); }
 
   int  slot() const { return slot_; }        // 0 = global, 1..SS_STEPS = step
   bool inGlobal() const { return slot_ == PE_GLOBAL; }
   int  step() const { return slot_ - 1; }    // valid only when !inGlobal()
   float perStepDrift(int i) const { return perStepDrift_[i]; }
+  // The two panel knobs (diagnostics: the PROFILE KNOB line).
+  const Knob& knob1() const { return k1_; }
+  const Knob& knob2() const { return k2_; }
   // Diagnostic: has each knob's pickup engaged on the CURRENT slot?
-  bool k1Live() const { return k1Live_[slot_]; }
-  bool k2Live() const { return k2Live_[slot_]; }
+  bool k1Live() const { return k1_.live(); }
+  bool k2Live() const { return k2_.live(); }
   // Diagnostic: last per-poll knob speed (|Δraw|) and its fast/slow verdict,
   // for tuning the potFast threshold from board data.
-  float speed1() const { return spd1_; }
-  // Did knob1's pickup engage on the current slot THIS update() (the poll
-  // its movement since arriving first crossed the threshold)?
-  bool  k1Engaged() const { return k1Engaged_; }
-  float speed2() const { return spd2_; }
-  bool  fast1()  const { return potFast(spd1_); }
-  bool  fast2()  const { return potFast(spd2_); }
+  float speed1() const { return k1_.speed(); }
+  float speed2() const { return k2_.speed(); }
+  bool  fast1()  const { return potFast(k1_.speed()); }
+  bool  fast2()  const { return potFast(k2_.speed()); }
 
   // button1: GLOBAL -> step1 -> ... -> stepN -> GLOBAL, where N = activeSteps
   // (#149): the nav only visits ACTIVE steps, so shrinking the sequence shrinks
@@ -335,156 +410,58 @@ class PanelEditor {
     if (slot_ > ssClampSteps(activeSteps)) goTo(PE_GLOBAL);
   }
 
-  // One control pass. Movement is detected on the RAW knob (r1/r2) -- the
-  // physical pot position -- while the VALUE written uses the smoothed knob
-  // (k1/k2). Detecting on the smoothed value is wrong: a one-pole caps the
-  // per-pass delta below any sane threshold (turning a pot to the far end moves
-  // the smoothed read only ~2% that pass), so pickup would never engage. The
-  // pickup latch tracks the pot; the smoothing only de-zippers the output.
-  // In GLOBAL, knobs drive *dur and *gdrift; in a step, position + per-step
-  // drift. Always folds max(per-step, global) into seq.drift[].
+  // One control pass: bind each knob to the current slot's parameter, poll
+  // it (it reads its own input and writes when live), then fold max(per-step,
+  // global) into seq.drift[].
   void update(Sequencer& seq, float* dur, float* gdrift,
-              float r1, float r2, float k1, float k2,
-              float moveThresh = 0.02f, float driftMax = 0.03f,
-              float durMin = 0.25f, float durMax = 60.0f, float gdriftMax = 0.03f) {
-    if (!primed_) { prime(r1, r2); }
-
-    // Anchor pending from a slot change (goTo can't see the raw reads): capture
-    // the pot position on arrival as this slot's move reference.
-    if (anchorPending_) { k1Anchor_ = r1; k2Anchor_ = r2; anchorPending_ = false; }
-
-    // Pickup: measure movement from the ANCHOR (pot position at entry), which is
-    // FROZEN until the knob engages -- so a SLOW sweep accumulates and eventually
-    // crosses the threshold. (Comparing against the previous poll let the
-    // reference chase the pot, so a slow turn never accumulated a crossing delta
-    // and pickup never engaged -- the "control feels dead" bug.) After engaging,
-    // the anchor is irrelevant; the knob drives the value directly.
-    k1Engaged_ = !k1Live_[slot_] && fabsf(r1 - k1Anchor_) > moveThresh;
-    if (k1Engaged_) k1Live_[slot_] = true;
-    if (!k2Live_[slot_] && fabsf(r2 - k2Anchor_) > moveThresh) k2Live_[slot_] = true;
-
-    // Per-poll knob SPEED (|Δraw| since last update). All four knob targets use
-    // the SAME speed-adaptive behavior (applyKnob) so feel is consistent; only
-    // the KnobSpec (range + fast/slow grids) differs per target.
-    float spd1 = fabsf(r1 - r1Prev_);
-    float spd2 = fabsf(r2 - r2Prev_);
-    spd1_ = spd1; spd2_ = spd2;   // exposed for the profiler (threshold tuning)
-    r1Prev_ = r1;
-    r2Prev_ = r2;
-
-    // Per-knob specs. Position: fast = 5% (20 detents), slow = continuous.
-    // Drift: fast = driftMax/30, slow = 0.03% (0.0003) -- 0..driftMax(3%) is
-    // 100 fine detents of 0.03% each. Duration: continuous both (a smooth
-    // sweep; grid TBD). Global drift: same as per-step drift.
-    const KnobSpec POSITION = positionSpec();
+              float driftMax = 0.03f, float durMin = 0.25f, float durMax = 60.0f,
+              float gdriftMax = 0.03f) {
+    // Per-knob specs. Drift: fast = driftMax/30, slow = 0.03% (0.0003) --
+    // 0..driftMax(3%) is 100 fine detents of 0.03% each. Duration: continuous
+    // both (a smooth sweep; grid TBD). Global drift: same as per-step drift.
     const KnobSpec DRIFT    { 0.0f, driftMax, driftMax / 30.0f, 0.0003f };
     const KnobSpec DURATION = durationSpec(durMin, durMax);
     const KnobSpec GDRIFT   { 0.0f, gdriftMax, gdriftMax / 30.0f, 0.0003f };
 
     if (slot_ == PE_GLOBAL) {
-      if (k1Live_[slot_]) *dur    = applyKnob(DURATION, k1, spd1);
-      if (k2Live_[slot_]) *gdrift = applyKnob(GDRIFT,   k2, spd2);
+      k1_.bind(dur, DURATION);
+      k2_.bind(gdrift, GDRIFT);
     } else {
-      int s = slot_ - 1;
-      // POSITION is written from the RAW pot (r1), not the smoothed read: the
-      // core applies position at frame boundaries (no zipper to smooth), and a
-      // one-pole's ~250 ms creep would cost a re-render per hop for its whole
-      // tail (finding F8) and add its own settling latency. The fast-move grid
-      // in applyKnob still snaps; ADC jitter sits below the core's refresh
-      // threshold. Duration and drift keep the smoother.
-      if (k1Live_[slot_]) seq.position[s]  = applyKnob(POSITION, r1, spd1);
-      if (k2Live_[slot_]) perStepDrift_[s] = applyKnob(DRIFT,    k2, spd2);
+      k1_.unbind();
+      k2_.bind(&perStepDrift_[slot_ - 1], DRIFT);
     }
+    k1_.poll();
+    k2_.poll();
 
     for (int i = 0; i < SS_STEPS; i++)
       seq.drift[i] = foldDrift(perStepDrift_[i], *gdrift);
   }
 
  private:
+  // Arriving on a slot re-arms both knobs' pickup: a knob takes over the new
+  // slot's parameter only after it moves (no snap to the pot).
   void goTo(int slot) {
     slot_ = slot;
-    k1Live_[slot_] = false;   // re-arm pickup on arrival
-    k2Live_[slot_] = false;
-    anchorPending_ = true;    // next update() captures the anchor from raw reads
+    k1_.rearm();
+    k2_.rearm();
   }
 
   int   slot_ = PE_GLOBAL;
-  bool  k1Live_[PE_NSLOTS] = {false};
-  bool  k2Live_[PE_NSLOTS] = {false};
   float perStepDrift_[SS_STEPS] = {0};
-  float k1Anchor_ = 0.0f, k2Anchor_ = 0.0f;   // frozen move reference (per entry)
-  float r1Prev_ = 0.0f, r2Prev_ = 0.0f;       // last raw reads (per-poll speed)
-  float spd1_ = 0.0f, spd2_ = 0.0f;           // last measured speed (diagnostic)
-  bool  k1Engaged_ = false;                   // knob1 pickup engaged this update()
-  bool  anchorPending_ = false;
-  bool  primed_ = false;
+  Knob  k1_, k2_;
 };
 
-// --- The row-2 pots: one position knob per step (Fizzy #157) ----------------
+// --- The row-2 pots: one position knob per head (Fizzy #157) ----------------
 // Eight pots behind the 4051 on A7, one per read head: panel knob i (0 =
-// leftmost) sets step i's position. The pots are not wired to the 4051 in
+// leftmost) sets head i's position. Each is an independent Knob bound to
+// seq.position[i] with positionSpec(), reading its own MuxPin (mux_adc.h);
+// nothing relates one pot to another. The pots are not wired to the 4051 in
 // panel order; this table is the PCB netlist (RV3 RV2 RV1 RV4 RV6 RV8 RV7 RV5
-// left to right, wipers on X2 X1 X0 X3 X5 X7 X6 X4).
+// left to right, wipers on X2 X1 X0 X3 X5 X7 X6 X4), used once, when the
+// firmware builds the eight MuxPins.
 constexpr int MUX_KNOBS = 8;
-static_assert(MUX_KNOBS == SS_STEPS, "one row-2 pot per step");
+static_assert(MUX_KNOBS == SS_STEPS, "one row-2 pot per head");
 constexpr int KNOB_MUX_CH[MUX_KNOBS] = {2, 1, 0, 3, 5, 7, 6, 4};
-
-// Knob i -> seq.position[i], each with its own pickup (AuxKnob: the pot takes
-// over only after it moves from where it sat at boot) and the knob1 position
-// rule (raw read, speed-adaptive grid, positionSpec()). Every pot is read once
-// per poll, the panel knobs' cadence, so the tuned feel carries over as is.
-//
-// Knob1 in step mode edits the same positions (PanelEditor). Per step, the
-// control that moved last owns it (LastMovedOwner, knob1 first), and either
-// control's pickup ENGAGING claims the step outright -- a fine turn stays
-// under LastMovedOwner's per-poll threshold, so without that the control
-// that does not own the step would engage and still never write. PanelEditor
-// writes the step it is on every poll once live, so update() runs AFTER it
-// and re-applies the pot's value every poll while the pot owns. A pot that
-// has never engaged pickup never writes, even while it owns by default.
-//
-// Readiness: until the mux has converted every channel once (`scanned`),
-// its reads are not pot positions (they start at 0), so update() does
-// nothing at all -- not even priming. Otherwise a pot's pickup anchor would
-// be 0 and its first real read a "move": every pot not at 0 would take its
-// step at power-on.
-
-// Knob1 as StepKnobs sees it, from PanelEditor, for one poll.
-struct Knob1View {
-  int   step    = -1;      // the step knob1 edits; -1 in GLOBAL
-  float speed   = 0.0f;    // its per-poll speed (PanelEditor::speed1)
-  bool  engaged = false;   // its pickup engaged this poll (PanelEditor::k1Engaged)
-};
-
-class StepKnobs {
- public:
-  StepKnobs() { for (auto& k : knob_) k.writeRaw = true; }
-
-  // One poll. `muxRaw[ch]` = the latest read of 4051 channel ch (0..1);
-  // `scanned` = every channel has been converted at least once.
-  void update(Sequencer& seq, const float muxRaw[MUX_KNOBS], bool scanned, const Knob1View& k1) {
-    if (!scanned) return;
-    for (int s = 0; s < MUX_KNOBS; s++) {
-      AuxKnob& k = knob_[s];
-      const bool wasLive = k.live;
-      float v;
-      if (k.update(muxRaw[KNOB_MUX_CH[s]], positionSpec(), &v)) value_[s] = v;
-      const bool onStep = (s == k1.step);
-      if (onStep && k1.engaged)  own_[s].second = false;   // knob1 engaged: it claims
-      if (!wasLive && k.live)    own_[s].second = true;    // the pot engaged: it claims (simultaneous: the pot)
-      if (own_[s].update(onStep ? k1.speed : 0.0f, k.speed) && k.live) seq.position[s] = value_[s];
-    }
-  }
-
-  // Diagnostics (the PROFILE MUX line).
-  bool live(int k) const { return knob_[k].live; }
-  bool owns(int k) const { return own_[k].second; }
-
- private:
-  AuxKnob        knob_[MUX_KNOBS];
-  LastMovedOwner own_[MUX_KNOBS];
-  float          value_[MUX_KNOBS] = {0};
-};
 
 // --- Encoder: the detent tables, the page state, and one detent's effect ----
 // These used to live in dreamosc.cpp (un-host-compilable): the stretch table,

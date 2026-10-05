@@ -23,7 +23,7 @@ GLOBAL ──button1──▶ step 1 ──button1──▶ … ──button1─
 | Mode | knob1 | knob2 | led1 |
 |------|-------|-------|------|
 | **GLOBAL** | duration (0.25..60 s) | global drift (0..0.03) | off |
-| **step i** | that step's position (0..1) | that step's per-step drift (0..0.03) | ROYGBIVW (step 1..8) |
+| **step i** | unassigned (each head's position is its row-2 pot) | that step's per-step drift (0..0.03) | ROYGBIVW (step 1..8) |
 
 - **Global drift is the FLOOR** for each step's per-step drift; effective
   per-step drift = `max(perStep, global)`, clamped to [0,1]. Global lifts every
@@ -35,7 +35,7 @@ GLOBAL ──button1──▶ step 1 ──button1──▶ … ──button1─
   (0.0003) on a slow turn — 100 fine detents span the range.
 - **led1 = ROYGBIVW** shows the selected step (red=1 … white=8), off in GLOBAL.
 
-### Row-2 pots: one position knob per step (Fizzy #157)
+### Row-2 pots: one position knob per head (Fizzy #157)
 
 Eight pots behind a CD4051 8:1 mux, common output on **A7** (D22), selects
 A/B/C on **D7/D8/D9** (the Seed pins labelled SS/SCK/MI). The mux is scanned
@@ -46,24 +46,43 @@ oversampled, 32.5-cycle sampling), so all eight pots are read in ~0.85 ms
 and every 1 ms control
 poll sees a fresh value for each.
 
-- **Knob N (left to right) sets step N's position**, 0..1 of the file. Same
-  feel as knob1 in step mode: `positionSpec()` (a fast turn snaps to 5%
-  landmarks, a slow turn is continuous), written from the raw read, pickup
-  from boot. Speed is measured per 1 ms poll, the same as knob1, so the
-  fast/slow split and the ownership threshold mean the same thing.
+- **Knob N (left to right) sets head N's position**, 0..1 of the file, and
+  nothing else: eight independent `Knob`s, each reading its own `MuxPin` and
+  bound to `seq.position[N]` with `positionSpec()` (a fast turn snaps to 5%
+  landmarks while it moves, a slow turn is continuous), pickup from boot.
 - **The pots are not wired in panel order.** `KNOB_MUX_CH` in
   `controls_core.h` maps panel knob → mux channel (from the PCB netlist:
   X2 X1 X0 X3 X5 X7 X6 X4).
-- **knob1 in step mode still edits the same position.** Per step, whichever
-  of knob1 and that step's pot moved last owns it, and either one's pickup
-  engaging counts as a move (so a slow trim still takes the step).
+- **knob1 no longer edits position** (it is unassigned in step mode), so
+  nothing else writes a head's position and there is no ownership rule.
 - PROFILE `MUX` line: the eight pots in panel order (raw ×1000), then
-  `L=` (pickup engaged) and `O=` (the pot owns the step), knob 1 first. The
+  `L=` (pickup engaged), knob 1 first. The
   positions themselves are the `POS` line. `scn=` = full scans this second
   (~1150..1190; must be > 1000), `o1=` = ADC1 (Pod knob) overruns, ever
   (must stay 0).
-- **Boot:** the pots are not read until ADC2 has converted every input once,
-  so their pickup starts from where they really sit.
+- **Boot:** a `MuxPin` is not `ready()` until ADC2 has converted every input
+  once, and a `Knob` does nothing while its input is not ready, so the pots'
+  pickup starts from where they really sit.
+
+## Every pot is a `Knob`
+
+Every physical pot -- the Pod's two knobs and the eight row-2 pots -- is a
+`Knob` (`controls_core.h`); a new pot uses `Knob` directly or derives from it,
+so they all feel the same. A `Knob` is injected with the **`AnalogInput`** it
+reads (`analog_input.h`) and never knows what is behind it: the Pod's knobs
+are `ControlPin`s (`control_pin.h`, over libDaisy's `AnalogControl`
+`pod.knob1`/`pod.knob2`, read raw -- not its filtered `Value()`), the row-2 pots are `MuxPin`s (`mux_adc.h`, one 4051 channel
+each), tests use a `FakeInput`. A `Knob` is **bound** to the float it writes
+and the `KnobSpec` that maps onto it; `PanelEditor` re-binds the Pod's knobs
+per slot. Polled once per 1 ms, a `Knob` owns:
+- **pickup** (below), detected on the raw read;
+- **speed**, `|Δraw|` per poll, for the fast/slow grid;
+- **flutter**: `Knob::DEADBAND` (0.002 of travel, twice the ~0.001 measured
+  on a resting pot) holds the value still until the pot moves past it, so a
+  resting knob writes a constant. A slow turn moves in steps just over 0.2%;
+- **de-zippering**: a one-pole (`Knob::SMOOTH`) over the deadbanded read, for
+  parameters whose `KnobSpec` asks for it (`smooth = true`: duration, drift).
+  Position does not (`positionSpec()`, see "Pot smoothing and refreshes").
 
 ## PICKUP (soft takeover) — everywhere
 
@@ -76,7 +95,7 @@ Two implementation facts that were hard-won bugs:
 - **Detect movement on the RAW knob.** A one-pole smoother caps the per-pass
   delta below any threshold, so detecting on the smoothed read means pickup
   never engages. Duration and drift WRITE the smoothed value; position writes
-  the raw (snapped) value, see below.
+  the deadbanded raw (snapped) value, see below.
 - **Freeze the move reference at an ANCHOR** (the pot position at slot entry) and
   don't update it until the knob engages. If the reference updates every poll it
   *chases* the pot, so a SLOW turn never accumulates a threshold-crossing delta
@@ -132,7 +151,8 @@ index is also the color index, so click order = RoYG).
   re-renders too, as often as you turn (the ISR drops superseded frames once
   per block, finding F4), so it always goes live at the latest position.
 - **Pot smoothing and refreshes** (finding F8): position is written from the
-  RAW pot (snapped by the fast-move grid), not the one-pole smoothed read, so
+  deadbanded RAW pot (snapped by the fast-move grid), not the one-pole
+  smoothed read, so
   a turn is a few discrete updates rather than a ~250 ms creep that would cost
   a re-render per hop. The core also spaces refreshes per head at 4× the
   measured render cost (≥ 10 ms; there is no one-hop floor any more, so a
@@ -191,7 +211,8 @@ block is 32 samples.
 
 All the pure decision logic (mode/pickup/drift-fold, encoder stepping, the
 stretch detent table, the per-page encoder dispatch, LED colors and levels) is
-in the platform-free, host-tested **`controls_core.h`** (`PanelEditor`,
+in the platform-free, host-tested **`controls_core.h`** (`Knob`, `PanelEditor`,
+`KNOB_MUX_CH`,
 `foldDrift`, `stepAdditive`/`stepIndex`/`stepCount`, `STRETCH_STOPS`,
 `EncoderState`/`applyEncoder`/`pageBrightness`, `pageColor`/`stepColor`).
 `dreamosc.cpp` is only the hardware glue that reads the panel and calls in. See

@@ -283,13 +283,25 @@ is bugs that only showed on hardware.
   These are the safe fall-back points.
 - **`experimental`**: the latest change that is **host-tested but NOT yet heard
   on hardware**. Moves forward freely; graduates to the next `alphaN` once
-  confirmed on the bench, or gets abandoned if it doesn't hold up. Always
-  re-pointable (`git tag -f experimental <commit>` + `git push -f origin
-  experimental`).
+  confirmed on the bench, or gets abandoned if it doesn't hold up. Re-point it
+  by **delete + re-push, never a force push**:
+  ```
+  git push origin --delete experimental     # remove the remote tag
+  git tag -d experimental                   # remove the local tag
+  git tag -a experimental <commit> -m "..." # recreate, annotated
+  git push origin experimental              # plain push
+  git ls-remote --tags origin experimental  # verify
+  ```
 - When the user asks to "tag alphaN" / "tag experimental", create an **annotated**
   tag (`git tag -a`) on the right commit and **push the tag to origin** (a plain
   `git push` does NOT push tags — `git push origin <tag>`). Verify with
-  `git ls-remote --tags origin <tag>`.
+  `git ls-remote --tags origin <tag>`. `alphaN` tags are never moved or
+  deleted; if one already exists, stop and ask.
+- **No force pushes, of anything, without the operator's explicit go-ahead for
+  that specific push.** That covers `git push -f` / `--force` /
+  `--force-with-lease`, `+refspec` pushes and `git tag -f`, for branches and
+  tags alike. If a push is rejected as non-fast-forward, stop and report it;
+  do not work around it.
 - Reference the driving Fizzy card (dreamosc board `03gsa1lwpx0m5f4k5f2p16toh`)
   in the commit message when a change implements one.
 

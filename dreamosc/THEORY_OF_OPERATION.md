@@ -284,9 +284,9 @@ per-sample step-count check. The main loop only *reads* them, in
 construction: `render()` re-reads position, a frame rendered with the newer
 value is simply the better frame, and the next `plan()` sees no further
 change. (The host harness writes the controls from the same thread that
-calls `render()`, so it models the same ordering.) The knobs' smoother and
-pickup speed detector sample once per millisecond inside the callback, the
-rate they were tuned at.
+calls `render()`, so it models the same ordering.) The knobs run on every
+block inside the callback, each told the seconds since its previous poll;
+their filters are in time (controls_core.h), so the rate does not matter.
 
 **Dwell and seam.** `seamGeom(dur, fade)` gives `fadeLen = dur · fade` (fade
 clamped to 0..0.5) and `onset = dur − fadeLen`. A dwell runs `elapsed_` from 0.

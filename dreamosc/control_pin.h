@@ -6,7 +6,7 @@
 //
 // It reads GetRawFloat() (count / 65535), NOT Value(): Value() is
 // AnalogControl's one-pole filter, and every filter a control wants is the
-// Knob's (controls_core.h) -- tuned to the 1 ms poll and host-tested -- so a
+// Knob's (controls_core.h) -- in seconds, not per poll, and host-tested -- so a
 // pot behaves the same whatever input it is wired to. Process() is therefore
 // never called. Note GetRawFloat() also skips AnalogControl's flip / invert /
 // offset / scale (those apply in Process()); the Pod's knobs use none of them.

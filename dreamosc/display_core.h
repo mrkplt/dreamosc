@@ -12,7 +12,7 @@
 //
 // Two economies keep the bus quiet:
 //   1. A row redraws only when the number it SHOWS changes. Knob flutter is
-//      removed at the knob (Deadband, controls_core.h), not here: the value
+//      removed at the knob (one-pole + Hysteresis, controls_core.h), not here: the value
 //      fed in is already still when the knob is.
 //   2. The driver diffs the framebuffer against what the panel already holds
 //      and sends only bands that differ (changedBands), so a caller never has

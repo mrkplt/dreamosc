@@ -319,45 +319,59 @@ TEST_CASE("F7: a boundary between plan() and render() wastes a render", "[findin
 // ---------------------------------------------------------------------------
 // F8: the knob smoother (coeff 0.02 at 1 ms) creeps for ~250 ms after any
 // touch, and every creep step above threshold was a refresh (7 per touch).
-// Fixed at both ends: position is now fed from the RAW pot (positionSpec), and
-// the core caps refreshes at one per hop per head with a 0.002 threshold.
+// Fixed at both ends: the core caps refreshes at one per hop per head with a
+// 0.002 threshold, and the Knob's one-pole (Beads' 4.9 ms) now settles
+// inside its hysteresis, so its tail ends in tens of ms instead of creeping.
 // ---------------------------------------------------------------------------
-TEST_CASE("F8: a pot move costs at most one refresh raw, one per hop smoothed", "[finding]") {
+TEST_CASE("F8: a pot move costs no more refreshes through the Knob than the hand itself", "[finding]") {
   gTab.init();
   auto srcbuf = make_source(3.0f, 48000);
   MemSource src{srcbuf.data(), (uint32_t)srcbuf.size()};
-  // Drive position the way the panel now does (raw) and the old way
-  // (smoothed), and count refreshes in the second after one 30% move.
-  auto run = [&](bool smoothed) {
+  // One 30% move at 1 s, three ways, counting refreshes in the second after:
+  //   STEP:      position jumps (the stimulus with the fewest refreshes);
+  //   HAND:      position follows a hand turn, 0.1 -> 0.4 at 10 travel/s
+  //              (30 ms), raw, written every 32-sample block;
+  //   KNOB:      the same hand turn through a Knob, as the panel does.
+  enum Feed { STEP, HAND, KNOB };
+  auto run = [&](Feed feed) {
     Sequencer seq; make_seq(seq, &src, 48000, 50.0f, 4.0f, 0.0f);
     std::vector<float> out;
-    float state = 0.1f; bool primed = false;
+    FakeInput in; in.v = 0.1f;
+    float pos = 0.1f;                                         // stored where the pot is
+    Knob k(in, &pos, positionSpec());
+    const float dt = 32.0f / 48000.0f;
     uint32_t refreshesAt = 0;
     for (uint32_t n = 0; n < 48000 * 2; n++) {
-      if (n % 48 == 0) {                                      // 1 ms control poll
-        float raw = n < 48000 ? 0.1f : 0.4f;                  // a 30% move at 1 s
-        seq.position[0] = smoothed ? smoothKnob(state, raw, primed) : raw;
-        primed = true;
+      if (n % 32 == 0) {                                      // one audio block
+        const float goal = n < 48000 ? 0.1f : 0.4f;
+        if (feed == STEP) {
+          seq.position[0] = goal;
+        } else {
+          in.v = fminf(in.v + 10.0f * dt, goal);
+          if (feed == HAND) seq.position[0] = in.v;
+          else { k.poll(dt); seq.position[0] = pos; }
+        }
       }
       if (n == 48000) refreshesAt = seq.refreshes();
       drain(seq);
       out.push_back(seq.next());
     }
-    write_wav(wavpath(smoothed ? "F8_pot_smoothed.wav" : "F8_pot_raw.wav").c_str(), out);
+    static const char* names[3] = {"F8_pot_step.wav", "F8_pot_hand.wav", "F8_pot_knob.wav"};
+    write_wav(wavpath(names[feed]).c_str(), out);
     REQUIRE(count_clicks(out, [](size_t) { return false; }) == 0);
     return seq.refreshes() - refreshesAt;
   };
-  uint32_t raw = run(false), smoothed = run(true);
-  WARN("F8: refreshes in the second after one 30% pot move: raw feed " << raw
-       << ", smoothed feed " << smoothed << " (cap: one per hop while it creeps).");
-  REQUIRE(raw <= 2);
-  // Smoothed (the feed the panel no longer uses): the creep lasts ~250 ms and
-  // the gap is 4 x cost = 804 samples (16.7 ms) at the host's seeded 4096
-  // cost since L2 dropped the one-hop floor, so up to ~15 refreshes could fit;
-  // measured 10 (the 0.002 threshold ends the creep early). Was 7 under the
-  // one-hop floor. This is the policy's cost on a creeping feed, bounded here
-  // so it cannot grow unnoticed; the raw feed above is what the panel does.
-  REQUIRE(smoothed <= 12);
+  uint32_t step = run(STEP), hand = run(HAND), knob = run(KNOB);
+  WARN("F8: refreshes in the second after one 30% pot move: step " << step
+       << ", hand turn raw " << hand << ", hand turn through the Knob " << knob
+       << " (the core refreshes at most once per 4 x cost while position moves).");
+  REQUIRE(step <= 2);
+  // While position moves, the core refreshes at its L2 cadence, so a hand
+  // turn costs what its duration costs. The Knob's one-pole lags the hand by
+  // tau (4.9 ms) and its tail runs ~50 ms to float resolution in steps far
+  // under the 0.002 refresh threshold, so it may add one refresh past the
+  // hand's own, never a creep's worth (the old 0.02/ms smoother: ~10).
+  REQUIRE(knob <= hand + 1);
 }
 
 TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does not", "[finding]") {
@@ -381,17 +395,6 @@ TEST_CASE("F8: a small position move (0.5%) triggers a refresh; below 0.2% does 
   WARN("F8: refreshes after a 0.5% move: " << small << "; after a 0.1% move: " << tiny);
   REQUIRE(small == 1);
   REQUIRE(tiny == 0);
-}
-
-TEST_CASE("F8: a position knob writes the pot, not the smoothed read", "[finding]") {
-  FakeInput in; float pos = -1.0f;
-  Knob k(in, &pos, positionSpec());
-  in.v = 0.10f; k.poll();
-  in.v = 0.10f; k.poll();
-  // Pot jumps to 0.80; the knob's smoothed read is still lagging behind it.
-  in.v = 0.80f; k.poll();
-  REQUIRE(k.smoothed() < 0.5f);
-  REQUIRE(pos == Approx(0.80f));                 // the pot, not the smoothed read
 }
 
 // ---------------------------------------------------------------------------

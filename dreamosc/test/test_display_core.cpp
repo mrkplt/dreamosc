@@ -1,7 +1,7 @@
 // Unit tests for the OLED screen logic (display_core.h, Fizzy #141): which
 // bands a framebuffer change dirties, and the POS1..POS8 screen model (redraw
 // only when the SHOWN value changes, one row per band). Knob flutter is the
-// knob's job (Deadband, test_controls_core.cpp).
+// knob's job (one-pole + Hysteresis, test_controls_core.cpp).
 //
 // No CATCH_CONFIG_MAIN here -- test_stretch_core.cpp defines it.
 

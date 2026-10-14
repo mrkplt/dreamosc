@@ -15,7 +15,7 @@
 #include "sd_source.h"
 #include "codec_rate.h"
 #include "axisram.h"      // AXISRAM_DATA: plain globals in D1 AXI SRAM (see the header)
-#include "mux_adc.h"      // the 4051 on A7, scanned by ADC2; MuxPin
+#include "mux_adc.h"      // the 4051s on A7 and A1, scanned by ADC2; MuxPin
 #include "control_pin.h"  // ControlPin: the Pod's knobs, through libDaisy's AnalogControl
 #include "screen_oled.h"  // the SSD1309 OLED: libDaisy's OledDisplay, per-band transport
 #include "display_core.h" // what the screen shows (host-tested)
@@ -114,8 +114,9 @@ struct Prof {
   uint32_t maxTicks = 0;
   uint32_t lastUnder = 0, lastClip = 0, lastLate = 0, lastRefresh = 0, lastIsr = 0;
   uint32_t lastPrint = 0;
-  float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + smoothed)
+  float r1 = 0, r2 = 0, k1 = 0, k2 = 0;   // last knob reads (raw + conditioned)
   float mux[8] = {0};                      // row-2 pots in PANEL order, raw (the MUX line)
+  float mux2[8] = {0};                     // row-3 pots in PANEL order, raw (the MUX2 line)
   uint32_t lastScans = 0;                  // muxAdc.scans() at the last print
   // Peak per-poll knob speed since the last print (instantaneous speed is ~0
   // at any given print instant; the peak catches an actual turn). Used to
@@ -167,7 +168,7 @@ static OledCanvas     canvas{display};
 static PositionScreen posScreen;
 static OledBusStats   oledStats;
 
-// The 4051 on A7, scanned by ADC2 (mux_adc.h). Declared with the Pod because
+// The 4051s (row 2 on A7, row 3 on A1), scanned by ADC2 (mux_adc.h). Declared with the Pod because
 // it shares ADC1's lifecycle: both converters are stopped around a PLL3
 // re-plan (PLL3 R is the ADC kernel clock) and started with the instrument
 // (stopInstrument() / startInstrument()). ADC2's end-of-conversion interrupt drives
@@ -201,6 +202,11 @@ static SourceInfo srcInfo;
 static CodecRate codecRate;
 
 static bool audioRunning = false;
+
+// 1 / the codec's measured rate: how long one frame lasts, so the panel can
+// tell every Knob how much time a block spans (processControls). Set by
+// openSource() before audio starts; the audio callback only reads it.
+static float controlSecondsPerFrame = 1.0f / 48000.0f;
 
 // Stop audio and BOTH converters: the Pod's ADC1 (its knobs) and the mux's
 // ADC2. Required before a PLL3 re-plan (codec_rate.h).
@@ -258,6 +264,7 @@ static bool openSource(const char* name) {
   if (!ok) return false;
   if (!setCodecRate(pod.seed, sdSrc.rate, codecRate)) return false;
   seq.init(&sdSrc, (float)codecRate.measured, voicePool);
+  controlSecondsPerFrame = 1.0f / (float)codecRate.measured;
   return true;
 }
 
@@ -277,15 +284,17 @@ static void startInstrument() {
 //   GLOBAL mode (led1 OFF):  knob1 -> duration (0.25..60s), knob2 -> global drift
 //   step mode  (led1 ROYGBIVW): knob1 -> unassigned, knob2 -> that step's drift
 //   row-2 pots     -> one head's position each (always, no mode)
+//   row-3 pots     -> scanned and conditioned, bound to nothing yet (MUX2 line)
 //   encoder turn   -> the current page's parameter (stretch / fade / frame / steps)
 //   encoder click  -> cycle page: stretch(red)/steps(orange)/fade(yellow)/window(green)
 //                     each page's led2 brightness encodes that page's level
 //   led2           -> encoder page color; brightness = that page's level
 //
-// PICKUP (soft takeover) EVERYWHERE: landing on GLOBAL or a step does NOT snap
-// its value to the pot -- a knob takes over only after it physically moves since
-// arriving. So you can tour steps (and hop to global) without disturbing values
-// you don't touch. All the mode/pickup logic is the host-tested PanelEditor.
+// TAKEOVER EVERYWHERE: landing on GLOBAL or a step does NOT snap its value to
+// the pot -- a knob writes only after it physically moves since arriving, and
+// then catches up from the stored value without a jump (Beads' catch-up).
+// So you can tour steps (and hop to global) without disturbing values you
+// don't touch. All the mode/takeover logic is the host-tested PanelEditor.
 //
 // Read from the AUDIO CALLBACK (see processControls below), which then owns
 // every control value the Sequencer reads. The encoder's page + index state,
@@ -300,7 +309,7 @@ static EncoderState enc;
 static float globalDrift = 0.0f;
 
 // The Pod's two knobs: ControlPins over the AnalogControls DaisyPod::Init()
-// builds (pod.knob1 / pod.knob2), read raw -- every filter is the Knob's.
+// builds (pod.knob1 / pod.knob2), read raw -- all conditioning is the Knob's.
 static ControlPin podKnob1Pin(pod.knob1);
 static ControlPin podKnob2Pin(pod.knob2);
 
@@ -309,8 +318,8 @@ static ControlPin podKnob2Pin(pod.knob2);
 // + global drift. Step mode: knob2 = per-step drift (knob1 unassigned).
 static PanelEditor panel(podKnob1Pin, podKnob2Pin);
 
-// --- the 4051 analog mux on A7 (row-2 knobs, Fizzy #157) ---------------------
-// A CD4051 8:1 mux: common out -> A7 (D22, PA5 = ADC12_INP19); selects A/B/C
+// --- the 4051 analog muxes (row-2 knobs on A7, Fizzy #157; row 3 on A1) -----
+// Row 2: a CD4051 8:1 mux, common out -> A7 (D22, PA5 = ADC12_INP19); selects A/B/C
 // <- the Seed pins labelled SS/SCK/MI on the pinout, which are D7/D8/D9
 // (SPI1 NSS/SCK/MISO in libDaisy's spi.cpp -- the SPI function is the
 // unambiguous name; the header numbering is not). Eight pots, one per head:
@@ -321,12 +330,32 @@ static PanelEditor panel(podKnob1Pin, podKnob2Pin);
 // (see mux_adc.h). A MuxPin is not ready until ADC2 has converted every
 // channel once, so a pot never reads the pre-scan 0 as a position; a mux
 // whose ADC did not come up is never ready, so its pots never write.
+//
+// Row 3: a second 4051 on the SAME select lines, common out -> A1 (D16, PA3 =
+// ADC12_INP15), converted right after row 2's common at every select
+// position. Its eight Knobs are bound to nothing until we decide what row 3
+// controls; they read and condition (the MUX2 line shows them). An unwired
+// A1 floats, which costs nothing but a meaningless MUX2 line.
 static_assert(MuxAdc::CHANNELS == MUX_KNOBS, "one 4051 input per row-2 pot");
 static_assert(MUX_KNOBS == 8, "the pin and knob tables below list eight");
+static_assert(MUX_BANKS <= MuxAdc::MAX_BANKS, "every bank has a common");
+static const MuxAdc::Common MUX_COMMONS[MUX_BANKS] = {
+  {seed::A7, ADC_CHANNEL_19},   // row 2
+  {seed::A1, ADC_CHANNEL_15},   // row 3
+};
 static MuxPin headPosPin[MUX_KNOBS] = {
-  {muxAdc, KNOB_MUX_CH[0]}, {muxAdc, KNOB_MUX_CH[1]}, {muxAdc, KNOB_MUX_CH[2]},
-  {muxAdc, KNOB_MUX_CH[3]}, {muxAdc, KNOB_MUX_CH[4]}, {muxAdc, KNOB_MUX_CH[5]},
-  {muxAdc, KNOB_MUX_CH[6]}, {muxAdc, KNOB_MUX_CH[7]},
+  {muxAdc, 0, KNOB_MUX_CH[0]}, {muxAdc, 0, KNOB_MUX_CH[1]}, {muxAdc, 0, KNOB_MUX_CH[2]},
+  {muxAdc, 0, KNOB_MUX_CH[3]}, {muxAdc, 0, KNOB_MUX_CH[4]}, {muxAdc, 0, KNOB_MUX_CH[5]},
+  {muxAdc, 0, KNOB_MUX_CH[6]}, {muxAdc, 0, KNOB_MUX_CH[7]},
+};
+static MuxPin row3Pin[MUX_KNOBS] = {
+  {muxAdc, 1, KNOB_MUX_CH[0]}, {muxAdc, 1, KNOB_MUX_CH[1]}, {muxAdc, 1, KNOB_MUX_CH[2]},
+  {muxAdc, 1, KNOB_MUX_CH[3]}, {muxAdc, 1, KNOB_MUX_CH[4]}, {muxAdc, 1, KNOB_MUX_CH[5]},
+  {muxAdc, 1, KNOB_MUX_CH[6]}, {muxAdc, 1, KNOB_MUX_CH[7]},
+};
+static Knob row3[MUX_KNOBS] = {
+  Knob(row3Pin[0]), Knob(row3Pin[1]), Knob(row3Pin[2]), Knob(row3Pin[3]),
+  Knob(row3Pin[4]), Knob(row3Pin[5]), Knob(row3Pin[6]), Knob(row3Pin[7]),
 };
 static Knob headPos[MUX_KNOBS] = {
   Knob(headPosPin[0], &seq.position[0], positionSpec()),
@@ -371,19 +400,26 @@ static uint32_t lastDetentMs = 0;
 //
 // Rates. The debouncers self-limit to one sample per GetNow() millisecond, so
 // calling them at 1.5 kHz is exactly right (never a skipped ms, edges valid
-// on this call only). The knobs are sampled once per ms too, on purpose: each
-// Knob's smoother and pickup speed detector (potFast) are per-call
-// filters tuned at 1 kHz; sampling them at the callback rate would change how
-// duration and drift feel under the hand. The LEDs are libDaisy SOFTWARE PWM
-// (Led::Update steps a ramp per call) and want the steady callback rate.
-// Cost: a handful of GPIO reads and float ops; isr_max on the COST line is
-// the measurement.
-static uint32_t lastKnobMs = 0;
+// on this call only). The KNOBS run on every block, as Beads runs its pots
+// (beads.cc: once per 4 kHz block), each polled with the time that actually
+// elapsed since its previous poll: a Knob's filters are in seconds, not per
+// call (controls_core.h), so it conditions the same at any rate, and the
+// block rate follows the file's (16..96 kHz / 32 = 0.5..3 kHz). The Pod's
+// knobs (ADC1, continuous DMA) are fresh every block; the mux pots are
+// polled when ADC2 has finished a new scan (~2300/s), with the time since
+// their last poll, so a block that sees the previous scan (fs above ~74
+// kHz) is skipped rather than read as a pot that stopped. The LEDs are
+// libDaisy SOFTWARE PWM (Led::Update steps a ramp per call) and want the
+// steady callback rate. Cost: a handful of GPIO reads and float ops per
+// knob; isr_max on the COST line is the measurement.
+static float    muxDt = 0.0f;       // seconds since the mux knobs' last poll
+static uint32_t muxPolledScan = 0;  // muxAdc.scans() at that poll
 #ifdef PROFILE
 static volatile uint32_t profDetents = 0;   // detents applied since the last print
 #endif
 
-static void processControls() {
+// `dt`: the seconds this callback's block spans (frames / codec rate).
+static void processControls(float dt) {
   // --- encoder click / turn, buttons: one debounce sample per ms; the edge
   // flags are valid only on this call, and the pure decision logic applies
   // them in the same order the old poll did (click before detent). ---
@@ -399,25 +435,28 @@ static void processControls() {
   (void)det;
 #endif
 
-  // --- knobs, once per ms: every pot is a Knob that reads its own input
-  // (ControlPin / MuxPin) and writes its bound parameter when live -- pickup,
-  // speed, deadband and smoothing are the Knob's (controls_core.h, host-
+  // --- knobs, every block: every pot is a Knob that reads its own input
+  // (ControlPin / MuxPin) and writes its bound parameter when live --
+  // conditioning, takeover and speed are the Knob's (controls_core.h, host-
   // tested). The Pod's knobs go through PanelEditor (GLOBAL: duration +
   // global drift; step: per-step drift); the row-2 pots each write one
-  // head's position. ADC1 and ADC2 both convert continuously, so every read
-  // here is fresh. ---
-  if (ms != lastKnobMs) {
-    lastKnobMs = ms;
-    panel.update(seq, &seq.duration, &globalDrift);
-    for (Knob& k : headPos) k.poll();
-#ifdef PROFILE
-    for (int k = 0; k < MUX_KNOBS; k++) prof.mux[k] = headPos[k].raw();
-    prof.r1 = panel.knob1().raw();      prof.r2 = panel.knob2().raw();   // for the KNOB line
-    prof.k1 = panel.knob1().smoothed(); prof.k2 = panel.knob2().smoothed();
-    if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
-    if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
-#endif
+  // head's position; the row-3 pots are unbound. ---
+  panel.update(seq, &seq.duration, &globalDrift, dt);
+  muxDt += dt;
+  const uint32_t scans = muxAdc.scans();
+  if (scans != muxPolledScan) {
+    muxPolledScan = scans;
+    for (Knob& k : headPos) k.poll(muxDt);
+    for (Knob& k : row3) k.poll(muxDt);
+    muxDt = 0.0f;
   }
+#ifdef PROFILE
+  for (int k = 0; k < MUX_KNOBS; k++) { prof.mux[k] = headPos[k].raw(); prof.mux2[k] = row3[k].raw(); }
+  prof.r1 = panel.knob1().raw();      prof.r2 = panel.knob2().raw();   // for the KNOB line
+  prof.k1 = panel.knob1().filtered(); prof.k2 = panel.knob2().filtered();
+  if (panel.speed1() > prof.pk1) prof.pk1 = panel.speed1();   // peak since last print
+  if (panel.speed2() > prof.pk2) prof.pk2 = panel.speed2();
+#endif
 
   // --- led2: encoder page color (RoYG over stretch/steps/fade/window, same
   // ROYGBIVW palette as led1) at that page's LEVEL (pageBrightness), so a
@@ -507,14 +546,13 @@ static void profilePrint() {
       (int)enc.page,
       panel.slot());                         // 0 = GLOBAL, 1..N = step
   profilePrintSource();
-  // KNOB line: raw (r1/r2) and smoothed (k1/k2) knob reads (*1000) and whether
-  // pickup has engaged on the current slot (k1L/k2L = 1 once the pot has moved
-  // past threshold). If you turn a knob and k1L stays 0, pickup isn't detecting
-  // the move; if k1L=1 but the value doesn't change, the write is the bug.
-  // pk1/pk2 = PEAK per-poll knob speed since last print (*1000, i.e. per-mil
-  // of full travel per poll). potFast threshold is 10 in these units (0.01).
-  // Turn a knob and read pk to see what "fast" actually measures -> tune the
-  // threshold. f1/f2 = the fast verdict at print time. det = encoder detents
+  // KNOB line: raw (r1/r2) and conditioned (k1/k2: one-pole ->
+  // hysteresis) knob reads (*1000), and whether each knob has written on the
+  // current slot (k1L/k2L = 1 once it moved). If you turn a knob and k1L stays
+  // 0, takeover isn't seeing the move; if k1L=1 but the value doesn't change,
+  // the write is the bug. pk1/pk2 = PEAK knob speed since last print, in % of
+  // travel per second (POT_FAST_SPEED = 10 travel/s = 1000 here). Turn a knob
+  // and read pk to see what "fast" actually measures -> tune the threshold. f1/f2 = the fast verdict at print time. det = encoder detents
   // applied this second (count them against the physical clicks: the L1
   // bench check), drop = panel events the IRQ queue refused, ever (must stay
   // bench check). b1/b2 = buttons held, as the last debounce sample saw them
@@ -524,7 +562,7 @@ static void profilePrint() {
       scaled(prof.r1, 1000.0f), scaled(prof.r2, 1000.0f),
       scaled(prof.k1, 1000.0f), scaled(prof.k2, 1000.0f),
       (int)panel.k1Live(), (int)panel.k2Live(),
-      scaled(prof.pk1, 1000.0f), scaled(prof.pk2, 1000.0f),
+      scaled(prof.pk1, 100.0f), scaled(prof.pk2, 100.0f),
       (int)panel.fast1(), (int)panel.fast2(),
       (int)pod.button1.Pressed(), (int)pod.button2.Pressed(),
       (unsigned)profDetents);
@@ -550,24 +588,32 @@ static void profilePrint() {
   appendScaled(line, sizeof(line), used, seq.drift, SS_STEPS, 10000.0f);
   pod.seed.PrintLine("%s", line);
   // MUX line: the eight row-2 pots, raw (*1000), in PANEL order (leftmost
-  // first, KNOB_MUX_CH already applied), then an 8-digit string, knob 1
-  // first: L = pickup engaged. Turning knob N must sweep the Nth value 0..1000 and nothing
-  // else; a sweep in the wrong slot is a table/wiring mismatch, one that moves
-  // with a neighbour is crosstalk, and 1000 at the counter-clockwise stop means
-  // the pots read inverted. The step positions themselves are the POS line.
-  // scn = full 8-channel scans this second: must be > 1000 (every pot fresh
-  // on every 1 ms poll; ~1150..1190 across the codec planner's ADC clock
-  // range, mux_adc.h). o1 = ADC1 (Pod knobs) overruns ever, cleared by the
-  // shared IRQ: must stay 0; if not, suspect knob1/knob2 reading swapped.
+  // first, KNOB_MUX_CH already applied), then each knob's takeover state,
+  // knob 1 first (knobStateChar: - = not written since arriving, C =
+  // catching up, T = tracking). Turning knob N must
+  // sweep the Nth value 0..1000 and nothing else; a sweep in the wrong slot is
+  // a table/wiring mismatch, one that moves with a neighbour is crosstalk,
+  // and 1000 at the counter-clockwise stop means the pots read inverted. The
+  // step positions themselves are the POS line. scn = full scans (every
+  // channel of both banks) this second: ~2300 (mux_adc.h); must exceed the
+  // block rate (fs / 32, e.g. 1378 at 44.1 kHz) for every block to see a
+  // fresh scan. o1 = ADC1 (Pod knobs) overruns ever, cleared by the shared
+  // IRQ: must stay 0; if not, suspect knob1/knob2 reading swapped. MUX2: the
+  // same for row 3 (unbound: its states only show takeover tracking the pot).
   const uint32_t scans = muxAdc.scans();
-  char lv[MUX_KNOBS + 1];
-  for (int k = 0; k < MUX_KNOBS; k++) lv[k] = headPos[k].live() ? '1' : '0';
-  lv[MUX_KNOBS] = '\0';
+  char st[MUX_KNOBS + 1];
+  for (int k = 0; k < MUX_KNOBS; k++) st[k] = knobStateChar(headPos[k]);
+  st[MUX_KNOBS] = '\0';
   used = snprintf(line, sizeof(line), "MUX ");
   used = appendScaled(line, sizeof(line), used, prof.mux, MUX_KNOBS, 1000.0f);
-  snprintf(line + used, sizeof(line) - used, " L=%s scn=%u o1=%u", lv,
+  snprintf(line + used, sizeof(line) - used, " S=%s scn=%u o1=%u", st,
            (unsigned)(scans - prof.lastScans), (unsigned)muxAdc.ovr1());
   prof.lastScans = scans;
+  pod.seed.PrintLine("%s", line);
+  for (int k = 0; k < MUX_KNOBS; k++) st[k] = knobStateChar(row3[k]);
+  used = snprintf(line, sizeof(line), "MUX2 ");
+  used = appendScaled(line, sizeof(line), used, prof.mux2, MUX_KNOBS, 1000.0f);
+  snprintf(line + used, sizeof(line) - used, " S=%s", st);
   pod.seed.PrintLine("%s", line);
   // HEALTH line: CPU and supply accounting for this second. act = gated
   // step heads (sounding + incoming, at most 2); arm = armed (pre-warmed)
@@ -632,14 +678,14 @@ static void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
   uint32_t t0 = System::GetTick();
   profSampleStack();   // sees the render this ISR preempted (see profMinSp)
 #endif
-  // The panel first, so every control value is settled before this block is
-  // rendered against it (see processControls).
-  processControls();
-  // size is the INTERLEAVED sample count (2 * block). Render mono in chunks
-  // of at most AUDIO_BLOCK (per-block constants hoisted inside), then
-  // duplicate to L/R. Chunking means a larger-than-expected block can never
-  // leave the tail of `out` unwritten.
+  // size is the INTERLEAVED sample count (2 * block). The panel first, so
+  // every control value is settled before this block is rendered against it
+  // (see processControls); it is told how long the block is.
   size_t n = size / 2;
+  processControls((float)n * controlSecondsPerFrame);
+  // Render mono in chunks of at most AUDIO_BLOCK (per-block constants
+  // hoisted inside), then duplicate to L/R. Chunking means a larger-than-
+  // expected block can never leave the tail of `out` unwritten.
   for (size_t off = 0; off < n; off += AUDIO_BLOCK) {
     size_t m = n - off;
     if (m > AUDIO_BLOCK) m = AUDIO_BLOCK;
@@ -662,9 +708,10 @@ int main(void) {
   pod.Init(true);
   pod.SetAudioBlockSize(AUDIO_BLOCK);
   boardVersion = (int)pod.seed.CheckBoardVersion();
-  // The 4051 on A7 gets its own converter (ADC2, mux_adc.h), after
-  // pod.Init() and before StartAdc(). A7 = PA5 = ADC12 input 19.
-  muxAdc.init(seed::A7, ADC_CHANNEL_19, seed::D7, seed::D8, seed::D9);
+  // The 4051s get their own converter (ADC2, mux_adc.h), after pod.Init()
+  // and before StartAdc(): row 2 on A7 (PA5 = ADC12 input 19), row 3 on A1
+  // (PA3 = input 15), selects on D7/D8/D9.
+  muxAdc.init(MUX_COMMONS, MUX_BANKS, seed::D7, seed::D8, seed::D9);
 #ifdef PROFILE
   pod.seed.StartLog(false);   // USB CDC; non-blocking so boot never stalls
   profTicksPerUs = System::GetTickFreq() / 1000000u;

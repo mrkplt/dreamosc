@@ -91,6 +91,27 @@ tightened. These replace the 400 MHz / ~18 ms guesses below.
   counts re-renders; `slack` should stay positive. If a fast knob sweep drives
   `du` up, the refresh threshold (0.002 in position) or the minimum gap
   (4 × cost, ≥ 10 ms) is the knob.
+- **Knob conditioning from Beads + per-block knobs + row 3 (host-tested,
+  not heard).** Every Knob is now 4.9 ms one-pole → 0.001 hysteresis
+  → Beads' catch-up takeover (no jump), polled every block
+  with the real dt; the mux runs 4× oversampling over two banks (A7, A1).
+  The bench owes:
+  - **Feel.** Every knob responds faster (τ 4.9 ms vs ~50 ms on duration
+    and drift) and position is now smoothed (it was raw + deadband). Touch a
+    knob whose stored value is far from the pot: the value must move from
+    where it was, never leap; it meets the pot at the end of travel.
+  - **Resting stillness at 4× oversampling.** `MUX` raw values at rest vs
+    the old 16× (expect ~2× the flutter); the `POS` line and the OLED must
+    stay still with every pot at rest. If a resting pot's position ticks,
+    the hysteresis (0.001) is too small for 4× -- raise it, measured.
+  - `MUX scn=` ≈ 2300 (both banks), above the block rate (1378 at 44.1 kHz);
+    `o1=0`.
+  - `isr_max`: the knobs now run every block (18 Knobs, one expf only when
+    dt changes); expect a few µs more than alpha7.
+  - **Row 3**, once wired: turning row-3 knob N sweeps the Nth `MUX2` value
+    and nothing on `MUX`; a sweep in the wrong slot means the row-3 board is
+    not the row-2 PCB and needs its own `KNOB_MUX_CH`.
+  - `KNOB pk=` is now % of travel per second (fast threshold = 1000).
 
 ## Surfaced by the alpha4 cleanup review (open, not fixed)
 

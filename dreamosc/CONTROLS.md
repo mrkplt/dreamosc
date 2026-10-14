@@ -41,32 +41,44 @@ Eight pots behind a CD4051 8:1 mux, common output on **A7** (D22), selects
 A/B/C on **D7/D8/D9** (the Seed pins labelled SS/SCK/MI). The mux is scanned
 by **ADC2** (`mux_adc.h`), leaving the Pod's own ADC1 and its two knobs
 untouched. ADC2 paces the scan itself: its end-of-conversion interrupt
-latches the read, steps the mux and starts the next conversion (16×
-oversampled, 32.5-cycle sampling), so all eight pots are read in ~0.85 ms
-and every 1 ms control
-poll sees a fresh value for each.
+latches the read, points ADC2 at the next mux's common (or steps the muxes)
+and starts the next conversion (4× oversampled, 32.5-cycle sampling, Beads'
+settings for its muxed pots). Both rows (16 pots) are read in ~0.43 ms,
+~2300 scans/s, so every audio block sees a fresh scan up to fs ≈ 74 kHz.
 
 - **Knob N (left to right) sets head N's position**, 0..1 of the file, and
   nothing else: eight independent `Knob`s, each reading its own `MuxPin` and
   bound to `seq.position[N]` with `positionSpec()` (a fast turn snaps to 5%
-  landmarks while it moves, a slow turn is continuous), pickup from boot.
+  landmarks while it moves, a slow turn is continuous), takeover from boot.
 - **The pots are not wired in panel order.** `KNOB_MUX_CH` in
   `controls_core.h` maps panel knob → mux channel (from the PCB netlist:
   X2 X1 X0 X3 X5 X7 X6 X4).
 - **knob1 no longer edits position** (it is unassigned in step mode), so
   nothing else writes a head's position and there is no ownership rule.
 - PROFILE `MUX` line: the eight pots in panel order (raw ×1000), then
-  `L=` (pickup engaged), knob 1 first. The
-  positions themselves are the `POS` line. `scn=` = full scans this second
-  (~1150..1190; must be > 1000), `o1=` = ADC1 (Pod knob) overruns, ever
-  (must stay 0).
+  `S=` (each knob's takeover state, knob 1 first: `-` not written since
+  arriving, `C` catching up, `T` tracking). The
+  positions themselves are the `POS` line. `scn=` = full scans of both rows
+  this second (~2300; must exceed the block rate, fs/32), `o1=` = ADC1 (Pod
+  knob) overruns, ever (must stay 0).
 - **Boot:** a `MuxPin` is not `ready()` until ADC2 has converted every input
   once, and a `Knob` does nothing while its input is not ready, so the pots'
-  pickup starts from where they really sit.
+  takeover starts from where they really sit.
+
+### Row-3 pots: wired for, bound to nothing yet
+
+A second 4051 on the **same select lines** (D7/D8/D9), its common on **A1**
+(D16, PA3 = ADC12_INP15), converted right after row 2's common at every
+select position. Its eight pots are `Knob`s over `MuxPin`s (bank 1) that read
+and condition but are **bound to nothing** until we decide what row 3
+controls. They use `KNOB_MUX_CH` on the assumption that the row-3 board is
+the row-2 PCB. PROFILE `MUX2` line: the eight row-3 pots raw (×1000) in panel
+order and their `S=` states. Turning row-3 knob N must sweep the Nth value;
+if A1 is not wired, the line is noise and nothing else is affected.
 
 ## Every pot is a `Knob`
 
-Every physical pot -- the Pod's two knobs and the eight row-2 pots -- is a
+Every physical pot -- the Pod's two knobs and the row-2 and row-3 pots -- is a
 `Knob` (`controls_core.h`); a new pot uses `Knob` directly or derives from it,
 so they all feel the same. A `Knob` is injected with the **`AnalogInput`** it
 reads (`analog_input.h`) and never knows what is behind it: the Pod's knobs
@@ -74,32 +86,50 @@ are `ControlPin`s (`control_pin.h`, over libDaisy's `AnalogControl`
 `pod.knob1`/`pod.knob2`, read raw -- not its filtered `Value()`), the row-2 pots are `MuxPin`s (`mux_adc.h`, one 4051 channel
 each), tests use a `FakeInput`. A `Knob` is **bound** to the float it writes
 and the `KnobSpec` that maps onto it; `PanelEditor` re-binds the Pod's knobs
-per slot. Polled once per 1 ms, a `Knob` owns:
-- **pickup** (below), detected on the raw read;
-- **speed**, `|Δraw|` per poll, for the fast/slow grid;
-- **flutter**: `Knob::DEADBAND` (0.002 of travel, twice the ~0.001 measured
-  on a resting pot) holds the value still until the pot moves past it, so a
-  resting knob writes a constant. A slow turn moves in steps just over 0.2%;
-- **de-zippering**: a one-pole (`Knob::SMOOTH`) over the deadbanded read, for
-  parameters whose `KnobSpec` asks for it (`smooth = true`: duration, drift).
-  Position does not (`positionSpec()`, see "Pot smoothing and refreshes").
+per slot.
 
-## PICKUP (soft takeover) — everywhere
+**The conditioning is Mutable Instruments Beads'**, ported from
+`beads/cv_reader.h` (`PotChannel`), `beads/pot_controller.h`
+(`PotController`) and `stmlib/dsp/hysteresis_filter.h`, in Beads' order. Its
+constants are Beads', converted where Beads' were per call (Beads runs its
+pots once per 4 kHz block) to time, so **nothing in a `Knob` is per call**:
+`poll(dt)` is told the seconds since its previous poll and conditions the
+same at any rate. A `Knob` owns:
+- **one-pole**, time constant `KNOB_TAU_S` = 4.87 ms (Beads' 0.05 per 4 kHz
+  block); the coefficient for each poll is `1 − exp(−dt/τ)`;
+- **hysteresis**, `KnobSpec::hysteresis` = `KNOB_HYSTERESIS` = 0.001 of travel
+  (Beads' value on its TIME pot; every pot here defaults to it because every
+  one drives something a wobble would cost). stmlib's filter follows the
+  input at one threshold's distance, so a slow turn moves continuously and
+  noise of up to 0.002 peak-to-peak is stopped once its peaks are seen. It
+  settles one threshold short of the pot (so a pot at the stop reads 0.999).
+  After a move the one-pole's tail ends below the OLED's resolution within
+  ~30 ms and stops at float resolution by ~55 ms;
+- **takeover** (below), the catch-up algorithm of Beads' `PotController`;
+- **speed**, `|Δraw/dt|` in travel per second, for the fast/slow grid
+  (`POT_FAST_SPEED` = 10/s: the old 0.01-per-1-ms threshold, in time).
 
-Landing on any slot (GLOBAL or a step) does **not** snap its value to the pot. A
-knob takes over its parameter for the current slot only after it has physically
-**moved** since arriving; until then the slot holds its stored value. This lets
-you tour the steps and change only the ones you touch.
+## TAKEOVER (soft takeover) — everywhere
 
-Two implementation facts that were hard-won bugs:
-- **Detect movement on the RAW knob.** A one-pole smoother caps the per-pass
-  delta below any threshold, so detecting on the smoothed read means pickup
-  never engages. Duration and drift WRITE the smoothed value; position writes
-  the deadbanded raw (snapped) value, see below.
-- **Freeze the move reference at an ANCHOR** (the pot position at slot entry) and
-  don't update it until the knob engages. If the reference updates every poll it
-  *chases* the pot, so a SLOW turn never accumulates a threshold-crossing delta
-  and the control feels dead. Anchor + accumulate is the fix.
+Landing on any slot (GLOBAL or a step) does **not** snap its value to the pot,
+and touching a knob never makes its parameter **jump** to the pot either.
+Every arrival (boot, a slot change) puts the knob in Beads' **CATCHING_UP**
+state with the parameter's stored value: nothing is written until the pot
+moves more than `PotTakeover::CATCH_MOVE` (0.005); from then each move
+moves the parameter by the same amount scaled by a skew ratio, so the two
+reach the end of travel together and meet; then the knob tracks. Turning
+toward a value already at that stop holds it there until you turn back. This
+lets you tour the steps and change only the ones you touch, without a leap
+when you do.
+
+- **Movement accumulates.** Catch-up compares the pot against a reference
+  that only advances when the threshold is crossed, so a slow turn engages
+  (the old "control feels dead" bug was a reference that chased the pot
+  every poll) and the thresholds do not depend on the poll rate.
+- **Only the catch-up is ported.** The rest of Beads' `PotController`
+  (locking, hidden parameters, scale/offset) is Beads' shift-button UI and
+  parameter mapping, not part of a pot; Beads itself uses it only on its
+  three mix pots.
 
 ## Encoder
 
@@ -150,18 +180,18 @@ index is also the color index, so click order = RoYG).
   SOUNDING head, not just the next visit. The NEXT step's pre-warmed head
   re-renders too, as often as you turn (the ISR drops superseded frames once
   per block, finding F4), so it always goes live at the latest position.
-- **Pot smoothing and refreshes** (finding F8): position is written from the
-  deadbanded RAW pot (snapped by the fast-move grid), not the one-pole
-  smoothed read, so
-  a turn is a few discrete updates rather than a ~250 ms creep that would cost
-  a re-render per hop. The core also spaces refreshes per head at 4× the
+- **Pot smoothing and refreshes** (finding F8): position goes through the
+  Knob's 4.9 ms one-pole and its hysteresis, whose tail ends in tens of ms
+  (below the 0.002 refresh threshold well before that), not the old
+  ~250 ms creep that cost a re-render per hop: a hand turn through the Knob
+  costs at most one refresh more than the same turn written raw (host: 4 vs
+  3 for a 30% turn in 30 ms). The core also spaces refreshes per head at 4× the
   measured render cost (≥ 10 ms; there is no one-hop floor any more, so a
   second move within the same hop lands at that hop's boundary — L2) and
   ignores position deltas under 0.2%. The NEXT step's pre-warmed head only
   re-renders its pair once go-live is within 8× cost (L3), so turning its
   knob all dwell long costs one pair, not one per gap, and it still goes live
-  at the latest position. Duration and drift keep the smoother. Refreshes
-  land at hop boundaries; they do not click.
+  at the latest position. Refreshes land at hop boundaries; they do not click.
 - **Duration is now LIVE and UNQUANTIZED** (#155). The step dwell is exactly
   `round(duration·sr)` samples, independent of frame size — so frame size no
   longer bends step timing (the old model quantized the dwell to the analysis-hop
@@ -199,20 +229,22 @@ I²C frame is ~10 ms of bus time).
 Rates inside the callback: libDaisy's debouncers self-limit to one sample
 per millisecond (edges are valid only on the call that sampled them; the
 pure `applyDigitalControls()` in `controls_core.h` applies click-then-detent
-in that same call). The **knobs are sampled once per millisecond on purpose**:
-the smoother and the pickup speed detector are per-call filters tuned at
-1 kHz, and sampling them at 1.5 kHz would change how duration and drift feel.
-The LEDs are libDaisy software PWM and want the steady callback rate.
+in that same call). The **knobs run on every block**, as Beads runs its pots,
+each told the time since its previous poll (`AUDIO_BLOCK / fs` for the Pod's
+knobs; the mux pots are polled when ADC2 has finished a new scan, with the
+time since their last poll). Because a `Knob` is in seconds, the block rate
+following the file's rate (0.5..3 kHz over 16..96 kHz) does not change the
+feel. The LEDs are libDaisy software PWM and want the steady callback rate.
 Profiler: `det=` (detents applied per second — count them against the
 physical clicks); `isr_max` on the COST line includes the panel read. Audio
 block is 32 samples.
 
 ## Where the logic lives
 
-All the pure decision logic (mode/pickup/drift-fold, encoder stepping, the
+All the pure decision logic (mode/takeover/drift-fold, knob conditioning, encoder stepping, the
 stretch detent table, the per-page encoder dispatch, LED colors and levels) is
-in the platform-free, host-tested **`controls_core.h`** (`Knob`, `PanelEditor`,
-`KNOB_MUX_CH`,
+in the platform-free, host-tested **`controls_core.h`** (`Knob`, `PotTakeover`,
+`Hysteresis`, `PanelEditor`, `KNOB_MUX_CH`, `knobStateChar`,
 `foldDrift`, `stepAdditive`/`stepIndex`/`stepCount`, `STRETCH_STOPS`,
 `EncoderState`/`applyEncoder`/`pageBrightness`, `pageColor`/`stepColor`).
 `dreamosc.cpp` is only the hardware glue that reads the panel and calls in. See
@@ -221,5 +253,5 @@ the testing-culture note in `../CLAUDE.md`.
 ## Diagnostics
 
 `make PROFILE=1` prints the full control + instrument state over USB serial each
-second (`SET`/`KNOB`/`POS`/`DRF`/`HLTH`/`COST` lines). Every variable parameter must
+second (`SET`/`KNOB`/`POS`/`DRF`/`MUX`/`MUX2`/`HLTH`/`COST` lines). Every variable parameter must
 appear there — see the profiler directive in `../CLAUDE.md`.
